@@ -179,6 +179,7 @@ pub enum EventType {
     TaskQueue(TaskQueueEvent),
     Milter(MilterEvent),
     MtaHook(MtaHookEvent),
+    DeliveryHook(DeliveryHookEvent),
     Delivery(DeliveryEvent),
     Queue(QueueEvent),
     TlsRpt(TlsRptEvent),
@@ -587,6 +588,14 @@ pub enum MtaHookEvent {
     ActionDiscard,
     ActionReject,
     ActionQuarantine,
+    Error,
+}
+
+#[event_type]
+pub enum DeliveryHookEvent {
+    ActionAccept,
+    ActionReject,
+    ActionFileInto,
     Error,
 }
 

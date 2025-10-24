@@ -42,6 +42,7 @@ impl EventType {
             EventType::TaskQueue(event) => event.description(),
             EventType::Milter(event) => event.description(),
             EventType::MtaHook(event) => event.description(),
+            EventType::DeliveryHook(event) => event.description(),
             EventType::Delivery(event) => event.description(),
             EventType::Queue(event) => event.description(),
             EventType::TlsRpt(event) => event.description(),
@@ -92,6 +93,7 @@ impl EventType {
             EventType::TaskQueue(event) => event.explain(),
             EventType::Milter(event) => event.explain(),
             EventType::MtaHook(event) => event.explain(),
+            EventType::DeliveryHook(event) => event.explain(),
             EventType::Delivery(event) => event.explain(),
             EventType::Queue(event) => event.explain(),
             EventType::TlsRpt(event) => event.explain(),
@@ -982,6 +984,26 @@ impl MtaHookEvent {
             MtaHookEvent::ActionReject => "The MTA hook requested to reject the message",
             MtaHookEvent::ActionQuarantine => "The MTA hook requested to quarantine the message",
             MtaHookEvent::Error => "An error occurred with the MTA hook",
+        }
+    }
+}
+
+impl DeliveryHookEvent {
+    pub fn description(&self) -> &'static str {
+        match self {
+            DeliveryHookEvent::ActionAccept => "Delivery hook action: Accept",
+            DeliveryHookEvent::ActionReject => "Delivery hook action: Reject",
+            DeliveryHookEvent::ActionFileInto => "Delivery hook action: FileInto",
+            DeliveryHookEvent::Error => "Delivery hook error",
+        }
+    }
+
+    pub fn explain(&self) -> &'static str {
+        match self {
+            DeliveryHookEvent::ActionAccept => "The delivery hook accepted the message without modifications",
+            DeliveryHookEvent::ActionReject => "The delivery hook rejected the message",
+            DeliveryHookEvent::ActionFileInto => "The delivery hook filed the message into specific mailboxes",
+            DeliveryHookEvent::Error => "An error occurred with the delivery hook",
         }
     }
 }
