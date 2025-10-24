@@ -338,12 +338,10 @@ async fn try_delivery_hook(
     let envelope = hooks::Envelope {
         from: hooks::Address {
             address: sender.to_string(),
-            parameters: None,
         },
-        to: vec![hooks::Address {
+        to: hooks::Address {
             address: recipient.to_string(),
-            parameters: None,
-        }],
+        },
     };
 
     // Build message with SMTP hook types
@@ -363,7 +361,8 @@ async fn try_delivery_hook(
         hooks::Message {
             headers,
             server_headers: vec![],
-            contents: String::new(), // Don't include full body to reduce payload size
+            // TODO: This should be the full raw message, so we can modify it per user
+            contents: msg.body_text(0).map(|text| text.as_ref().to_string()).unwrap_or_default(),
             size: message_size,
         }
     } else {
@@ -375,9 +374,12 @@ async fn try_delivery_hook(
         }
     };
 
-    let request = hooks::Request::new(user_id)
-        .with_envelope(envelope)
-        .with_message(message);
+    let request = hooks::Request::new(
+        jmap_proto::types::id::Id::from(user_id).as_string(),
+        user_id,
+    )
+    .with_envelope(envelope)
+    .with_message(message);
 
     let time = Instant::now();
     match send_delivery_hook_request(request).await {

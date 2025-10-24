@@ -7,20 +7,17 @@
 pub mod client;
 
 use serde::{Deserialize, Serialize};
-use store::ahash::AHashMap;
 
 // Types copied from smtp::inbound::hooks to avoid cyclic dependency
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Address {
     pub address: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parameters: Option<AHashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Envelope {
     pub from: Address,
-    pub to: Vec<Address>,
+    pub to: Address,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -36,7 +33,8 @@ pub struct Message {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Request {
-    pub user_id: u32,
+    pub user_id: String,
+    pub user_id_num: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub envelope: Option<Envelope>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,6 +63,11 @@ pub enum Modification {
     FileInto {
         mailbox_id: String,
         #[serde(default = "default_keep_in_inbox")]
+        // TODO: I don't love this design - keep in inbox could conflict between
+        // multiple fileInto modifications.
+        // Hoist it up to the Response level
+        // Probably should have the default behavior be true, and change it to
+        // `skip_inbox`
         keep_in_inbox: bool,
     },
 }
@@ -74,9 +77,10 @@ fn default_keep_in_inbox() -> bool {
 }
 
 impl Request {
-    pub fn new(user_id: u32) -> Self {
+    pub fn new(user_id: String, user_id_num: u32) -> Self {
         Self {
             user_id,
+            user_id_num,
             envelope: None,
             message: None,
         }
