@@ -2230,6 +2230,7 @@ dependencies = [
  "rasn",
  "rasn-cms",
  "rasn-pkix",
+ "reqwest 0.12.23",
  "rkyv",
  "rsa",
  "sequoia-openpgp",

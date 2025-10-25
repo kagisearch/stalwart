@@ -30,7 +30,7 @@ members = [
 
 [profile.dev]
 opt-level = 0
-debug = 1
+debug = 'full'
 #codegen-units = 4
 lto = false
 incremental = true
