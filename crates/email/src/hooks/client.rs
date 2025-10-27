@@ -4,23 +4,19 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::time::Duration;
 use utils::HttpLimitResponse;
+use common::config::smtp::session::DeliveryHook;
 
 use super::{Request, Response};
 
-const DELIVERY_HOOK_URL: &str = "http://localhost:8080/delivery-hook";
-const DELIVERY_HOOK_TIMEOUT: Duration = Duration::from_secs(10);
-const DELIVERY_HOOK_MAX_RESPONSE_SIZE: usize = 1024 * 1024; // 1MB
-
-pub async fn send_delivery_hook_request(request: Request) -> Result<Response, String> {
+pub async fn send_delivery_hook_request(hook: &DeliveryHook, request: Request) -> Result<Response, String> {
     let response = reqwest::Client::builder()
-        .timeout(DELIVERY_HOOK_TIMEOUT)
+        .timeout(hook.timeout)
+        .danger_accept_invalid_certs(hook.tls_allow_invalid_certs)
         .build()
         .map_err(|err| format!("Failed to create HTTP client: {}", err))?
-        .post(DELIVERY_HOOK_URL)
-        .header("Content-Type", "application/json")
-        .header("Authorization", "basic YWRtaW46YW5leHRyZW1lbHl1bmNvbnZpbmNpbmdwYXNzd29yZA==")
+        .post(&hook.url)
+        .headers(hook.headers.clone())
         .body(
             serde_json::to_string(&request)
                 .map_err(|err| format!("Failed to serialize delivery hook request: {}", err))?,
@@ -32,7 +28,7 @@ pub async fn send_delivery_hook_request(request: Request) -> Result<Response, St
     if response.status().is_success() {
         serde_json::from_slice(
             response
-                .bytes_with_limit(DELIVERY_HOOK_MAX_RESPONSE_SIZE)
+                .bytes_with_limit(hook.max_response_size)
                 .await
                 .map_err(|err| format!("Failed to parse delivery hook response: {}", err))?
                 .ok_or_else(|| "Delivery hook response too large".to_string())?

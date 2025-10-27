@@ -9,18 +9,18 @@ pub mod client;
 use serde::{Deserialize, Serialize};
 
 // Types copied from smtp::inbound::hooks to avoid cyclic dependency
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Address {
     pub address: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Envelope {
     pub from: Address,
     pub to: Address,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
     pub headers: Vec<(String, String)>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -31,7 +31,7 @@ pub struct Message {
     pub size: usize,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Request {
     pub user_id: String,
     pub user_id_num: u32,

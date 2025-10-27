@@ -7,11 +7,13 @@
 use common::Server;
 
 use directory::Permission;
+use futures::future::join_all;
 use jmap_proto::types::{state::StateChange, type_state::DataType};
 use mail_parser::MessageParser;
 use std::{borrow::Cow, future::Future};
 use store::ahash::AHashMap;
 use utils::BlobHash;
+use common::expr::functions::ResolveVariable;
 
 use crate::{
     hooks::{self, client::send_delivery_hook_request, Action as HookAction, Modification},
@@ -20,6 +22,21 @@ use crate::{
 };
 
 use super::ingest::{EmailIngest, IngestEmail, IngestSource};
+
+// Simple resolver for delivery hooks (no variables needed)
+struct DeliveryResolver;
+
+impl ResolveVariable for DeliveryResolver {
+    fn resolve_variable(&self, _variable: u32) -> common::expr::Variable<'_> {
+        // Delivery hooks don't use session variables, so return empty
+        common::expr::Variable::default()
+    }
+
+    fn resolve_global(&self, _variable: &str) -> common::expr::Variable<'_> {
+        // Delivery hooks don't use global variables, so return empty
+        common::expr::Variable::default()
+    }
+}
 
 #[derive(Debug)]
 pub struct IngestMessage {
@@ -325,7 +342,7 @@ impl MailDelivery for Server {
 /// - Ok(None) if hook accepted without modifications (continue normal flow)
 /// - Err if hook rejected the message
 async fn try_delivery_hook(
-    _server: &Server,
+    server: &Server,
     user_id: u32,
     sender: &str,
     recipient: &str,
@@ -381,24 +398,60 @@ async fn try_delivery_hook(
     .with_envelope(envelope)
     .with_message(message);
 
-    let time = Instant::now();
-    match send_delivery_hook_request(request).await {
-            Ok(response) => {
-                let elapsed = time.elapsed();
+    // Get configured delivery hooks
+    let delivery_hooks = &server.core.smtp.session.delivery_hooks;
 
+    // If no hooks configured, return None to continue normal flow
+    if delivery_hooks.is_empty() {
+        return Ok(None);
+    }
+
+    // Filter enabled hooks
+    let resolver = DeliveryResolver;
+    let mut enabled_hooks = Vec::new();
+    for hook in delivery_hooks {
+        if server.eval_if(&hook.enable, &resolver, 0).await.unwrap_or(false) {
+            enabled_hooks.push(hook);
+        }
+    }
+
+    if enabled_hooks.is_empty() {
+        return Ok(None);
+    }
+
+    // Run all enabled hooks in parallel
+    let mut hook_futures = Vec::new();
+    for hook in enabled_hooks {
+        let hook_request = request.clone();
+        let time = Instant::now();
+        hook_futures.push(async move {
+            let result = send_delivery_hook_request(hook, hook_request).await;
+            (hook, result, time.elapsed())
+        });
+    }
+
+    let hook_results = join_all(hook_futures).await;
+
+    // Process all hook results
+    let mut all_mailbox_ids = Vec::new();
+    let mut keep_in_inbox = true;
+    let mut should_tempfail = false;
+    let mut should_permfail = false;
+    let mut any_accept_with_modifications = false;
+
+    for (hook, result, elapsed) in hook_results {
+        match result {
+            Ok(response) => {
                 match response.action {
                     HookAction::Accept => {
                         trc::event!(
                             DeliveryHook(trc::DeliveryHookEvent::ActionAccept),
                             AccountId = user_id,
+                            Details = format!("Hook '{}' accepted", hook.id),
                             Elapsed = elapsed,
                         );
 
                         // Process modifications
-                        let mut mailbox_ids = Vec::new();
-                        let mut keep_in_inbox = true;
-                        let mut has_file_into = false;
-
                         for modification in response.modifications {
                             match modification {
                                 Modification::FileInto {
@@ -409,55 +462,88 @@ async fn try_delivery_hook(
                                     if let Some(id) = jmap_proto::types::id::Id::from_bytes(
                                         mailbox_id.as_bytes(),
                                     ) {
-                                        mailbox_ids.push(id.document_id());
-                                        keep_in_inbox = keep;
-                                        has_file_into = true;
+                                        if !all_mailbox_ids.contains(&id.document_id()) {
+                                            all_mailbox_ids.push(id.document_id());
+                                        }
+                                        // If any hook sets keep_in_inbox to false, respect it
+                                        if !keep {
+                                            keep_in_inbox = false;
+                                        }
+                                        any_accept_with_modifications = true;
                                     } else {
                                         trc::event!(
                                             DeliveryHook(trc::DeliveryHookEvent::Error),
                                             AccountId = user_id,
-                                            Reason = format!("Invalid mailbox ID: {}", mailbox_id),
+                                            Details = format!("Hook '{}': Invalid mailbox ID: {}", hook.id, mailbox_id),
                                         );
                                     }
                                 }
                             }
-                        }
-
-                        if has_file_into {
-                            // If keep_in_inbox is true, add INBOX_ID
-                            if keep_in_inbox && !mailbox_ids.contains(&INBOX_ID) {
-                                mailbox_ids.push(INBOX_ID);
-                            }
-                            Ok(Some((mailbox_ids, true)))
-                        } else {
-                            // No file into modifications, continue normal flow
-                            Ok(None)
                         }
                     }
                     HookAction::Reject => {
                         trc::event!(
                             DeliveryHook(trc::DeliveryHookEvent::ActionReject),
                             AccountId = user_id,
+                            Details = format!("Hook '{}' rejected", hook.id),
                             Elapsed = elapsed,
                         );
 
-                        Err(trc::EventType::MessageIngest(trc::MessageIngestEvent::Error)
-                            .ctx(trc::Key::Reason, "Message rejected by delivery hook")
-                            .ctx(trc::Key::Code, 550))
+                        // Check if this rejection should be a tempfail or permfail
+                        if hook.tempfail_on_error {
+                            should_tempfail = true;
+                        } else {
+                            should_permfail = true;
+                        }
                     }
                 }
             }
             Err(err) => {
-                // Hook error - log and continue with normal flow
+                // Hook error - log and potentially fail
                 trc::event!(
                     DeliveryHook(trc::DeliveryHookEvent::Error),
                     AccountId = user_id,
-                    Reason = err.clone(),
-                    Elapsed = time.elapsed(),
+                    Details = format!("Hook '{}': {}", hook.id, err),
+                    Elapsed = elapsed,
                 );
 
-                // Fall through to normal Sieve/inbox delivery
-                Ok(None)
+                // If tempfail_on_error is set, hook errors should cause tempfail
+                if hook.tempfail_on_error {
+                    should_tempfail = true;
+                }
             }
         }
+    }
+
+    // Check for failures - tempfail takes precedence over permfail for retry behavior
+    if should_tempfail {
+        return Err(trc::EventType::MessageIngest(trc::MessageIngestEvent::Error)
+            .ctx(trc::Key::Reason, "Message temporarily rejected by delivery hook")
+            .ctx(trc::Key::Code, 451));
+    }
+
+    if should_permfail {
+        return Err(trc::EventType::MessageIngest(trc::MessageIngestEvent::Error)
+            .ctx(trc::Key::Reason, "Message rejected by delivery hook")
+            .ctx(trc::Key::Code, 550));
+    }
+
+    // If any hook specified mailboxes, file into those mailboxes
+    if any_accept_with_modifications {
+        // If keep_in_inbox is true, add INBOX_ID
+        if keep_in_inbox && !all_mailbox_ids.contains(&INBOX_ID) {
+            all_mailbox_ids.push(INBOX_ID);
+        }
+
+        trc::event!(
+            DeliveryHook(trc::DeliveryHookEvent::ActionFileInto),
+            AccountId = user_id,
+            Details = format!("Filed into mailboxes: {:?}", all_mailbox_ids),
+        );
+
+        return Ok(Some((all_mailbox_ids, true)));
+    }
+
+    // If no hooks handled the message, continue with normal flow
+    Ok(None)
 }

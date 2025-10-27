@@ -2220,6 +2220,7 @@ dependencies = [
  "common",
  "compact_str",
  "directory",
+ "futures",
  "groupware",
  "hashify",
  "jmap_proto",
