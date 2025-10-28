@@ -46,6 +46,8 @@ pub struct Response {
     pub action: Action,
     #[serde(default)]
     pub modifications: Vec<Modification>,
+    #[serde(default)]
+    pub skip_inbox: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -61,19 +63,15 @@ pub enum Action {
 pub enum Modification {
     #[serde(rename = "fileInto")]
     FileInto {
+        folder: String,
         mailbox_id: String,
-        #[serde(default = "default_keep_in_inbox")]
-        // TODO: I don't love this design - keep in inbox could conflict between
-        // multiple fileInto modifications.
-        // Hoist it up to the Response level
-        // Probably should have the default behavior be true, and change it to
-        // `skip_inbox`
-        keep_in_inbox: bool,
+        #[serde(default)]
+        flags: Vec<String>,
+        #[serde(default)]
+        special_use: Option<String>,
+        #[serde(default)]
+        create: bool,
     },
-}
-
-fn default_keep_in_inbox() -> bool {
-    true
 }
 
 impl Request {
