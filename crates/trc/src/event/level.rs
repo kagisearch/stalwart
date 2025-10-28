@@ -410,6 +410,12 @@ impl EventType {
                 | MtaHookEvent::ActionQuarantine => Level::Info,
                 MtaHookEvent::Error => Level::Warn,
             },
+            EventType::DeliveryHook(event) => match event {
+                DeliveryHookEvent::ActionAccept
+                | DeliveryHookEvent::ActionReject
+                | DeliveryHookEvent::ActionFileInto => Level::Info,
+                DeliveryHookEvent::Error => Level::Warn,
+            },
             EventType::Dane(event) => match event {
                 DaneEvent::AuthenticationSuccess
                 | DaneEvent::AuthenticationFailure

@@ -21,13 +21,15 @@ use smtp_proto::*;
 use utils::config::{Config, utils::ParseValue};
 
 use crate::{
-    config::CONNECTION_VARS,
+    config::{CONNECTION_VARS, smtp::delivery_hooks::DeliveryHook},
     expr::{if_block::IfBlock, tokenizer::TokenMap, *},
 };
 
 use self::resolver::Policy;
 
 use super::*;
+
+use delivery_hooks::parse_delivery_hooks;
 
 #[derive(Clone)]
 pub struct SessionConfig {
@@ -46,6 +48,7 @@ pub struct SessionConfig {
 
     pub milters: Vec<Milter>,
     pub hooks: Vec<MTAHook>,
+    pub delivery_hooks: Vec<DeliveryHook>,
 }
 
 #[derive(Clone)]
@@ -210,6 +213,11 @@ impl SessionConfig {
             .sub_keys("session.hook", ".url")
             .into_iter()
             .filter_map(|id| parse_hooks(config, &id, &has_rcpt_vars))
+            .collect();
+        session.delivery_hooks = config
+            .sub_keys("session.delivery_hook", ".url")
+            .into_iter()
+            .filter_map(|id| parse_delivery_hooks(config, &id, &has_rcpt_vars))
             .collect();
         session.mta_sts_policy = Policy::try_parse(config);
 
@@ -795,6 +803,7 @@ impl Default for SessionConfig {
             mta_sts_policy: None,
             milters: Default::default(),
             hooks: Default::default(),
+            delivery_hooks: Default::default(),
         }
     }
 }

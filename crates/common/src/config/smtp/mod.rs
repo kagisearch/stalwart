@@ -7,6 +7,7 @@
 use utils::config::{Config, Rate};
 
 pub mod auth;
+pub mod delivery_hooks;
 pub mod queue;
 pub mod report;
 pub mod resolver;
