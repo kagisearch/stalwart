@@ -4,20 +4,22 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::Server;
+use common::{Server, config::jmap::settings::SpecialUse};
 
 use directory::Permission;
 use futures::future::join_all;
-use jmap_proto::types::{state::StateChange, type_state::DataType};
+use jmap_proto::types::{state::StateChange, type_state::DataType, keyword::Keyword};
 use mail_parser::MessageParser;
 use std::{borrow::Cow, future::Future};
 use store::ahash::AHashMap;
-use utils::BlobHash;
+use utils::{BlobHash, config::utils::ParseValue};
 use common::expr::functions::ResolveVariable;
+use trc::AddContext;
 
 use crate::{
+    cache::{MessageCacheFetch, mailbox::MailboxCacheAccess},
     hooks::{self, client::send_delivery_hook_request, Action as HookAction, Modification},
-    mailbox::{INBOX_ID, TRASH_ID},
+    mailbox::{INBOX_ID, TRASH_ID, manage::MailboxFnc},
     sieve::ingest::SieveScriptIngest,
 };
 
@@ -86,6 +88,7 @@ async fn handle_sieve_script_ingest(
     parsed_message: Option<mail_parser::Message<'_>>,
     access_token: &common::auth::AccessToken,
     mailbox_ids: Vec<u32>,
+    flags: Vec<String>,
     rcpt: &str,
     sender_address: &str,
     sender_authenticated: bool,
@@ -94,13 +97,14 @@ async fn handle_sieve_script_ingest(
 ) -> trc::Result<super::ingest::IngestedEmail> {
     match server.sieve_script_get_active(uid).await {
         Ok(None) => {
-            // No sieve script - ingest to specified mailboxes
+            // No sieve script - ingest to specified mailboxes with flags from hooks
+            let keywords: Vec<Keyword> = flags.into_iter().map(|f| Keyword::from(f)).collect();
             server.email_ingest(IngestEmail {
                 raw_message,
                 message: parsed_message,
                 access_token,
                 mailbox_ids,
-                keywords: vec![],
+                keywords,
                 received_at: None,
                 source: IngestSource::Smtp {
                     deliver_to: rcpt,
@@ -236,14 +240,14 @@ impl MailDelivery for Server {
 
                     // Always check for active sieve script after delivery hooks
                     match hook_result {
-                        Ok(Some((mailbox_ids, hook_handled))) => {
+                        Ok(Some((mailbox_ids, flags, hook_handled))) => {
                             // Hook specified mailbox(es) to file into
                             if hook_handled {
                                 trc::event!(
                                     DeliveryHook(trc::DeliveryHookEvent::ActionFileInto),
                                     SpanId = message.session_id,
                                     AccountId = uid,
-                                    Details = format!("Filed into mailboxes: {:?}", mailbox_ids),
+                                    Details = format!("Filed into mailboxes: {:?} with flags: {:?}", mailbox_ids, flags),
                                 );
                             }
 
@@ -255,6 +259,7 @@ impl MailDelivery for Server {
                                 parsed_message,
                                 &access_token,
                                 mailbox_ids,
+                                flags,
                                 &rcpt,
                                 &message.sender_address,
                                 message.sender_authenticated,
@@ -265,6 +270,7 @@ impl MailDelivery for Server {
                         }
                         Ok(None) => {
                             // Hook returned Accept or no hooks configured - proceed with normal flow
+                            let flags = Vec::new(); // No flags from hooks
                             // Check if there is an active sieve script
                             handle_sieve_script_ingest(
                                 self,
@@ -273,6 +279,7 @@ impl MailDelivery for Server {
                                 parsed_message,
                                 &access_token,
                                 vec![INBOX_ID],
+                                flags,
                                 &rcpt,
                                 &message.sender_address,
                                 message.sender_authenticated,
@@ -367,7 +374,7 @@ impl MailDelivery for Server {
 
 /// Try to call the delivery hook to determine mailbox filing
 /// Returns:
-/// - Ok(Some((mailbox_ids, handled))) if hook specified mailbox(es) to file into
+/// - Ok(Some((mailbox_ids, flags, handled))) if hook specified mailbox(es) to file into
 /// - Ok(None) if hook accepted without modifications (continue normal flow)
 /// - Err if hook rejected the message
 async fn try_delivery_hook(
@@ -377,7 +384,7 @@ async fn try_delivery_hook(
     recipient: &str,
     parsed_message: &Option<mail_parser::Message<'_>>,
     message_size: usize,
-) -> trc::Result<Option<(Vec<u32>, bool)>> {
+) -> trc::Result<Option<(Vec<u32>, Vec<String>, bool)>> {
     use std::time::Instant;
 
     // Build envelope with SMTP hook types
@@ -463,10 +470,17 @@ async fn try_delivery_hook(
 
     // Process all hook results
     let mut all_mailbox_ids = Vec::new();
+    let mut all_flags = Vec::new();
     let mut keep_in_inbox = true;
     let mut should_tempfail = false;
     let mut should_permfail = false;
     let mut any_accept_with_modifications = false;
+
+    // Get mailbox cache for resolving mailbox names and special use folders
+    let mut cache = server
+        .get_cached_messages(user_id)
+        .await
+        .caused_by(trc::location!())?;
 
     for (hook, result, elapsed) in hook_results {
         match result {
@@ -495,14 +509,6 @@ async fn try_delivery_hook(
                                     special_use,
                                     create,
                                 } => {
-                                    // Handle mailbox name (could be used for logging or validation)
-                                    trc::event!(
-                                        DeliveryHook(trc::DeliveryHookEvent::ActionFileInto),
-                                        AccountId = user_id,
-                                        Details = format!("Hook '{}': Filing into mailbox '{}' (ID: {}) with flags: {:?}, special_use: {:?}, create: {}",
-                                            hook.id, mailbox, mailbox_id, flags, special_use, create),
-                                    );
-
                                     let mut target_id = u32::MAX;
 
                                     // Find mailbox by Id first (similar to sieve ingest logic)
@@ -510,7 +516,10 @@ async fn try_delivery_hook(
                                         if let Some(id) = jmap_proto::types::id::Id::from_bytes(
                                             mailbox_id.as_bytes(),
                                         ) {
-                                            target_id = id.document_id();
+                                            let document_id = id.document_id();
+                                            if cache.has_mailbox_id(&document_id) {
+                                                target_id = document_id;
+                                            }
                                         }
                                     }
 
@@ -522,26 +531,30 @@ async fn try_delivery_hook(
                                             target_id = INBOX_ID;
                                         } else if special_use_role.eq_ignore_ascii_case("trash") {
                                             target_id = TRASH_ID;
+                                        } else if let Ok(role) = SpecialUse::parse_value(special_use_role)
+                                            && let Some(item) = cache.mailbox_by_role(&role)
+                                        {
+                                            target_id = item.document_id;
                                         }
-                                        // Note: For other special use roles, we'd need access to the mailbox cache
-                                        // which isn't available at this level. The actual mailbox lookup
-                                        // would need to be done during Sieve script processing.
                                     }
 
-                                    // Use folder name as fallback (though we can't resolve it here without account context)
+                                    // Find mailbox by name
                                     if target_id == u32::MAX {
-                                        // Log that we're using the provided mailbox_id as-is
-                                        trc::event!(
-                                            DeliveryHook(trc::DeliveryHookEvent::ActionFileInto),
-                                            AccountId = user_id,
-                                            Details = format!("Hook '{}': Could not resolve mailbox, using folder name: {}", hook.id, mailbox),
-                                        );
-
-                                        // Try to parse mailbox_id again as fallback
-                                        if let Some(id) = jmap_proto::types::id::Id::from_bytes(
-                                            mailbox_id.as_bytes(),
-                                        ) {
-                                            target_id = id.document_id();
+                                        if !create {
+                                            if let Some(m) = cache.mailbox_by_path(&mailbox) {
+                                                target_id = m.document_id;
+                                            }
+                                        } else if let Some(document_id) = server
+                                            .mailbox_create_path(user_id, &mailbox)
+                                            .await
+                                            .caused_by(trc::location!())?
+                                        {
+                                            // Refresh cache after creating mailbox
+                                            cache = server
+                                                .get_cached_messages(user_id)
+                                                .await
+                                                .caused_by(trc::location!())?;
+                                            target_id = document_id;
                                         }
                                     }
 
@@ -550,12 +563,23 @@ async fn try_delivery_hook(
                                         target_id = INBOX_ID;
                                     }
 
+                                    trc::event!(
+                                        DeliveryHook(trc::DeliveryHookEvent::ActionFileInto),
+                                        AccountId = user_id,
+                                        Details = format!("Hook '{}': Filing into mailbox '{}' (resolved ID: {}) with flags: {:?}, special_use: {:?}, create: {}",
+                                            hook.id, mailbox, target_id, flags, special_use, create),
+                                    );
+
                                     if !all_mailbox_ids.contains(&target_id) {
                                         all_mailbox_ids.push(target_id);
                                     }
 
-                                    // TODO: Handle flags - they would need to be applied during message ingestion
-                                    // TODO: Handle create - mailbox creation would need to happen during Sieve processing
+                                    // Collect flags for this modification
+                                    for flag in flags {
+                                        if !all_flags.contains(&flag) {
+                                            all_flags.push(flag);
+                                        }
+                                    }
 
                                     any_accept_with_modifications = true;
                                 }
@@ -622,7 +646,7 @@ async fn try_delivery_hook(
             Details = format!("Filed into mailboxes: {:?}", all_mailbox_ids),
         );
 
-        return Ok(Some((all_mailbox_ids, true)));
+        return Ok(Some((all_mailbox_ids, all_flags, true)));
     }
 
     // If no hooks handled the message, continue with normal flow
