@@ -12,6 +12,7 @@ pub mod report;
 pub mod resolver;
 pub mod session;
 pub mod throttle;
+pub mod delivery_hook;
 
 use crate::expr::{Expression, tokenizer::TokenMap};
 

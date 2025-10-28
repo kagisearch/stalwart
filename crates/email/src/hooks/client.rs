@@ -5,7 +5,7 @@
  */
 
 use utils::HttpLimitResponse;
-use common::config::smtp::session::DeliveryHook;
+use common::config::smtp::delivery_hook::DeliveryHook;
 
 use super::{Request, Response};
 

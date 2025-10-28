@@ -11,6 +11,10 @@ pull in all features from the main Stalwart project.
 * Keep changes isolated, in new files, where possible.
 * Add tests for new behavior to verify external changes don't cause regressions.
 * Keep changes minimal, providing extensible functionality through hooks to eternal systems.
+* Avoid deduplication between fork code and new functionality.
+    * This helps with merge conflicts at the cost of duplication.
+    * The other trade off is that when bugs are fixed in the fork, our copied code may miss out.
+    * This guidance may change in the future.
 
 ### Setup
 
