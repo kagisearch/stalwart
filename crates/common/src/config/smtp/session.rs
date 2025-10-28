@@ -21,7 +21,7 @@ use smtp_proto::*;
 use utils::config::{Config, utils::ParseValue};
 
 use crate::{
-    config::{CONNECTION_VARS, smtp::delivery_hook::DeliveryHook},
+    config::{CONNECTION_VARS, smtp::delivery_hooks::DeliveryHook},
     expr::{if_block::IfBlock, tokenizer::TokenMap, *},
 };
 
@@ -29,7 +29,7 @@ use self::resolver::Policy;
 
 use super::*;
 
-use delivery_hook::parse_delivery_hooks;
+use delivery_hooks::parse_delivery_hooks;
 
 #[derive(Clone)]
 pub struct SessionConfig {

@@ -7,12 +7,12 @@
 use utils::config::{Config, Rate};
 
 pub mod auth;
+pub mod delivery_hooks;
 pub mod queue;
 pub mod report;
 pub mod resolver;
 pub mod session;
 pub mod throttle;
-pub mod delivery_hook;
 
 use crate::expr::{Expression, tokenizer::TokenMap};
 

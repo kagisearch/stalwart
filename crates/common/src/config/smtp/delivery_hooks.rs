@@ -4,37 +4,32 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::{str::FromStr, time::Duration};
+//! Configuration parsing for delivery hooks
+//! 
+//! This module provides the configuration structure and parsing logic
+//! for delivery hooks, extending the base session configuration.
 
+use std::str::FromStr;
 use base64::{Engine, engine::general_purpose::STANDARD};
-
-use hyper::{
-    HeaderMap,
-    header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue},
-};
+use hyper::{HeaderMap, header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue}};
 use utils::config::Config;
+use crate::expr::{if_block::IfBlock, tokenizer::TokenMap};
 
-use crate::{
-    expr::{if_block::IfBlock, tokenizer::TokenMap},
-};
-
+/// Configuration for a delivery hook
 #[derive(Clone)]
 pub struct DeliveryHook {
     pub enable: IfBlock,
     pub id: String,
     pub url: String,
-    pub timeout: Duration,
+    pub timeout: std::time::Duration,
     pub headers: HeaderMap,
     pub tls_allow_invalid_certs: bool,
     pub tempfail_on_error: bool,
     pub max_response_size: usize,
 }
 
-pub fn parse_delivery_hooks(
-    config: &mut Config,
-    id: &str,
-    token_map: &TokenMap,
-) -> Option<DeliveryHook> {
+/// Parse delivery hook configuration from TOML config
+pub fn parse_delivery_hooks(config: &mut Config, id: &str, token_map: &TokenMap) -> Option<DeliveryHook> {
     let mut headers = HeaderMap::new();
 
     for (header, value) in config
@@ -90,18 +85,12 @@ pub fn parse_delivery_hooks(
             .to_string(),
         timeout: config
             .property_or_default(("session.delivery_hook", id, "timeout"), "30s")
-            .unwrap_or_else(|| Duration::from_secs(30)),
+            .unwrap_or_else(|| std::time::Duration::from_secs(30)),
         tls_allow_invalid_certs: config
-            .property_or_default(
-                ("session.delivery_hook", id, "allow-invalid-certs"),
-                "false",
-            )
+            .property_or_default(("session.delivery_hook", id, "allow-invalid-certs"), "false")
             .unwrap_or_default(),
         tempfail_on_error: config
-            .property_or_default(
-                ("session.delivery_hook", id, "options.tempfail-on-error"),
-                "true",
-            )
+            .property_or_default(("session.delivery_hook", id, "options.tempfail-on-error"), "true")
             .unwrap_or(true),
         max_response_size: config
             .property_or_default(
