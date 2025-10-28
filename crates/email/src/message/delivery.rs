@@ -156,6 +156,7 @@ impl MailDelivery for Server {
                         uid,
                         &message.sender_address,
                         &rcpt,
+                        &raw_message,
                         &parsed_message,
                         message.message_size as usize,
                     )

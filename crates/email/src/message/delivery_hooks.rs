@@ -107,6 +107,7 @@ pub async fn try_delivery_hook(
     user_id: u32,
     sender: &str,
     recipient: &str,
+    raw_message: &[u8],
     parsed_message: &Option<mail_parser::Message<'_>>,
     message_size: usize,
 ) -> trc::Result<Option<(Vec<u32>, Vec<String>, bool)>> {
@@ -137,15 +138,14 @@ pub async fn try_delivery_hook(
         hooks::Message {
             headers,
             server_headers: vec![],
-            // TODO: This should be the full raw message, so we can modify it per user
-            contents: msg.body_text(0).map(|text| text.as_ref().to_string()).unwrap_or_default(),
+            contents: String::from_utf8_lossy(raw_message).into_owned(),
             size: message_size,
         }
     } else {
         hooks::Message {
             headers: vec![],
             server_headers: vec![],
-            contents: String::new(),
+            contents: String::from_utf8_lossy(raw_message).into_owned(),
             size: message_size,
         }
     };
