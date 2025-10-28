@@ -5,7 +5,7 @@
  */
 
 //! Configuration parsing for delivery hooks
-//! 
+//!
 //! This module provides the configuration structure and parsing logic
 //! for delivery hooks, extending the base session configuration.
 

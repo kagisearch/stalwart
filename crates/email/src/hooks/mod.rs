@@ -63,7 +63,9 @@ pub enum Action {
 pub enum Modification {
     #[serde(rename = "fileInto")]
     FileInto {
+        #[serde(default)]
         folder: String,
+        #[serde(default)]
         mailbox_id: String,
         #[serde(default)]
         flags: Vec<String>,
