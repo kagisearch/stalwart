@@ -284,8 +284,17 @@ impl SieveScriptIngest for Server {
                         input = true.into();
                     }
                     Event::Keep { flags, message_id } => {
+                        // KAGI FORK:
+                        // sieve will emit a keep event if no other actions are specified
+                        // we ignore this, unless flags are present, since we default to adding
+                        // to the inbox as a result of delivery hooks
+                        if flags.is_empty() {
+                            do_deliver = true;
+                            input = true.into();
+                            continue;
+                        }
                         if let Some(message) = messages.get_mut(message_id) {
-                            message.flags = flags.into_iter().map(Keyword::from).collect();
+                            message.flags.extend(flags.into_iter().map(Keyword::from));
                             if !message.file_into.contains(&INBOX_ID) {
                                 message.file_into.push(INBOX_ID);
                             }
