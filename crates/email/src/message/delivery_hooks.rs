@@ -297,8 +297,7 @@ pub async fn try_delivery_hook(
 
     // If any hook specified mailboxes, file into those mailboxes
     if any_accept_with_modifications {
-        // If keep_in_inbox is true, add INBOX_ID
-        if skip_inbox && !all_mailbox_ids.contains(&INBOX_ID) {
+        if !skip_inbox && !all_mailbox_ids.contains(&INBOX_ID) {
             all_mailbox_ids.push(INBOX_ID);
         }
 
