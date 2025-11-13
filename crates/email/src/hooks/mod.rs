@@ -74,6 +74,8 @@ pub enum Modification {
         #[serde(default)]
         create: bool,
     },
+    #[serde(rename = "addHeader")]
+    AddHeader { name: String, value: String },
 }
 
 impl Request {

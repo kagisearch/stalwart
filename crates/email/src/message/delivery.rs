@@ -19,10 +19,32 @@ use crate::{
     sieve::ingest::{SieveOutputMessage, SieveScriptIngest},
 };
 
+use crate::hooks::Modification as HookModification;
 use super::{
     delivery_hooks::try_delivery_hook,
     ingest::{EmailIngest, IngestEmail, IngestSource},
 };
+
+// Prepend AddHeader modifications to a raw RFC 5322 message
+fn apply_add_header_modifications(add_headers: &[(String, String)], original_raw: &[u8]) -> Vec<u8> {
+    let extra_len: usize = add_headers
+        .iter()
+        .map(|(h, v)| h.len() + 2 + v.len() + 2) // ": " + CRLF
+        .sum();
+    let mut new_message = Vec::with_capacity(original_raw.len() + extra_len);
+
+    for (name, value) in add_headers {
+        new_message.extend_from_slice(name.as_bytes());
+        new_message.extend_from_slice(b": ");
+        new_message.extend_from_slice(value.as_bytes());
+        if !value.ends_with('\n') {
+            new_message.extend_from_slice(b"\r\n");
+        }
+    }
+
+    new_message.extend_from_slice(original_raw);
+    new_message
+}
 
 #[derive(Debug)]
 pub struct IngestMessage {
@@ -32,6 +54,79 @@ pub struct IngestMessage {
     pub message_blob: BlobHash,
     pub message_size: u64,
     pub session_id: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_add_header_modifications;
+    use mail_parser::MessageParser;
+
+    fn parse_headers(raw: &[u8]) -> Vec<(String, String)> {
+        let msg = MessageParser::new().parse(raw).expect("parse message");
+        msg.root_part()
+            .headers()
+            .iter()
+            .map(|h| {
+                (
+                    h.name().to_string(),
+                    h.value().as_text().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn add_single_header_prepends_and_parses() {
+        let base = b"Subject: Hi\r\n\r\nBody";
+        let out = apply_add_header_modifications(
+            &[("X-Test".to_string(), "foo".to_string())],
+            base,
+        );
+
+        // Prepend before original headers
+        let expected_prefix = b"X-Test: foo\r\nSubject: Hi\r\n\r\n";
+        assert!(out.starts_with(expected_prefix));
+
+        // Parser must see the new header
+        let headers = parse_headers(&out);
+        assert!(headers.iter().any(|(n, v)| n == "X-Test" && v == "foo"));
+    }
+
+    #[test]
+    fn add_multiple_headers_preserves_order() {
+        let base = b"Subject: Hi\r\n\r\nBody";
+        let out = apply_add_header_modifications(
+            &[
+                ("X-A".to_string(), "1".to_string()),
+                ("X-B".to_string(), "2".to_string()),
+            ],
+            base,
+        );
+
+        // Ensure order X-A then X-B at the top
+        let s = String::from_utf8_lossy(&out);
+        let pos_a = s.find("X-A: 1").unwrap();
+        let pos_b = s.find("X-B: 2").unwrap();
+        assert!(pos_a < pos_b);
+
+        let headers = parse_headers(&out);
+        // Both must be present
+        assert!(headers.iter().any(|(n, v)| n == "X-A" && v == "1"));
+        assert!(headers.iter().any(|(n, v)| n == "X-B" && v == "2"));
+    }
+
+    #[test]
+    fn add_header_with_trailing_lf_is_accepted() {
+        let base = b"Subject: Hi\r\n\r\nBody";
+        let out = apply_add_header_modifications(
+            &[("X-LF".to_string(), "val\n".to_string())],
+            base,
+        );
+
+        // We don't normalize existing trailing LF to CRLF; parser should still accept
+        let headers = parse_headers(&out);
+        assert!(headers.iter().any(|(n, v)| n == "X-LF" && v == "val"));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,8 +430,12 @@ async fn deliver_to_recipient(
         let mut mailbox_ids: Vec<u32> = output_message.mailbox_ids;
         let mut keywords: Vec<jmap_proto::types::keyword::Keyword> = output_message.keywords;
 
+        // Apply delivery hooks (mailboxes/flags/skip_inbox + per-recipient modifications)
+        let mut owned_new_raw: Option<Vec<u8>> = None;
+        let mut use_modified = false;
+        let mut parsed_for_ingest = parsed_output_message.clone();
         match try_delivery_hook(server, uid, &sender, &rcpt, &parsed_output_message).await {
-            Ok((hook_mailboxes, hook_flags, skip_inbox)) => {
+            Ok((hook_mailboxes, hook_flags, skip_inbox, hook_modifications)) => {
                 for id in hook_mailboxes {
                     if !mailbox_ids.contains(&id) {
                         mailbox_ids.push(id);
@@ -355,14 +454,60 @@ async fn deliver_to_recipient(
                 if skip_inbox {
                     mailbox_ids.retain(|&id| id != INBOX_ID);
                 }
+
+                // Filter and apply AddHeader modifications
+                let add_headers: Vec<(String, String)> = hook_modifications
+                    .into_iter()
+                    .filter_map(|m| match m {
+                        HookModification::AddHeader { name, value } => Some((name, value)),
+                        _ => None,
+                    })
+                    .collect();
+
+                if !add_headers.is_empty() {
+                    owned_new_raw = Some(apply_add_header_modifications(
+                        &add_headers,
+                        &output_message.raw,
+                    ));
+
+                    // Try to re-parse the modified message; rollback on failure
+                    let parse_ok = if let Some(ref bytes) = owned_new_raw {
+                        if let Some(new_parsed) = MessageParser::new().parse(bytes) {
+                            parsed_for_ingest = new_parsed;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if !parse_ok {
+                        trc::event!(
+                            MessageIngest(trc::MessageIngestEvent::Error),
+                            Details = "Failed to parse message after AddHeader modifications.",
+                            SpanId = session_id
+                        );
+                        use_modified = false;
+                    } else {
+                        use_modified = true;
+                    }
+                }
             }
             Err(err) => return Err(err),
         }
 
+        // Use modified raw bytes if present
+        let raw_for_ingest: &[u8] = if use_modified {
+            owned_new_raw.as_deref().expect("modified bytes must exist when flagged")
+        } else {
+            &output_message.raw
+        };
+
         match server
             .email_ingest(IngestEmail {
-                raw_message: &output_message.raw,
-                message: Some(parsed_output_message),
+                raw_message: raw_for_ingest,
+                message: Some(parsed_for_ingest),
                 access_token: &access_token,
                 mailbox_ids,
                 keywords,

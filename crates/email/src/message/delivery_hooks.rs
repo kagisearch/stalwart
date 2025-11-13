@@ -38,14 +38,14 @@ impl ResolveVariable for DeliveryResolver {
 
 /// Try to call the delivery hook to determine mailbox filing
 /// Returns:
-/// - (mailbox_ids, flags, skip_inbox)
+/// - (mailbox_ids, flags, skip_inbox, modifications)
 pub async fn try_delivery_hook(
     server: &Server,
     user_id: u32,
     sender: &str,
     recipient: &str,
     parsed_message: &mail_parser::Message<'_>,
-) -> trc::Result<(HashSet<u32>, HashSet<String>, bool)> {
+) -> trc::Result<(HashSet<u32>, HashSet<String>, bool, Vec<Modification>)> {
     // Build envelope with SMTP hook types
     let envelope = hooks::Envelope {
         from: hooks::Address {
@@ -85,7 +85,7 @@ pub async fn try_delivery_hook(
 
     // If no hooks configured, return None to continue normal flow
     if delivery_hooks.is_empty() {
-        return Ok((HashSet::new(), HashSet::new(), false));
+        return Ok((HashSet::new(), HashSet::new(), false, Vec::new()));
     }
 
     // Filter enabled hooks
@@ -102,7 +102,7 @@ pub async fn try_delivery_hook(
     }
 
     if enabled_hooks.is_empty() {
-        return Ok((HashSet::new(), HashSet::new(), false));
+        return Ok((HashSet::new(), HashSet::new(), false, Vec::new()));
     }
 
     // Run all enabled hooks in parallel
@@ -122,6 +122,7 @@ pub async fn try_delivery_hook(
     let mut mailbox_ids = HashSet::new();
     let mut flags = HashSet::new();
     let mut skip_inbox = false;
+    let mut modifications_out: Vec<Modification> = Vec::new();
     let mut should_tempfail = false;
     let mut should_permfail = false;
 
@@ -223,6 +224,8 @@ pub async fn try_delivery_hook(
                                         mailbox_ids.insert(target_id);
                                     }
                                 }
+                                // Push through other modifications (e.g., AddHeader) for per-recipient handling
+                                other => modifications_out.push(other),
                             }
                         }
                     }
@@ -286,5 +289,5 @@ pub async fn try_delivery_hook(
         Details = format!("Filed into mailboxes: {:?}", mailbox_ids),
     );
 
-    Ok((mailbox_ids, flags, skip_inbox))
+    Ok((mailbox_ids, flags, skip_inbox, modifications_out))
 }
