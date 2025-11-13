@@ -48,6 +48,8 @@ pub struct Response {
     pub modifications: Vec<Modification>,
     #[serde(default)]
     pub skip_inbox: bool,
+    #[serde(default)]
+    pub flags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -67,8 +69,6 @@ pub enum Modification {
         folder: String,
         #[serde(default)]
         mailbox_id: String,
-        #[serde(default)]
-        flags: Vec<String>,
         #[serde(default)]
         special_use: Option<String>,
         #[serde(default)]
