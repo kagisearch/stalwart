@@ -53,7 +53,7 @@ strip = true
 
 [profile.test]
 opt-level = 0
-debug = 'full'
+debug = 1
 #codegen-units = 16
 lto = false
 incremental = true
