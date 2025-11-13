@@ -11,7 +11,6 @@ use jmap_proto::types::{id::Id, state::StateChange, type_state::DataType};
 use mail_parser::MessageParser;
 use std::{borrow::Cow, future::Future};
 use store::ahash::AHashMap;
-use trc::SieveEvent;
 use utils::BlobHash;
 
 use crate::{
@@ -324,7 +323,7 @@ async fn deliver_to_recipient(
             message
         } else {
             trc::event!(
-                Sieve(SieveEvent::UnexpectedError),
+                MessageIngest(trc::MessageIngestEvent::Error),
                 Details = "Failed to parse Sieve generated message.",
                 SpanId = session_id
             );
