@@ -460,7 +460,20 @@ impl BootManager {
 
                 trc::event!(
                     Server(trc::ServerEvent::Startup),
-                    Version = env!("CARGO_PKG_VERSION"),
+                    Version = format!(
+                        "{}{}{}",
+                        env!("CARGO_PKG_VERSION"),
+                        if let Some(commit) = built_info::GIT_COMMIT_HASH {
+                            format!("-{}", commit)
+                        } else {
+                            "".to_string()
+                        },
+                        if built_info::GIT_DIRTY.unwrap_or(false) {
+                            "-dirty"
+                        } else {
+                            ""
+                        },
+                    ),
                 );
 
                 // Webadmin auto-update
