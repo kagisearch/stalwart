@@ -34,7 +34,7 @@ pub struct Message {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Request {
     pub user_id: String,
-    pub user_id_num: u32,
+    pub principal_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub envelope: Option<Envelope>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -79,10 +79,10 @@ pub enum Modification {
 }
 
 impl Request {
-    pub fn new(user_id: String, user_id_num: u32) -> Self {
+    pub fn new(user_id: String, principal_name: String) -> Self {
         Self {
             user_id,
-            user_id_num,
+            principal_name,
             envelope: None,
             message: None,
         }

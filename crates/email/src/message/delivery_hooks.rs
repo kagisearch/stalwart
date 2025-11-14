@@ -68,9 +68,28 @@ pub async fn try_delivery_hook(
         })
         .collect();
 
+    let principal = match server
+        .directory()
+        .query(directory::QueryParams::id(user_id))
+        .await
+    {
+        Ok(principal) => match principal {
+            Some(principal) => principal,
+            None => {
+                return Err(
+                    trc::EventType::MessageIngest(trc::MessageIngestEvent::Error).ctx(
+                        trc::Key::Reason,
+                        "User principal not found for delivery hook",
+                    ),
+                );
+            }
+        },
+        Err(err) => return Err(err),
+    };
+
     let request = hooks::Request::new(
         jmap_proto::types::id::Id::from(user_id).as_string(),
-        user_id,
+        principal.name,
     )
     .with_envelope(envelope)
     .with_message(hooks::Message {
