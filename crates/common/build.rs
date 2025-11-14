@@ -20,6 +20,8 @@ fn main() {
 
     fs::write(&dest_path, generated_code).expect("Failed to write generated locales.");
 
+    built::write_built_file().expect("Failed to acquire build-time information");
+
     println!("cargo:rerun-if-changed={}", yaml_path.display());
 }
 
