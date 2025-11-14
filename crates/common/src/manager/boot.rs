@@ -49,6 +49,10 @@ pub struct IpcReceivers {
     pub broadcast_rx: Option<mpsc::Receiver<BroadcastEvent>>,
 }
 
+pub mod built_info {
+    include!(concat!(env!("OUT_DIR"), "/built.rs"));
+}
+
 const HELP: &str = concat!(
     "Stalwart Server v",
     env!("CARGO_PKG_VERSION"),
@@ -201,6 +205,22 @@ impl BootManager {
                     }
                     ("version" | "V", _) => {
                         println!("{}", env!("CARGO_PKG_VERSION"));
+                        if let Some(commit) = built_info::GIT_COMMIT_HASH {
+                            println!(
+                                "Git: {}{}{}",
+                                commit,
+                                if built_info::GIT_DIRTY.unwrap_or(false) {
+                                    "-dirty"
+                                } else {
+                                    ""
+                                },
+                                if let Some(git_ref) = built_info::GIT_HEAD_REF {
+                                    format!(" ({})", git_ref)
+                                } else {
+                                    "".to_string()
+                                },
+                            );
+                        }
                         std::process::exit(0);
                     }
                     ("config" | "c", Some(value)) => {

@@ -85,3 +85,6 @@ foundation = []
 
 [dev-dependencies]
 tokio = { version = "1.47", features = ["full"] }
+
+[build-dependencies]
+built = { version = "0.7", features = ["git2"] }
