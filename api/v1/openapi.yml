@@ -1944,30 +1944,6 @@ paths:
               - type: addAppPassword
                 name: dGVzdCQyMDI1LTAxLTA1VDE0OjEyOjUxLjg0NyswMDowMA==
                 password: $6$4M/5LmG7b13r0cdE$6zb.i6wJ3pAQHA2MRHkKg0t8bgSYb2IeqiIU115t.NugwW6VXifE0VKI5n2BQUNwdeDMUzaX82TmhuVVgC0Gx1
-  /reload/:
-    get:
-      summary: Reload Settings
-      responses:
-        "200":
-          description: OK
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  data:
-                    type: object
-                    properties:
-                      warnings:
-                        type: object
-                        properties: {}
-                      errors:
-                        type: object
-                        properties: {}
-              example:
-                data:
-                  warnings: {}
-                  errors: {}
   /queue/status/stop:
     patch:
       summary: Stop Queue Processing
