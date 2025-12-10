@@ -17,11 +17,13 @@ use utils::config::utils::ParseValue;
 
 use crate::{
     cache::{MessageCacheFetch, mailbox::MailboxCacheAccess},
-    hooks::{self, Action as HookAction, Modification, client::send_delivery_hook_request},
+    hooks::{
+        self, Action as HookAction, Modification, ModificationOut,
+        client::send_delivery_hook_request,
+    },
     mailbox::{INBOX_ID, TRASH_ID, manage::MailboxFnc},
 };
 
-// Simple resolver for delivery hooks (no variables needed)
 pub struct DeliveryResolver;
 
 impl ResolveVariable for DeliveryResolver {
@@ -39,14 +41,16 @@ impl ResolveVariable for DeliveryResolver {
 /// Try to call the delivery hook to determine mailbox filing
 /// Returns:
 /// - (mailbox_ids, flags, skip_inbox, modifications)
+/// - none: discard message, but don't return an error
 pub async fn try_delivery_hook(
     server: &Server,
     user_id: u32,
     sender: &str,
     recipient: &str,
     parsed_message: &mail_parser::Message<'_>,
-) -> trc::Result<(HashSet<u32>, HashSet<String>, bool, Vec<Modification>)> {
-    // Build envelope with SMTP hook types
+) -> trc::Result<Option<(HashSet<u32>, HashSet<String>, bool, Vec<ModificationOut>)>> {
+    let default_response = Some((HashSet::new(), HashSet::new(), false, Vec::new()));
+
     let envelope = hooks::Envelope {
         from: hooks::Address {
             address: sender.to_string(),
@@ -102,9 +106,9 @@ pub async fn try_delivery_hook(
     // Get configured delivery hooks
     let delivery_hooks = &server.core.smtp.session.delivery_hooks;
 
-    // If no hooks configured, return None to continue normal flow
+    // If no hooks configured, return default to continue normal flow
     if delivery_hooks.is_empty() {
-        return Ok((HashSet::new(), HashSet::new(), false, Vec::new()));
+        return Ok(default_response);
     }
 
     // Filter enabled hooks
@@ -121,7 +125,7 @@ pub async fn try_delivery_hook(
     }
 
     if enabled_hooks.is_empty() {
-        return Ok((HashSet::new(), HashSet::new(), false, Vec::new()));
+        return Ok(default_response);
     }
 
     // Run all enabled hooks in parallel
@@ -141,7 +145,7 @@ pub async fn try_delivery_hook(
     let mut mailbox_ids = HashSet::new();
     let mut flags = HashSet::new();
     let mut skip_inbox = false;
-    let mut modifications_out: Vec<Modification> = Vec::new();
+    let mut modifications_out: Vec<ModificationOut> = Vec::new();
     let mut should_tempfail = false;
     let mut should_permfail = false;
 
@@ -154,6 +158,82 @@ pub async fn try_delivery_hook(
     for (hook, result, elapsed) in hook_results {
         match result {
             Ok(response) => {
+                if response.skip_inbox {
+                    skip_inbox = true;
+                }
+
+                for flag in response.flags {
+                    flags.insert(flag);
+                }
+
+                for modification in response.modifications {
+                    match modification {
+                        Modification::FileInto {
+                            folder: mailbox,
+                            mailbox_id,
+                            special_use,
+                            create,
+                        } => {
+                            let mut target_id = u32::MAX;
+
+                            // Find mailbox by Id first (similar to sieve ingest logic)
+                            if !mailbox_id.is_empty() {
+                                if let Some(id) =
+                                    jmap_proto::types::id::Id::from_bytes(mailbox_id.as_bytes())
+                                {
+                                    let document_id = id.document_id();
+                                    if cache.has_mailbox_id(&document_id) {
+                                        target_id = document_id;
+                                    }
+                                }
+                            }
+
+                            // Find mailbox by special_use role if ID not found
+                            if let Some(special_use_role) = &special_use
+                                && target_id == u32::MAX
+                            {
+                                if special_use_role.eq_ignore_ascii_case("inbox") {
+                                    target_id = INBOX_ID;
+                                } else if special_use_role.eq_ignore_ascii_case("trash") {
+                                    target_id = TRASH_ID;
+                                } else if let Ok(role) = SpecialUse::parse_value(special_use_role)
+                                    && let Some(item) = cache.mailbox_by_role(&role)
+                                {
+                                    target_id = item.document_id;
+                                }
+                            }
+
+                            // Find mailbox by name
+                            if target_id == u32::MAX {
+                                if !create {
+                                    if let Some(m) = cache.mailbox_by_path(&mailbox) {
+                                        target_id = m.document_id;
+                                    }
+                                } else if let Some(document_id) = server
+                                    .mailbox_create_path(user_id, &mailbox)
+                                    .await
+                                    .caused_by(trc::location!())?
+                                {
+                                    // Refresh cache after creating mailbox
+                                    cache = server
+                                        .get_cached_messages(user_id)
+                                        .await
+                                        .caused_by(trc::location!())?;
+                                    target_id = document_id;
+                                }
+                            }
+
+                            // Don't file into invalid mailboxes
+                            if target_id != u32::MAX {
+                                mailbox_ids.insert(target_id);
+                            }
+                        }
+                        Modification::AddHeader { name, value } => {
+                            modifications_out.push(ModificationOut::AddHeader { name, value });
+                        }
+                    }
+                }
+
                 match response.action {
                     HookAction::Accept => {
                         trc::event!(
@@ -162,91 +242,28 @@ pub async fn try_delivery_hook(
                             Details = format!("Hook '{}' accepted", hook.id),
                             Elapsed = elapsed,
                         );
-
-                        if response.skip_inbox {
-                            skip_inbox = true;
-                        }
-
-                        for flag in response.flags {
-                            flags.insert(flag);
-                        }
-
-                        for modification in response.modifications {
-                            match modification {
-                                Modification::FileInto {
-                                    folder: mailbox,
-                                    mailbox_id,
-                                    special_use,
-                                    create,
-                                } => {
-                                    let mut target_id = u32::MAX;
-
-                                    // Find mailbox by Id first (similar to sieve ingest logic)
-                                    if !mailbox_id.is_empty() {
-                                        if let Some(id) = jmap_proto::types::id::Id::from_bytes(
-                                            mailbox_id.as_bytes(),
-                                        ) {
-                                            let document_id = id.document_id();
-                                            if cache.has_mailbox_id(&document_id) {
-                                                target_id = document_id;
-                                            }
-                                        }
-                                    }
-
-                                    // Find mailbox by special_use role if ID not found
-                                    if let Some(special_use_role) = &special_use
-                                        && target_id == u32::MAX
-                                    {
-                                        if special_use_role.eq_ignore_ascii_case("inbox") {
-                                            target_id = INBOX_ID;
-                                        } else if special_use_role.eq_ignore_ascii_case("trash") {
-                                            target_id = TRASH_ID;
-                                        } else if let Ok(role) =
-                                            SpecialUse::parse_value(special_use_role)
-                                            && let Some(item) = cache.mailbox_by_role(&role)
-                                        {
-                                            target_id = item.document_id;
-                                        }
-                                    }
-
-                                    // Find mailbox by name
-                                    if target_id == u32::MAX {
-                                        if !create {
-                                            if let Some(m) = cache.mailbox_by_path(&mailbox) {
-                                                target_id = m.document_id;
-                                            }
-                                        } else if let Some(document_id) = server
-                                            .mailbox_create_path(user_id, &mailbox)
-                                            .await
-                                            .caused_by(trc::location!())?
-                                        {
-                                            // Refresh cache after creating mailbox
-                                            cache = server
-                                                .get_cached_messages(user_id)
-                                                .await
-                                                .caused_by(trc::location!())?;
-                                            target_id = document_id;
-                                        }
-                                    }
-
-                                    // Don't file into invalid mailboxes
-                                    if target_id != u32::MAX {
-                                        trc::event!(
-                                            DeliveryHook(trc::DeliveryHookEvent::ActionFileInto),
-                                            AccountId = user_id,
-                                            Details = format!(
-                                                "Hook '{}': Filing into mailbox '{}' (resolved ID: {}), special_use: {:?}, create: {}",
-                                                hook.id, mailbox, target_id, special_use, create
-                                            ),
-                                        );
-
-                                        mailbox_ids.insert(target_id);
-                                    }
-                                }
-                                // Push through other modifications (e.g., AddHeader) for per-recipient handling
-                                other => modifications_out.push(other),
-                            }
-                        }
+                    }
+                    HookAction::Discard => {
+                        trc::event!(
+                            DeliveryHook(trc::DeliveryHookEvent::ActionDiscard),
+                            AccountId = user_id,
+                            Details = format!("Hook '{}' discarded", hook.id),
+                            Elapsed = elapsed,
+                        );
+                        // Discard means we stop processing further hooks and do not deliver
+                        return Ok(None);
+                    }
+                    HookAction::Quarantine => {
+                        trc::event!(
+                            DeliveryHook(trc::DeliveryHookEvent::ActionQuarantine),
+                            AccountId = user_id,
+                            Details = format!("Hook '{}' quarantined", hook.id),
+                            Elapsed = elapsed,
+                        );
+                        modifications_out.push(ModificationOut::AddHeader {
+                            name: "X-Quarantine".into(),
+                            value: "true".into(),
+                        });
                     }
                     HookAction::Reject => {
                         trc::event!(
@@ -302,11 +319,5 @@ pub async fn try_delivery_hook(
         );
     }
 
-    trc::event!(
-        DeliveryHook(trc::DeliveryHookEvent::ActionFileInto),
-        AccountId = user_id,
-        Details = format!("Filed into mailboxes: {:?}", mailbox_ids),
-    );
-
-    Ok((mailbox_ids, flags, skip_inbox, modifications_out))
+    Ok(Some((mailbox_ids, flags, skip_inbox, modifications_out)))
 }
