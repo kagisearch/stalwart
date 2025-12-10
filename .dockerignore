@@ -8,3 +8,6 @@
 
 !Cargo.lock
 !Cargo.toml
+
+// Allow git for adding version information (see 323d315e6f31bf8e8a01111bc3b9150fed5dcfb5)
+!.git
