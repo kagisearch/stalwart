@@ -261,4 +261,31 @@ mod tests {
             .unwrap_string("")
             .unwrap();
     }
+
+    #[test]
+    fn test_as_string_explicit_values() {
+        let test_cases = vec![
+            (0u64, "a"),
+            (1u64, "b"),
+            (31u64, "3"),
+            (32u64, "ba"),
+            (1023u64, "33"),
+            (1048575u64, "3333"),
+            (123456789u64, "dvxtiv"),
+            (65535u64, "b333"),
+            (5111u64, "e3x"),
+            (18446744073709551615u64, "p333333333333"),
+        ];
+
+        for (uint_value, expected_string) in test_cases {
+            let id = Id::from(uint_value);
+            assert_eq!(
+                id.as_string(),
+                expected_string,
+                "as_string() for {} should be '{}'",
+                uint_value,
+                expected_string
+            );
+        }
+    }
 }

@@ -594,8 +594,9 @@ pub enum MtaHookEvent {
 #[event_type]
 pub enum DeliveryHookEvent {
     ActionAccept,
+    ActionDiscard,
     ActionReject,
-    ActionFileInto,
+    ActionQuarantine,
     Error,
 }
 

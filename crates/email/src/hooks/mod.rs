@@ -56,8 +56,12 @@ pub struct Response {
 pub enum Action {
     #[serde(rename = "accept")]
     Accept,
+    #[serde(rename = "discard")]
+    Discard,
     #[serde(rename = "reject")]
     Reject,
+    #[serde(rename = "quarantine")]
+    Quarantine,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -75,6 +79,10 @@ pub enum Modification {
         create: bool,
     },
     #[serde(rename = "addHeader")]
+    AddHeader { name: String, value: String },
+}
+
+pub enum ModificationOut {
     AddHeader { name: String, value: String },
 }
 

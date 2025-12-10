@@ -412,8 +412,9 @@ impl EventType {
             },
             EventType::DeliveryHook(event) => match event {
                 DeliveryHookEvent::ActionAccept
+                | DeliveryHookEvent::ActionDiscard
                 | DeliveryHookEvent::ActionReject
-                | DeliveryHookEvent::ActionFileInto => Level::Info,
+                | DeliveryHookEvent::ActionQuarantine => Level::Info,
                 DeliveryHookEvent::Error => Level::Warn,
             },
             EventType::Dane(event) => match event {

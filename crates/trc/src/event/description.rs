@@ -993,16 +993,18 @@ impl DeliveryHookEvent {
         match self {
             DeliveryHookEvent::ActionAccept => "Delivery hook action: Accept",
             DeliveryHookEvent::ActionReject => "Delivery hook action: Reject",
-            DeliveryHookEvent::ActionFileInto => "Delivery hook action: FileInto",
+            DeliveryHookEvent::ActionQuarantine => "Delivery hook action: Quarantine",
+            DeliveryHookEvent::ActionDiscard => "Delivery hook action: Discard",
             DeliveryHookEvent::Error => "Delivery hook error",
         }
     }
 
     pub fn explain(&self) -> &'static str {
         match self {
-            DeliveryHookEvent::ActionAccept => "The delivery hook accepted the message without modifications",
+            DeliveryHookEvent::ActionAccept => "The delivery hook accepted the message",
             DeliveryHookEvent::ActionReject => "The delivery hook rejected the message",
-            DeliveryHookEvent::ActionFileInto => "The delivery hook filed the message into specific mailboxes",
+            DeliveryHookEvent::ActionQuarantine => "The delivery hook quarantined the message",
+            DeliveryHookEvent::ActionDiscard => "The delivery hook discarded the message",
             DeliveryHookEvent::Error => "An error occurred with the delivery hook",
         }
     }

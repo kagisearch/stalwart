@@ -19,14 +19,17 @@ use crate::{
     sieve::ingest::{SieveOutputMessage, SieveScriptIngest},
 };
 
-use crate::hooks::Modification as HookModification;
 use super::{
     delivery_hooks::try_delivery_hook,
     ingest::{EmailIngest, IngestEmail, IngestSource},
 };
+use crate::hooks::ModificationOut as HookModification;
 
 // Prepend AddHeader modifications to a raw RFC 5322 message
-fn apply_add_header_modifications(add_headers: &[(String, String)], original_raw: &[u8]) -> Vec<u8> {
+fn apply_add_header_modifications(
+    add_headers: &[(String, String)],
+    original_raw: &[u8],
+) -> Vec<u8> {
     let extra_len: usize = add_headers
         .iter()
         .map(|(h, v)| h.len() + 2 + v.len() + 2) // ": " + CRLF
@@ -78,10 +81,8 @@ mod tests {
     #[test]
     fn add_single_header_prepends_and_parses() {
         let base = b"Subject: Hi\r\n\r\nBody";
-        let out = apply_add_header_modifications(
-            &[("X-Test".to_string(), "foo".to_string())],
-            base,
-        );
+        let out =
+            apply_add_header_modifications(&[("X-Test".to_string(), "foo".to_string())], base);
 
         // Prepend before original headers
         let expected_prefix = b"X-Test: foo\r\nSubject: Hi\r\n\r\n";
@@ -118,10 +119,8 @@ mod tests {
     #[test]
     fn add_header_with_trailing_lf_is_accepted() {
         let base = b"Subject: Hi\r\n\r\nBody";
-        let out = apply_add_header_modifications(
-            &[("X-LF".to_string(), "val\n".to_string())],
-            base,
-        );
+        let out =
+            apply_add_header_modifications(&[("X-LF".to_string(), "val\n".to_string())], base);
 
         // We don't normalize existing trailing LF to CRLF; parser should still accept
         let headers = parse_headers(&out);
@@ -435,7 +434,21 @@ async fn deliver_to_recipient(
         let mut use_modified = false;
         let mut parsed_for_ingest = parsed_output_message.clone();
         match try_delivery_hook(server, uid, &sender, &rcpt, &parsed_output_message).await {
-            Ok((hook_mailboxes, hook_flags, skip_inbox, hook_modifications)) => {
+            Ok(result) => {
+                let (hook_mailboxes, hook_flags, skip_inbox, hook_modifications) = match result {
+                    Some(v) => v,
+                    None => {
+                        // Discard without error
+                        return Ok(IngestedEmail {
+                            id: Id::default(),
+                            change_id: u64::MAX, // this is specially handled and the message is not ingested
+                            blob_id: Default::default(),
+                            imap_uids: Vec::new(),
+                            size: 0,
+                        });
+                    }
+                };
+
                 for id in hook_mailboxes {
                     if !mailbox_ids.contains(&id) {
                         mailbox_ids.push(id);
@@ -460,7 +473,6 @@ async fn deliver_to_recipient(
                     .into_iter()
                     .filter_map(|m| match m {
                         HookModification::AddHeader { name, value } => Some((name, value)),
-                        _ => None,
                     })
                     .collect();
 
@@ -499,7 +511,9 @@ async fn deliver_to_recipient(
 
         // Use modified raw bytes if present
         let raw_for_ingest: &[u8] = if use_modified {
-            owned_new_raw.as_deref().expect("modified bytes must exist when flagged")
+            owned_new_raw
+                .as_deref()
+                .expect("modified bytes must exist when flagged")
         } else {
             &output_message.raw
         };
