@@ -124,14 +124,18 @@ mod tests {
     }
 
     #[test]
-    fn add_header_with_trailing_lf_is_accepted() {
+    fn add_header_with_trailing_lf_encodes_it() {
         let base = b"Subject: Hi\r\n\r\nBody";
         let out =
             apply_add_header_modifications(&[("X-LF".to_string(), "val\n".to_string())], base);
 
-        // We don't normalize existing trailing LF to CRLF; parser should still accept
+        // Trailing LF should be encoded per RFC 8187
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("X-LF: val%0A\r\n"));
+
+        // Ensure message remains parseable
         let headers = parse_headers(&out);
-        assert!(headers.iter().any(|(n, v)| n == "X-LF" && v == "val"));
+        assert!(headers.iter().any(|(n, _)| n == "X-LF"));
     }
 
     #[test]
