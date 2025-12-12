@@ -39,10 +39,17 @@ fn apply_add_header_modifications(
     for (name, value) in add_headers {
         new_message.extend_from_slice(name.as_bytes());
         new_message.extend_from_slice(b": ");
-        new_message.extend_from_slice(value.as_bytes());
-        if !value.ends_with('\n') {
-            new_message.extend_from_slice(b"\r\n");
+
+        // Encode LF and CR per RFC 8187 to prevent header corruption
+        for byte in value.bytes() {
+            match byte {
+                b'\r' => new_message.extend_from_slice(b"%0D"),
+                b'\n' => new_message.extend_from_slice(b"%0A"),
+                _ => new_message.push(byte),
+            }
         }
+
+        new_message.extend_from_slice(b"\r\n");
     }
 
     new_message.extend_from_slice(original_raw);
@@ -117,14 +124,51 @@ mod tests {
     }
 
     #[test]
-    fn add_header_with_trailing_lf_is_accepted() {
+    fn add_header_with_trailing_lf_encodes_it() {
         let base = b"Subject: Hi\r\n\r\nBody";
         let out =
             apply_add_header_modifications(&[("X-LF".to_string(), "val\n".to_string())], base);
 
-        // We don't normalize existing trailing LF to CRLF; parser should still accept
+        // Trailing LF should be encoded per RFC 8187
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("X-LF: val%0A\r\n"));
+
+        // Ensure message remains parseable
         let headers = parse_headers(&out);
-        assert!(headers.iter().any(|(n, v)| n == "X-LF" && v == "val"));
+        assert!(headers.iter().any(|(n, _)| n == "X-LF"));
+    }
+
+    #[test]
+    fn add_header_encodes_newlines_per_rfc8187() {
+        let base = b"Subject: Hi\r\n\r\nBody";
+
+        // Test LF encoding
+        let out = apply_add_header_modifications(
+            &[("X-NewLine".to_string(), "before\nafter".to_string())],
+            base,
+        );
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("X-NewLine: before%0Aafter\r\n"));
+
+        // Test CR encoding
+        let out = apply_add_header_modifications(
+            &[("X-CR".to_string(), "before\rafter".to_string())],
+            base,
+        );
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("X-CR: before%0Dafter\r\n"));
+
+        // Test CRLF encoding
+        let out = apply_add_header_modifications(
+            &[("X-CRLF".to_string(), "before\r\nafter".to_string())],
+            base,
+        );
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("X-CRLF: before%0D%0Aafter\r\n"));
+
+        // Ensure the message remains parseable
+        let headers = parse_headers(&out);
+        assert!(headers.iter().any(|(n, _)| n == "X-CRLF"));
     }
 }
 
