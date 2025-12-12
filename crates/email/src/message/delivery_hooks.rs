@@ -61,15 +61,8 @@ pub async fn try_delivery_hook(
     };
 
     let headers = parsed_message
-        .root_part()
-        .headers()
-        .iter()
-        .map(|h| {
-            (
-                h.name().to_string(),
-                h.value().as_text().unwrap_or_default().to_string(),
-            )
-        })
+        .headers_raw()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
     let principal = match server
