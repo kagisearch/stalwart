@@ -4,8 +4,6 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::time::Instant;
-
 use crate::{
     core::{Session, SessionData},
     spawn_op,
@@ -15,9 +13,13 @@ use directory::Permission;
 use imap_proto::{
     Command, ResponseCode, StatusResponse, protocol::rename::Arguments, receiver::Request,
 };
-use jmap_proto::types::{acl::Acl, collection::Collection};
-use store::write::BatchBuilder;
+use std::time::Instant;
+use store::{
+    ValueKey,
+    write::{AlignedBytes, Archive, BatchBuilder},
+};
 use trc::AddContext;
+use types::{acl::Acl, collection::Collection};
 
 use super::ImapContext;
 
@@ -86,7 +88,12 @@ impl<T: SessionStream> SessionData<T> {
         // Obtain mailbox
         let mailbox_ = self
             .server
-            .get_archive(params.account_id, Collection::Mailbox, mailbox_id)
+            .store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                params.account_id,
+                Collection::Mailbox,
+                mailbox_id,
+            ))
             .await
             .imap_ctx(&arguments.tag, trc::location!())?
             .ok_or_else(|| {
@@ -145,7 +152,7 @@ impl<T: SessionStream> SessionData<T> {
             batch
                 .with_account_id(params.account_id)
                 .with_collection(Collection::Mailbox)
-                .create_document(mailbox_id)
+                .with_document(mailbox_id)
                 .custom(ObjectIndexBuilder::<(), _>::new().with_changes(
                     email::mailbox::Mailbox::new(path_item).with_parent_id(parent_id),
                 ))
@@ -165,7 +172,7 @@ impl<T: SessionStream> SessionData<T> {
         batch
             .with_account_id(params.account_id)
             .with_collection(Collection::Mailbox)
-            .update_document(mailbox_id)
+            .with_document(mailbox_id)
             .custom(
                 ObjectIndexBuilder::new()
                     .with_current(mailbox)

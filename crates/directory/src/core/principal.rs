@@ -5,8 +5,8 @@
  */
 
 use crate::{
-    ArchivedPrincipal, FALLBACK_ADMIN_ID, Permission, PermissionGrant, Principal, PrincipalData,
-    ROLE_ADMIN, Type,
+    ArchivedPrincipal, ArchivedPrincipalData, FALLBACK_ADMIN_ID, Permission, PermissionGrant,
+    Principal, PrincipalData, ROLE_ADMIN, Type,
     backend::internal::{PrincipalField, PrincipalSet, PrincipalUpdate, PrincipalValue},
 };
 use ahash::AHashSet;
@@ -16,7 +16,8 @@ use serde::{
     de::{self, IgnoredAny, Visitor},
     ser::SerializeMap,
 };
-use std::{collections::hash_map::Entry, fmt, str::FromStr};
+use serde_json::Value;
+use std::{cmp::Ordering, collections::hash_map::Entry, fmt, str::FromStr};
 use store::{
     U32_LEN, U64_LEN,
     backend::MAX_TOKEN_LENGTH,
@@ -29,11 +30,6 @@ impl Principal {
             id,
             typ,
             name: "".into(),
-            description: None,
-            secrets: Default::default(),
-            emails: Default::default(),
-            quota: Default::default(),
-            tenant: Default::default(),
             data: Default::default(),
         }
     }
@@ -50,25 +46,26 @@ impl Principal {
         self.name.as_str()
     }
 
-    pub fn quota(&self) -> u64 {
-        self.quota.unwrap_or_default()
+    pub fn quota(&self) -> Option<u64> {
+        self.data.iter().find_map(|d| {
+            if let PrincipalData::DiskQuota(quota) = d {
+                if *quota > 0 { Some(*quota) } else { None }
+            } else {
+                None
+            }
+        })
     }
 
-    pub fn principal_quota(&self, typ: &Type) -> Option<u64> {
-        self.data
-            .iter()
-            .find_map(|d| {
-                if let PrincipalData::PrincipalQuota(q) = d {
-                    Some(q)
-                } else {
-                    None
-                }
-            })
-            .and_then(|quotas| {
-                quotas
-                    .iter()
-                    .find_map(|q| if q.typ == *typ { Some(q.quota) } else { None })
-            })
+    pub fn directory_quota(&self, typ: &Type) -> Option<u32> {
+        self.data.iter().find_map(|d| {
+            if let PrincipalData::DirectoryQuota { quota, typ: qtyp } = d
+                && qtyp == typ
+            {
+                Some(*quota)
+            } else {
+                None
+            }
+        })
     }
 
     // SPDX-SnippetBegin
@@ -77,7 +74,13 @@ impl Principal {
 
     #[cfg(feature = "enterprise")]
     pub fn tenant(&self) -> Option<u32> {
-        self.tenant
+        self.data.iter().find_map(|item| {
+            if let PrincipalData::Tenant(tenant) = item {
+                Some(*tenant)
+            } else {
+                None
+            }
+        })
     }
     // SPDX-SnippetEnd
 
@@ -87,92 +90,139 @@ impl Principal {
     }
 
     pub fn description(&self) -> Option<&str> {
-        self.description.as_deref()
-    }
-
-    pub fn member_of(&self) -> &[u32] {
-        self.data
-            .iter()
-            .find_map(|item| {
-                if let PrincipalData::MemberOf(items) = item {
-                    items.as_slice().into()
+        self.data.iter().find_map(|item| {
+            if let PrincipalData::Description(description) = item {
+                if !description.is_empty() {
+                    Some(description.as_str())
                 } else {
                     None
                 }
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn member_of_mut(&mut self) -> Option<&mut Vec<u32>> {
-        self.data.iter_mut().find_map(|item| {
-            if let PrincipalData::MemberOf(items) = item {
-                items.into()
             } else {
                 None
             }
         })
     }
 
-    pub fn roles(&self) -> &[u32] {
-        self.data
-            .iter()
-            .find_map(|item| {
-                if let PrincipalData::Roles(items) = item {
-                    items.as_slice().into()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default()
+    pub fn secret(&self) -> Option<&str> {
+        if let Some(PrincipalData::Password(password)) = self.data.first() {
+            Some(password.as_str())
+        } else if let Some(PrincipalData::Password(password)) = self.data.get(1) {
+            Some(password.as_str())
+        } else {
+            None
+        }
     }
 
-    pub fn permissions(&self) -> &[PermissionGrant] {
-        self.data
-            .iter()
-            .find_map(|item| {
-                if let PrincipalData::Permissions(items) = item {
-                    items.as_slice().into()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn urls(&self) -> &[String] {
-        self.data
-            .iter()
-            .find_map(|item| {
-                if let PrincipalData::Urls(items) = item {
-                    items.as_slice().into()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn roles_mut(&mut self) -> Option<&mut Vec<u32>> {
-        self.data.iter_mut().find_map(|item| {
-            if let PrincipalData::Roles(items) = item {
-                items.into()
+    pub fn primary_email(&self) -> Option<&str> {
+        self.data.iter().find_map(|item| {
+            if let PrincipalData::PrimaryEmail(email) = item {
+                Some(email.as_str())
             } else {
                 None
             }
         })
     }
 
-    pub fn lists(&self) -> &[u32] {
+    pub fn email_addresses(&self) -> impl Iterator<Item = &str> {
+        let mut found_email = false;
         self.data
             .iter()
-            .find_map(|item| {
-                if let PrincipalData::Lists(items) = item {
-                    items.as_slice().into()
+            .take_while(move |item| {
+                if matches!(
+                    item,
+                    PrincipalData::PrimaryEmail(_) | PrincipalData::EmailAlias(_)
+                ) {
+                    found_email = true;
+                    true
+                } else {
+                    !found_email
+                }
+            })
+            .filter_map(|item| {
+                if let PrincipalData::PrimaryEmail(email) | PrincipalData::EmailAlias(email) = item
+                {
+                    Some(email.as_str())
                 } else {
                     None
                 }
             })
-            .unwrap_or_default()
+    }
+
+    pub fn into_primary_email(self) -> Option<String> {
+        self.data.into_iter().find_map(|item| {
+            if let PrincipalData::PrimaryEmail(email) = item {
+                Some(email)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn into_email_addresses(self) -> impl Iterator<Item = String> {
+        self.data.into_iter().filter_map(|item| {
+            if let PrincipalData::PrimaryEmail(email) | PrincipalData::EmailAlias(email) = item {
+                Some(email)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn member_of(&self) -> impl Iterator<Item = u32> {
+        self.data.iter().filter_map(|item| {
+            if let PrincipalData::MemberOf(item) = item {
+                Some(*item)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn roles(&self) -> impl Iterator<Item = u32> {
+        self.data.iter().filter_map(|item| {
+            if let PrincipalData::Role(item) = item {
+                Some(*item)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn permissions(&self) -> impl Iterator<Item = PermissionGrant> {
+        self.data.iter().filter_map(|item| {
+            if let PrincipalData::Permission {
+                permission_id,
+                grant,
+            } = item
+            {
+                Permission::from_id(*permission_id).map(|permission| PermissionGrant {
+                    permission,
+                    grant: *grant,
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn urls(&self) -> impl Iterator<Item = &String> {
+        self.data.iter().filter_map(|item| {
+            if let PrincipalData::Url(item) = item {
+                Some(item)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn lists(&self) -> impl Iterator<Item = &u32> {
+        self.data.iter().filter_map(|item| {
+            if let PrincipalData::List(item) = item {
+                Some(item)
+            } else {
+                None
+            }
+        })
     }
 
     pub fn picture(&self) -> Option<&String> {
@@ -196,159 +246,232 @@ impl Principal {
     }
 
     pub fn add_permission(&mut self, permission: Permission, grant: bool) {
+        let permission = permission.id();
         if let Some(permissions) = self.data.iter_mut().find_map(|item| {
-            if let PrincipalData::Permissions(permissions) = item {
-                Some(permissions)
+            if let PrincipalData::Permission {
+                permission_id,
+                grant,
+            } = item
+            {
+                if *permission_id == permission {
+                    Some(grant)
+                } else {
+                    None
+                }
             } else {
                 None
             }
         }) {
-            if let Some(current) = permissions.iter_mut().find(|p| p.permission == permission) {
-                current.grant = grant;
-            } else {
-                permissions.push(PermissionGrant { permission, grant });
-            }
+            *permissions = grant;
         } else {
-            self.data
-                .push(PrincipalData::Permissions(vec![PermissionGrant {
-                    permission,
-                    grant,
-                }]));
+            self.data.push(PrincipalData::Permission {
+                permission_id: permission,
+                grant,
+            });
         }
     }
 
     pub fn add_permissions(&mut self, iter: impl Iterator<Item = PermissionGrant>) {
-        if let Some(permissions) = self.data.iter_mut().find_map(|item| {
-            if let PrincipalData::Permissions(permissions) = item {
-                Some(permissions)
-            } else {
-                None
-            }
-        }) {
-            permissions.extend(iter);
-        } else {
-            self.data.push(PrincipalData::Permissions(iter.collect()));
+        for grant in iter {
+            self.add_permission(grant.permission, grant.grant);
         }
     }
 
     pub fn remove_permission(&mut self, permission: Permission, grant: bool) {
-        if let Some(permissions) = self.data.iter_mut().find_map(|item| {
-            if let PrincipalData::Permissions(permissions) = item {
-                Some(permissions)
+        let permission = permission.id();
+        self.data.retain(|data| {
+            if let PrincipalData::Permission {
+                permission_id: p,
+                grant: g,
+            } = data
+            {
+                *p != permission || *g != grant
             } else {
-                None
+                true
             }
-        }) && let Some(idx) = permissions
-            .iter_mut()
-            .position(|p| p.permission == permission && p.grant == grant)
-        {
-            permissions.swap_remove(idx);
-        }
+        });
     }
 
     pub fn remove_permissions(&mut self, grant: bool) {
-        if let Some(permissions) = self.data.iter_mut().find_map(|item| {
-            if let PrincipalData::Permissions(permissions) = item {
-                Some(permissions)
+        self.data.retain(|data| {
+            if let PrincipalData::Permission { grant: g, .. } = data {
+                *g != grant
             } else {
-                None
+                true
             }
-        }) {
-            permissions.retain(|p| p.grant != grant);
-        }
+        });
     }
 
-    pub fn update_external(
-        &mut self,
-        mut external: Principal,
-        overwrite_emails: bool,
-    ) -> Vec<PrincipalUpdate> {
+    pub fn update_external(&mut self, external: Principal) -> Vec<PrincipalUpdate> {
         let mut updates = Vec::new();
+        let mut external_data = AHashSet::with_capacity(external.data.len());
+        let mut has_role = false;
+        let mut has_member_of = false;
+        let mut has_quota = false;
+        let mut has_otp_auth = false;
+        let mut has_app_password = false;
 
-        // Add external members
-        if let Some(member_of) = external.member_of_mut().filter(|s| !s.is_empty()) {
-            self.data
-                .push(PrincipalData::MemberOf(std::mem::take(member_of)));
+        for item in external.data {
+            match item {
+                PrincipalData::DiskQuota(_) => {
+                    has_quota = true;
+                    external_data.insert(item);
+                }
+                PrincipalData::MemberOf(_) => {
+                    has_member_of = true;
+                    external_data.insert(item);
+                }
+                PrincipalData::Role(_) => {
+                    has_role = true;
+                    external_data.insert(item);
+                }
+                PrincipalData::OtpAuth(_) => {
+                    has_otp_auth = true;
+                    external_data.insert(item);
+                }
+                PrincipalData::AppPassword(_) => {
+                    has_app_password = true;
+                    external_data.insert(item);
+                }
+                PrincipalData::Password(_)
+                | PrincipalData::Description(_)
+                | PrincipalData::PrimaryEmail(_)
+                | PrincipalData::EmailAlias(_) => {
+                    external_data.insert(item);
+                }
+                _ => {}
+            }
         }
 
-        // If the principal has no roles, take the ones from the external principal
-        if let Some(roles) = external.roles_mut().filter(|s| !s.is_empty())
-            && self.roles().is_empty()
-        {
-            self.data.push(PrincipalData::Roles(std::mem::take(roles)));
-        }
+        let mut old_data = Vec::new();
+        let data_len = self.data.len();
 
-        if external.description.as_ref().is_some_and(|v| !v.is_empty())
-            && self.description != external.description
-        {
-            self.description = external.description;
-            updates.push(PrincipalUpdate::set(
-                PrincipalField::Description,
-                PrincipalValue::String(self.description.clone().unwrap()),
-            ));
-        }
-
-        if !external.secrets.is_empty() && external.secrets != self.secrets {
-            self.secrets = external.secrets;
-            updates.push(PrincipalUpdate::set(
-                PrincipalField::Secrets,
-                PrincipalValue::StringList(self.secrets.clone()),
-            ));
-        }
-
-        if !external.emails.is_empty() && external.emails != self.emails {
-            if overwrite_emails {
-                self.emails = external.emails;
-                updates.push(PrincipalUpdate::set(
-                    PrincipalField::Emails,
-                    PrincipalValue::StringList(self.emails.clone()),
-                ));
-            } else {
-                // Missing emails are appended to avoid overwriting locally defined aliases
-                // This means that old email addresses need to be deleted either manually or using the API
-                for email in external.emails {
-                    let email = email.to_lowercase();
-                    if !self.emails.contains(&email) {
-                        updates.push(PrincipalUpdate::add_item(
-                            PrincipalField::Emails,
-                            PrincipalValue::String(email.clone()),
-                        ));
-                        self.emails.push(email);
+        for item in std::mem::replace(&mut self.data, Vec::with_capacity(data_len)) {
+            match item {
+                PrincipalData::Password(_)
+                | PrincipalData::AppPassword(_)
+                | PrincipalData::OtpAuth(_)
+                | PrincipalData::Description(_)
+                | PrincipalData::PrimaryEmail(_)
+                | PrincipalData::EmailAlias(_)
+                | PrincipalData::DiskQuota(_)
+                | PrincipalData::MemberOf(_)
+                | PrincipalData::Role(_) => {
+                    if external_data.remove(&item)
+                        || match item {
+                            PrincipalData::EmailAlias(_) => true,
+                            PrincipalData::AppPassword(_) => !has_app_password,
+                            PrincipalData::OtpAuth(_) => !has_otp_auth,
+                            PrincipalData::Role(_) => !has_role,
+                            PrincipalData::MemberOf(_) => !has_member_of,
+                            PrincipalData::DiskQuota(_) => !has_quota,
+                            _ => false,
+                        }
+                    {
+                        self.data.push(item);
+                    } else if matches!(
+                        item,
+                        PrincipalData::Password(_)
+                            | PrincipalData::AppPassword(_)
+                            | PrincipalData::OtpAuth(_)
+                            | PrincipalData::PrimaryEmail(_)
+                            | PrincipalData::EmailAlias(_)
+                    ) {
+                        old_data.push(item);
                     }
+                }
+                _ => {
+                    self.data.push(item);
                 }
             }
         }
 
-        if external.quota.is_some() && self.quota != external.quota {
-            self.quota = external.quota;
-            updates.push(PrincipalUpdate::set(
-                PrincipalField::Quota,
-                PrincipalValue::Integer(self.quota.unwrap()),
-            ));
+        // Add new data
+        let mut has_password = false;
+        let mut has_email = false;
+        for item in external_data {
+            match &item {
+                PrincipalData::Description(value) => {
+                    updates.push(PrincipalUpdate::set(
+                        PrincipalField::Description,
+                        PrincipalValue::String(value.to_string()),
+                    ));
+                }
+                PrincipalData::DiskQuota(value) => {
+                    updates.push(PrincipalUpdate::set(
+                        PrincipalField::Quota,
+                        PrincipalValue::Integer(*value),
+                    ));
+                }
+                PrincipalData::Password(value)
+                | PrincipalData::AppPassword(value)
+                | PrincipalData::OtpAuth(value) => {
+                    let item = PrincipalUpdate::add_item(
+                        PrincipalField::Secrets,
+                        PrincipalValue::String(value.to_string()),
+                    );
+                    if !has_password && !updates.is_empty() {
+                        updates.insert(0, item);
+                    } else {
+                        updates.push(item);
+                    }
+                    has_password = true;
+                }
+                PrincipalData::PrimaryEmail(value) => {
+                    let item = PrincipalUpdate::add_item(
+                        PrincipalField::Emails,
+                        PrincipalValue::String(value.to_string()),
+                    );
+                    if !has_email && !updates.is_empty() {
+                        updates.insert(0, item);
+                    } else {
+                        updates.push(item);
+                    }
+                    has_email = true;
+                }
+                PrincipalData::EmailAlias(value) => {
+                    updates.push(PrincipalUpdate::add_item(
+                        PrincipalField::Emails,
+                        PrincipalValue::String(value.to_string()),
+                    ));
+                }
+                _ => (),
+            }
+            self.data.push(item);
         }
+
+        // Remove old data
+        for item in old_data {
+            match item {
+                PrincipalData::Password(value)
+                | PrincipalData::AppPassword(value)
+                | PrincipalData::OtpAuth(value) => {
+                    updates.push(PrincipalUpdate::remove_item(
+                        PrincipalField::Secrets,
+                        PrincipalValue::String(value),
+                    ));
+                }
+                PrincipalData::PrimaryEmail(value) | PrincipalData::EmailAlias(value) => {
+                    updates.push(PrincipalUpdate::remove_item(
+                        PrincipalField::Emails,
+                        PrincipalValue::String(value),
+                    ));
+                }
+                _ => (),
+            }
+        }
+
+        self.sort();
 
         updates
     }
 
     pub fn object_size(&self) -> usize {
         self.name.len()
-            + self.description.as_ref().map_or(0, |d| d.len())
-            + self.secrets.iter().map(|s| s.len()).sum::<usize>()
-            + self.emails.iter().map(|e| e.len()).sum::<usize>()
             + self
                 .data
                 .iter()
-                .map(|d| match d {
-                    PrincipalData::MemberOf(items)
-                    | PrincipalData::Roles(items)
-                    | PrincipalData::Lists(items) => items.len() * U32_LEN,
-                    PrincipalData::Permissions(items) => items.len() * U32_LEN,
-                    PrincipalData::ExternalMembers(items) | PrincipalData::Urls(items) => {
-                        items.iter().map(|s| s.len()).sum::<usize>()
-                    }
-                    PrincipalData::PrincipalQuota(items) => items.len() * U32_LEN,
-                    PrincipalData::Picture(value) | PrincipalData::Locale(value) => value.len(),
-                })
+                .map(|item| item.object_size())
                 .sum::<usize>()
     }
 
@@ -357,12 +480,80 @@ impl Principal {
             id: FALLBACK_ADMIN_ID,
             typ: Type::Individual,
             name: "Fallback Administrator".into(),
-            secrets: vec![fallback_pass.into()],
-            data: vec![PrincipalData::Roles(vec![ROLE_ADMIN])],
-            description: Default::default(),
-            emails: Default::default(),
-            quota: Default::default(),
-            tenant: Default::default(),
+            data: vec![
+                PrincipalData::Role(ROLE_ADMIN),
+                PrincipalData::Password(fallback_pass.into()),
+            ],
+        }
+    }
+
+    pub fn sort(&mut self) {
+        self.data.sort_unstable();
+    }
+}
+
+impl PrincipalData {
+    fn rank(&self) -> u8 {
+        match self {
+            PrincipalData::OtpAuth(_) => 0,
+            PrincipalData::Password(_) => 1,
+            PrincipalData::AppPassword(_) => 2,
+            PrincipalData::PrimaryEmail(_) => 3,
+            PrincipalData::EmailAlias(_) => 4,
+            _ => 5,
+        }
+    }
+
+    fn rank_string(&self) -> Option<&str> {
+        match self {
+            PrincipalData::OtpAuth(s)
+            | PrincipalData::Password(s)
+            | PrincipalData::AppPassword(s)
+            | PrincipalData::PrimaryEmail(s)
+            | PrincipalData::EmailAlias(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+impl PartialOrd for PrincipalData {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PrincipalData {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.rank().cmp(&other.rank()) {
+            Ordering::Equal => match (self.rank_string(), other.rank_string()) {
+                (Some(a), Some(b)) => a.cmp(b),
+                _ => Ordering::Equal,
+            },
+            other => other,
+        }
+    }
+}
+
+impl PrincipalData {
+    pub fn object_size(&self) -> usize {
+        match self {
+            PrincipalData::Password(v)
+            | PrincipalData::AppPassword(v)
+            | PrincipalData::OtpAuth(v)
+            | PrincipalData::Description(v)
+            | PrincipalData::PrimaryEmail(v)
+            | PrincipalData::EmailAlias(v)
+            | PrincipalData::Picture(v)
+            | PrincipalData::ExternalMember(v)
+            | PrincipalData::Url(v)
+            | PrincipalData::Locale(v) => v.len(),
+            PrincipalData::DiskQuota(_) => U64_LEN,
+            PrincipalData::Permission { .. } => U32_LEN + 1,
+            PrincipalData::DirectoryQuota { .. } | PrincipalData::ObjectQuota { .. } => U64_LEN + 1,
+            PrincipalData::Tenant(_)
+            | PrincipalData::MemberOf(_)
+            | PrincipalData::Role(_)
+            | PrincipalData::List(_) => U32_LEN,
         }
     }
 }
@@ -871,9 +1062,14 @@ pub(crate) fn build_search_index(
     let mut new_words = AHashSet::new();
 
     if let Some(current) = current {
-        for word in [Some(current.name.as_str()), current.description.as_deref()]
+        for word in [Some(current.name.as_str())]
             .into_iter()
-            .chain(current.emails.iter().map(|s| Some(s.as_str())))
+            .chain(current.data.iter().map(|s| match s {
+                ArchivedPrincipalData::Description(v)
+                | ArchivedPrincipalData::PrimaryEmail(v)
+                | ArchivedPrincipalData::EmailAlias(v) => Some(v.as_str()),
+                _ => None,
+            }))
             .flatten()
         {
             current_words.extend(WordTokenizer::new(word, MAX_TOKEN_LENGTH).map(|t| t.word));
@@ -881,9 +1077,14 @@ pub(crate) fn build_search_index(
     }
 
     if let Some(new) = new {
-        for word in [Some(new.name.as_str()), new.description.as_deref()]
+        for word in [Some(new.name.as_str())]
             .into_iter()
-            .chain(new.emails.iter().map(|s| Some(s.as_str())))
+            .chain(new.data.iter().map(|s| match s {
+                PrincipalData::Description(v)
+                | PrincipalData::PrimaryEmail(v)
+                | PrincipalData::EmailAlias(v) => Some(v.as_str()),
+                _ => None,
+            }))
             .flatten()
         {
             new_words.extend(WordTokenizer::new(word, MAX_TOKEN_LENGTH).map(|t| t.word));
@@ -909,7 +1110,7 @@ pub(crate) fn build_search_index(
 }
 
 impl Type {
-    pub fn to_jmap(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Individual => "individual",
             Self::Group => "group",
@@ -925,7 +1126,7 @@ impl Type {
         }
     }
 
-    pub fn as_str(&self) -> &'static str {
+    pub fn description(&self) -> &'static str {
         match self {
             Self::Individual => "Individual",
             Self::Group => "Group",
@@ -995,7 +1196,7 @@ impl serde::Serialize for PrincipalSet {
         let mut map = serializer.serialize_map(None)?;
 
         map.serialize_entry("id", &self.id)?;
-        map.serialize_entry("type", &self.typ.to_jmap())?;
+        map.serialize_entry("type", &self.typ.as_str())?;
 
         for (key, value) in &self.fields {
             match value {
@@ -1124,18 +1325,15 @@ impl<'de> serde::Deserialize<'de> for PrincipalSet {
                 let mut principal = PrincipalSet::default();
 
                 while let Some(key) = map.next_key::<&str>()? {
-                    let key = PrincipalField::try_parse(key)
-                        .or_else(|| {
-                            if key == "id" {
-                                // Ignored
-                                Some(PrincipalField::UsedQuota)
-                            } else {
-                                None
-                            }
-                        })
-                        .ok_or_else(|| {
-                            serde::de::Error::custom(format!("invalid principal field: {}", key))
-                        })?;
+                    if key == "id" {
+                        // Ignored
+                        map.next_value::<IgnoredAny>()?;
+                        continue;
+                    }
+
+                    let key = PrincipalField::try_parse(key).ok_or_else(|| {
+                        serde::de::Error::custom(format!("invalid principal field: {}", key))
+                    })?;
 
                     let value = match key {
                         PrincipalField::Name => {
@@ -1177,18 +1375,37 @@ impl<'de> serde::Deserialize<'de> for PrincipalSet {
                         | PrincipalField::EnabledPermissions
                         | PrincipalField::DisabledPermissions
                         | PrincipalField::Urls
-                        | PrincipalField::ExternalMembers => {
-                            match map.next_value::<StringOrMany>()? {
-                                StringOrMany::One(v) => PrincipalValue::StringList(vec![v]),
-                                StringOrMany::Many(v) => {
-                                    if !v.is_empty() {
-                                        PrincipalValue::StringList(v)
-                                    } else {
-                                        continue;
-                                    }
+                        | PrincipalField::ExternalMembers => match map.next_value::<Value>()? {
+                            Value::String(v) => {
+                                if v.len() <= MAX_STRING_LEN {
+                                    PrincipalValue::StringList(vec![v])
+                                } else {
+                                    return Err(serde::de::Error::custom("string too long"));
                                 }
                             }
-                        }
+                            Value::Array(v) => {
+                                if !v.is_empty() {
+                                    PrincipalValue::StringList(
+                                        v.into_iter()
+                                            .filter_map(|item| {
+                                                if let Value::String(s) = item {
+                                                    if s.len() <= MAX_STRING_LEN {
+                                                        Some(s)
+                                                    } else {
+                                                        None
+                                                    }
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .collect(),
+                                    )
+                                } else {
+                                    continue;
+                                }
+                            }
+                            _ => continue,
+                        },
                         PrincipalField::UsedQuota => {
                             // consume and ignore
                             map.next_value::<IgnoredAny>()?;
@@ -1261,69 +1478,9 @@ impl<'de> serde::Deserialize<'de> for StringOrU64 {
     }
 }
 
-#[derive(Debug)]
-enum StringOrMany {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl<'de> serde::Deserialize<'de> for StringOrMany {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct StringOrManyVisitor;
-
-        impl<'de> Visitor<'de> for StringOrManyVisitor {
-            type Value = StringOrMany;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a string or a sequence of strings")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                if value.len() <= MAX_STRING_LEN {
-                    Ok(StringOrMany::One(value.into()))
-                } else {
-                    Err(serde::de::Error::custom("string too long"))
-                }
-            }
-
-            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                if v.len() <= MAX_STRING_LEN {
-                    Ok(StringOrMany::One(v))
-                } else {
-                    Err(serde::de::Error::custom("string too long"))
-                }
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: de::SeqAccess<'de>,
-            {
-                let mut vec = Vec::new();
-
-                while let Some(value) = seq.next_element::<String>()? {
-                    vec.push(value);
-                }
-
-                Ok(StringOrMany::Many(vec))
-            }
-        }
-
-        deserializer.deserialize_any(StringOrManyVisitor)
-    }
-}
-
 impl Permission {
     pub fn all() -> impl Iterator<Item = Permission> {
-        (0..Permission::COUNT).filter_map(Permission::from_id)
+        (0..Permission::COUNT as u32).filter_map(Permission::from_id)
     }
 
     pub const fn is_user_permission(&self) -> bool {
@@ -1420,11 +1577,11 @@ impl Permission {
                 | Permission::SieveRenameScript
                 | Permission::SieveCheckScript
                 | Permission::SieveHaveSpace
-                | Permission::SpamFilterClassify
-                | Permission::SpamFilterTrain
                 | Permission::DavSyncCollection
                 | Permission::DavExpandProperty
                 | Permission::DavPrincipalAcl
+                | Permission::DavPrincipalList
+                | Permission::DavPrincipalSearch
                 | Permission::DavPrincipalMatch
                 | Permission::DavPrincipalSearchPropSet
                 | Permission::DavFilePropFind
@@ -1465,6 +1622,49 @@ impl Permission {
                 | Permission::CalendarAlarms
                 | Permission::CalendarSchedulingSend
                 | Permission::CalendarSchedulingReceive
+                | Permission::JmapAddressBookGet
+                | Permission::JmapAddressBookSet
+                | Permission::JmapAddressBookChanges
+                | Permission::JmapContactCardGet
+                | Permission::JmapContactCardChanges
+                | Permission::JmapContactCardQuery
+                | Permission::JmapContactCardQueryChanges
+                | Permission::JmapContactCardSet
+                | Permission::JmapContactCardCopy
+                | Permission::JmapContactCardParse
+                | Permission::JmapFileNodeGet
+                | Permission::JmapFileNodeSet
+                | Permission::JmapFileNodeChanges
+                | Permission::JmapFileNodeQuery
+                | Permission::JmapFileNodeQueryChanges
+                | Permission::JmapPrincipalGetAvailability
+                | Permission::JmapPrincipalChanges
+                | Permission::JmapPrincipalQuery
+                | Permission::JmapPrincipalGet
+                | Permission::JmapPrincipalQueryChanges
+                | Permission::JmapShareNotificationGet
+                | Permission::JmapShareNotificationSet
+                | Permission::JmapShareNotificationChanges
+                | Permission::JmapShareNotificationQuery
+                | Permission::JmapShareNotificationQueryChanges
+                | Permission::JmapCalendarGet
+                | Permission::JmapCalendarSet
+                | Permission::JmapCalendarChanges
+                | Permission::JmapCalendarEventGet
+                | Permission::JmapCalendarEventSet
+                | Permission::JmapCalendarEventChanges
+                | Permission::JmapCalendarEventQuery
+                | Permission::JmapCalendarEventQueryChanges
+                | Permission::JmapCalendarEventCopy
+                | Permission::JmapCalendarEventParse
+                | Permission::JmapCalendarEventNotificationGet
+                | Permission::JmapCalendarEventNotificationSet
+                | Permission::JmapCalendarEventNotificationChanges
+                | Permission::JmapCalendarEventNotificationQuery
+                | Permission::JmapCalendarEventNotificationQueryChanges
+                | Permission::JmapParticipantIdentityGet
+                | Permission::JmapParticipantIdentitySet
+                | Permission::JmapParticipantIdentityChanges
         )
     }
 
@@ -1524,14 +1724,13 @@ impl Permission {
                 | Permission::Undelete
                 | Permission::DkimSignatureCreate
                 | Permission::DkimSignatureGet
-                | Permission::JmapPrincipalGet
-                | Permission::JmapPrincipalQueryChanges
-                | Permission::JmapPrincipalQuery
                 | Permission::ApiKeyList
                 | Permission::ApiKeyGet
                 | Permission::ApiKeyCreate
                 | Permission::ApiKeyUpdate
                 | Permission::ApiKeyDelete
+                | Permission::SpamFilterTrain
+                | Permission::SpamFilterTest
         ) || self.is_user_permission()
     }
 

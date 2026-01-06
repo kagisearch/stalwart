@@ -4,36 +4,32 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::storage::index::{IndexValue, IndexableAndSerializableObject, IndexableObject};
-use jmap_proto::types::{collection::SyncCollection, property::Property};
-
 use super::{ArchivedEmailSubmission, EmailSubmission};
+use common::storage::index::{IndexValue, IndexableAndSerializableObject, IndexableObject};
+use store::{
+    U32_LEN,
+    write::{IndexPropertyClass, ValueClass, key::KeySerializer},
+};
+use types::{collection::SyncCollection, field::EmailSubmissionField};
 
 impl IndexableObject for EmailSubmission {
     fn index_values(&self) -> impl Iterator<Item = IndexValue<'_>> {
         [
-            IndexValue::Index {
-                field: Property::UndoStatus.into(),
-                value: self.undo_status.as_index().into(),
-            },
-            IndexValue::Index {
-                field: Property::EmailId.into(),
-                value: self.email_id.into(),
-            },
-            IndexValue::Index {
-                field: Property::ThreadId.into(),
-                value: self.thread_id.into(),
-            },
-            IndexValue::Index {
-                field: Property::IdentityId.into(),
-                value: self.identity_id.into(),
-            },
-            IndexValue::Index {
-                field: Property::SendAt.into(),
-                value: self.send_at.into(),
+            IndexValue::Property {
+                field: ValueClass::IndexProperty(IndexPropertyClass::Integer {
+                    property: EmailSubmissionField::Metadata.into(),
+                    value: self.send_at,
+                }),
+                value: KeySerializer::new(U32_LEN * 3 + 1)
+                    .write(self.email_id)
+                    .write(self.thread_id)
+                    .write(self.identity_id)
+                    .write(self.undo_status.as_index())
+                    .finalize()
+                    .into(),
             },
             IndexValue::LogItem {
-                sync_collection: SyncCollection::EmailSubmission.into(),
+                sync_collection: SyncCollection::EmailSubmission,
                 prefix: None,
             },
         ]
@@ -44,28 +40,21 @@ impl IndexableObject for EmailSubmission {
 impl IndexableObject for &ArchivedEmailSubmission {
     fn index_values(&self) -> impl Iterator<Item = IndexValue<'_>> {
         [
-            IndexValue::Index {
-                field: Property::UndoStatus.into(),
-                value: self.undo_status.as_index().into(),
-            },
-            IndexValue::Index {
-                field: Property::EmailId.into(),
-                value: self.email_id.into(),
-            },
-            IndexValue::Index {
-                field: Property::ThreadId.into(),
-                value: self.thread_id.into(),
-            },
-            IndexValue::Index {
-                field: Property::IdentityId.into(),
-                value: self.identity_id.into(),
-            },
-            IndexValue::Index {
-                field: Property::SendAt.into(),
-                value: self.send_at.into(),
+            IndexValue::Property {
+                field: ValueClass::IndexProperty(IndexPropertyClass::Integer {
+                    property: EmailSubmissionField::Metadata.into(),
+                    value: self.send_at.to_native(),
+                }),
+                value: KeySerializer::new(U32_LEN * 3 + 1)
+                    .write(self.email_id.to_native())
+                    .write(self.thread_id.to_native())
+                    .write(self.identity_id.to_native())
+                    .write(self.undo_status.as_index())
+                    .finalize()
+                    .into(),
             },
             IndexValue::LogItem {
-                sync_collection: SyncCollection::EmailSubmission.into(),
+                sync_collection: SyncCollection::EmailSubmission,
                 prefix: None,
             },
         ]

@@ -9,24 +9,26 @@ use crate::core::Mailbox;
 use ahash::AHashMap;
 use common::{
     auth::AccessToken,
-    config::jmap::settings::SpecialUse,
     listener::{SessionStream, limiter::InFlight},
     sharing::EffectiveAcl,
 };
-
 use directory::backend::internal::manage::ManageDirectory;
 use email::{
     cache::{MessageCacheFetch, email::MessageCacheAccess, mailbox::MailboxCacheAccess},
     mailbox::INBOX_ID,
 };
 use imap_proto::protocol::list::Attribute;
-use jmap_proto::types::{acl::Acl, collection::Collection, id::Id, keyword::Keyword};
 use parking_lot::Mutex;
 use std::{
     collections::BTreeMap,
     sync::{Arc, atomic::Ordering},
 };
+use store::{
+    ValueKey,
+    write::{AlignedBytes, Archive},
+};
 use trc::AddContext;
+use types::{acl::Acl, collection::Collection, id::Id, keyword::Keyword, special_use::SpecialUse};
 
 impl<T: SessionStream> SessionData<T> {
     pub async fn new(
@@ -174,6 +176,9 @@ impl<T: SessionStream> SessionData<T> {
                         SpecialUse::Archive => Some(Attribute::Archive),
                         SpecialUse::Sent => Some(Attribute::Sent),
                         SpecialUse::Important => Some(Attribute::Important),
+                        SpecialUse::Memos => Some(Attribute::Memos),
+                        SpecialUse::Scheduled => Some(Attribute::Scheduled),
+                        SpecialUse::Snoozed => Some(Attribute::Snoozed),
                         _ => None,
                     },
                     total_messages: cache.in_mailbox(mailbox.document_id).count() as u64,
@@ -398,7 +403,12 @@ impl<T: SessionStream> SessionData<T> {
         Ok(access_token.is_member(account_id)
             || self
                 .server
-                .get_archive(account_id, Collection::Mailbox, document_id)
+                .store()
+                .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                    account_id,
+                    Collection::Mailbox,
+                    document_id,
+                ))
                 .await
                 .and_then(|mailbox| {
                     if let Some(mailbox) = mailbox {

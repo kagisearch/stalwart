@@ -23,7 +23,7 @@ use common::{
     Inner, KV_ACME, Server,
     auth::{AccessToken, oauth::GrantType},
     core::BuildServer,
-    ipc::StateEvent,
+    ipc::PushEvent,
     listener::{SessionData, SessionManager, SessionStream},
     manager::webadmin::Resource,
 };
@@ -49,13 +49,11 @@ use jmap::{
     blob::{download::BlobDownload, upload::BlobUpload},
     websocket::upgrade::WebSocketUpgrade,
 };
-use jmap_proto::{
-    request::{Request, capability::Session},
-    types::{blob::BlobId, id::Id},
-};
-use std::{net::IpAddr, sync::Arc};
+use jmap_proto::request::{Request, capability::Session};
+use std::{net::IpAddr, str::FromStr, sync::Arc};
 use store::dispatch::lookup::KeyValue;
 use trc::SecurityEvent;
+use types::{blob::BlobId, id::Id};
 use utils::url_params::UrlParams;
 
 pub trait ParseHttp: Sync + Send {
@@ -95,7 +93,7 @@ impl ParseHttp for Server {
                         let (_in_flight, access_token) =
                             self.authenticate_headers(&req, &session, false).await?;
 
-                        let request = fetch_body(
+                        let bytes = fetch_body(
                             &mut req,
                             if !access_token.has_permission(Permission::UnlimitedUploads) {
                                 self.core.jmap.upload_max_size
@@ -105,17 +103,18 @@ impl ParseHttp for Server {
                             session.session_id,
                         )
                         .await
-                        .ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())
-                        .and_then(|bytes| {
-                            Request::parse(
-                                &bytes,
-                                self.core.jmap.request_max_calls,
-                                self.core.jmap.request_max_size,
-                            )
-                        })?;
+                        .ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?;
 
                         return Ok(self
-                            .handle_jmap_request(request, access_token, &session)
+                            .handle_jmap_request(
+                                Request::parse(
+                                    &bytes,
+                                    self.core.jmap.request_max_calls,
+                                    self.core.jmap.request_max_size,
+                                )?,
+                                access_token,
+                                &session,
+                            )
                             .await
                             .into_http_response());
                     }
@@ -125,7 +124,7 @@ impl ParseHttp for Server {
                             self.authenticate_headers(&req, &session, false).await?;
 
                         if let (Some(_), Some(blob_id), Some(name)) = (
-                            path.next().and_then(|p| Id::from_bytes(p.as_bytes())),
+                            path.next().and_then(|p| Id::from_str(p).ok()),
                             path.next().and_then(BlobId::from_base32),
                             path.next(),
                         ) {
@@ -153,9 +152,7 @@ impl ParseHttp for Server {
                         let (_in_flight, access_token) =
                             self.authenticate_headers(&req, &session, false).await?;
 
-                        if let Some(account_id) =
-                            path.next().and_then(|p| Id::from_bytes(p.as_bytes()))
-                        {
+                        if let Some(account_id) = path.next().and_then(|p| Id::from_str(p).ok()) {
                             return match fetch_body(
                                 &mut req,
                                 if !access_token.has_permission(Permission::UnlimitedUploads) {
@@ -507,9 +504,12 @@ impl ParseHttp for Server {
                         });
                 }
             }
-            "autodiscover" => {
+            "autodiscover" | "Autodiscover" => {
                 if req.method() == Method::POST
-                    && path.next().unwrap_or_default() == "autodiscover.xml"
+                    && path
+                        .next()
+                        .unwrap_or_default()
+                        .eq_ignore_ascii_case("autodiscover.xml")
                 {
                     // Limit anonymous requests
                     self.is_http_anonymous_request_allowed(&session.remote_ip)
@@ -853,7 +853,7 @@ impl SessionManager for HttpSessionManager {
     #[allow(clippy::manual_async_fn)]
     fn shutdown(&self) -> impl std::future::Future<Output = ()> + Send {
         async {
-            let _ = self.inner.ipc.state_tx.send(StateEvent::Stop).await;
+            let _ = self.inner.ipc.push_tx.send(PushEvent::Stop).await;
         }
     }
 }

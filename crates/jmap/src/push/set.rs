@@ -4,30 +4,27 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::get::PushSubscriptionFetch;
 use base64::{Engine, engine::general_purpose};
-use common::{Server, auth::AccessToken};
-use email::push::{Keys, PushSubscription};
+use common::{Server, auth::AccessToken, ipc::PushEvent};
+use email::push::{Keys, PushSubscription, PushSubscriptions};
 use jmap_proto::{
-    error::set::SetError,
-    method::set::{RequestArguments, SetRequest, SetResponse},
-    response::references::EvalObjectReferences,
-    types::{
-        collection::Collection,
-        date::UTCDate,
-        property::Property,
-        type_state::DataType,
-        value::{MaybePatchValue, Object, Value},
-    },
+    error::set::{SetError, SetErrorType},
+    method::set::{SetRequest, SetResponse},
+    object::push_subscription::{self, PushSubscriptionProperty, PushSubscriptionValue},
+    references::resolve::ResolveCreatedReference,
+    request::IntoValid,
+    types::date::UTCDate,
 };
+use jmap_tools::{Key, Map, Value};
 use rand::distr::Alphanumeric;
 use std::future::Future;
 use store::{
-    Serialize,
+    Serialize, ValueKey,
     rand::{Rng, rng},
-    write::{Archiver, BatchBuilder, now},
+    write::{AlignedBytes, Archive, Archiver, BatchBuilder, now},
 };
-use trc::AddContext;
+use trc::{AddContext, ServerEvent};
+use types::{collection::Collection, field::PrincipalField};
 use utils::map::bitmap::Bitmap;
 
 const EXPIRES_MAX: i64 = 7 * 24 * 3600; // 7 days
@@ -36,41 +33,67 @@ const VERIFICATION_CODE_LEN: usize = 32;
 pub trait PushSubscriptionSet: Sync + Send {
     fn push_subscription_set(
         &self,
-        request: SetRequest<RequestArguments>,
+        request: SetRequest<'_, push_subscription::PushSubscription>,
         access_token: &AccessToken,
-    ) -> impl Future<Output = trc::Result<SetResponse>> + Send;
+    ) -> impl Future<Output = trc::Result<SetResponse<push_subscription::PushSubscription>>> + Send;
 }
 
 impl PushSubscriptionSet for Server {
     async fn push_subscription_set(
         &self,
-        mut request: SetRequest<RequestArguments>,
+        mut request: SetRequest<'_, push_subscription::PushSubscription>,
         access_token: &AccessToken,
-    ) -> trc::Result<SetResponse> {
+    ) -> trc::Result<SetResponse<push_subscription::PushSubscription>> {
+        // Load existing push subscriptions
         let account_id = access_token.primary_id();
-        let push_ids = self
-            .get_document_ids(account_id, Collection::PushSubscription)
-            .await?
-            .unwrap_or_default();
+        let subscriptions_archive = self
+            .store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::property(
+                account_id,
+                Collection::Principal,
+                0,
+                PrincipalField::PushSubscriptions,
+            ))
+            .await?;
+        let mut subscriptions = if let Some(subscriptions) = &subscriptions_archive {
+            subscriptions
+                .deserialize::<PushSubscriptions>()
+                .caused_by(trc::location!())?
+        } else {
+            PushSubscriptions::default()
+        };
+
+        let num_subscriptions = subscriptions.subscriptions.len();
+        let mut max_id = 0;
+        let current_time = now();
+        subscriptions.subscriptions.retain(|s| {
+            max_id = max_id.max(s.id);
+
+            s.expires > current_time
+        });
+        let mut has_changes = num_subscriptions != subscriptions.subscriptions.len();
+
+        // Prepare response
         let mut response = SetResponse::from_request(&request, self.core.jmap.set_max_objects)?;
-        let will_destroy = request.unwrap_destroy();
+        let will_destroy = request.unwrap_destroy().into_valid().collect::<Vec<_>>();
 
         // Process creates
-        let mut batch = BatchBuilder::new();
         'create: for (id, object) in request.unwrap_create() {
             let mut push = PushSubscription::default();
 
-            if push_ids.len() as usize >= self.core.jmap.push_max_total {
-                response.not_created.append(id, SetError::forbidden().with_description(
+            if subscriptions.subscriptions.len()
+                >= access_token.object_quota(Collection::PushSubscription) as usize
+            {
+                response.not_created.append(id, SetError::new(SetErrorType::OverQuota).with_description(
                     "There are too many subscriptions, please delete some before adding a new one.",
                 ));
                 continue 'create;
             }
 
-            for (property, value) in object.0 {
+            for (property, mut value) in object.into_expanded_object() {
                 if let Err(err) = response
-                    .eval_object_references(value)
-                    .and_then(|value| validate_push_value(&property, value, &mut push, true))
+                    .resolve_self_references(&mut value)
+                    .and_then(|_| validate_push_value(&property, value, &mut push, true))
                 {
                     response.not_created.append(id, err);
                     continue 'create;
@@ -81,7 +104,10 @@ impl PushSubscriptionSet for Server {
                 response.not_created.append(
                     id,
                     SetError::invalid_properties()
-                        .with_properties([Property::DeviceClientId, Property::Url])
+                        .with_properties([
+                            PushSubscriptionProperty::DeviceClientId,
+                            PushSubscriptionProperty::Url,
+                        ])
                         .with_description("Missing required properties"),
                 );
                 continue 'create;
@@ -100,34 +126,32 @@ impl PushSubscriptionSet for Server {
                 .map(char::from)
                 .collect::<String>();
 
+            // Set id
+            max_id += 1;
+            let document_id = max_id;
+            push.id = document_id;
+
             // Insert record
-            let document_id = self
-                .store()
-                .assign_document_ids(account_id, Collection::PushSubscription, 1)
-                .await
-                .caused_by(trc::location!())?;
-            batch
-                .with_account_id(account_id)
-                .with_collection(Collection::PushSubscription)
-                .create_document(document_id)
-                .set(
-                    Property::Value,
-                    Archiver::new(push)
-                        .serialize()
-                        .caused_by(trc::location!())?,
-                )
-                .commit_point();
+            subscriptions.subscriptions.push(push);
             response.created.insert(
                 id,
-                Object::with_capacity(1)
-                    .with_property(Property::Id, Value::Id(document_id.into()))
-                    .with_property(Property::Keys, Value::Null)
-                    .with_property(Property::Expires, expires),
+                Map::with_capacity(1)
+                    .with_key_value(
+                        PushSubscriptionProperty::Id,
+                        PushSubscriptionValue::Id(document_id.into()),
+                    )
+                    .with_key_value(PushSubscriptionProperty::Keys, Value::Null)
+                    .with_key_value(
+                        PushSubscriptionProperty::Expires,
+                        PushSubscriptionValue::Date(expires),
+                    )
+                    .into(),
             );
+            has_changes = true;
         }
 
         // Process updates
-        'update: for (id, object) in request.unwrap_update() {
+        'update: for (id, object) in request.unwrap_update().into_valid() {
             // Make sure id won't be destroyed
             if will_destroy.contains(&id) {
                 response.not_updated.append(id, SetError::will_destroy());
@@ -136,67 +160,105 @@ impl PushSubscriptionSet for Server {
 
             // Obtain push subscription
             let document_id = id.document_id();
-            let mut push = if let Some(push) = self
-                .get_archive(account_id, Collection::PushSubscription, document_id)
-                .await?
-            {
-                push.deserialize::<email::push::PushSubscription>()
-                    .caused_by(trc::location!())?
-            } else {
+            let Some(push) = subscriptions
+                .subscriptions
+                .iter_mut()
+                .find(|p| p.id == document_id)
+            else {
                 response.not_updated.append(id, SetError::not_found());
                 continue 'update;
             };
 
-            for (property, value) in object.0 {
+            for (property, mut value) in object.into_expanded_object() {
                 if let Err(err) = response
-                    .eval_object_references(value)
-                    .and_then(|value| validate_push_value(&property, value, &mut push, false))
+                    .resolve_self_references(&mut value)
+                    .and_then(|_| validate_push_value(&property, value, push, false))
                 {
                     response.not_updated.append(id, err);
                     continue 'update;
                 }
             }
 
-            // Update record
-            batch
-                .with_account_id(account_id)
-                .with_collection(Collection::PushSubscription)
-                .update_document(document_id)
-                .set(
-                    Property::Value,
-                    Archiver::new(push)
-                        .serialize()
-                        .caused_by(trc::location!())?,
-                )
-                .commit_point();
+            has_changes = true;
             response.updated.append(id, None);
         }
 
         // Process deletions
         for id in will_destroy {
             let document_id = id.document_id();
-            if push_ids.contains(document_id) {
-                // Update record
-                batch
-                    .with_account_id(account_id)
-                    .with_collection(Collection::PushSubscription)
-                    .delete_document(document_id)
-                    .clear(Property::Value)
-                    .commit_point();
+            if let Some(idx) = subscriptions
+                .subscriptions
+                .iter()
+                .position(|p| p.id == document_id)
+            {
+                subscriptions.subscriptions.swap_remove(idx);
+                has_changes = true;
                 response.destroyed.push(id);
             } else {
                 response.not_destroyed.append(id, SetError::not_found());
             }
         }
 
-        // Write changes
-        if !batch.is_empty() {
-            self.commit_batch(batch).await.caused_by(trc::location!())?;
-        }
-
         // Update push subscriptions
-        if response.has_changes() {
-            self.update_push_subscriptions(account_id).await;
+        if has_changes {
+            // Save changes
+            let mut batch = BatchBuilder::new();
+
+            if subscriptions_archive.is_none() {
+                batch
+                    .with_account_id(u32::MAX)
+                    .with_collection(Collection::Principal)
+                    .with_document(account_id)
+                    .tag(PrincipalField::PushSubscriptions);
+            } else if subscriptions.subscriptions.is_empty() {
+                batch
+                    .with_account_id(u32::MAX)
+                    .with_collection(Collection::Principal)
+                    .with_document(account_id)
+                    .untag(PrincipalField::PushSubscriptions);
+            }
+
+            batch
+                .with_account_id(account_id)
+                .with_collection(Collection::Principal)
+                .with_document(0);
+
+            if let Some(subscriptions_archive) = subscriptions_archive {
+                batch.assert_value(PrincipalField::PushSubscriptions, subscriptions_archive);
+            }
+
+            if !subscriptions.subscriptions.is_empty() {
+                batch.set(
+                    PrincipalField::PushSubscriptions,
+                    Archiver::new(subscriptions)
+                        .serialize()
+                        .caused_by(trc::location!())?,
+                );
+            } else {
+                batch.clear(PrincipalField::PushSubscriptions);
+            }
+
+            self.commit_batch(batch).await.caused_by(trc::location!())?;
+
+            // Notify push manager
+            if self
+                .inner
+                .ipc
+                .push_tx
+                .clone()
+                .send(PushEvent::PushServerUpdate {
+                    account_id,
+                    broadcast: true,
+                })
+                .await
+                .is_err()
+            {
+                trc::event!(
+                    Server(ServerEvent::ThreadError),
+                    Details = "Error sending push updates.",
+                    CausedBy = trc::location!()
+                );
+            }
         }
 
         Ok(response)
@@ -204,34 +266,38 @@ impl PushSubscriptionSet for Server {
 }
 
 fn validate_push_value(
-    property: &Property,
-    value: MaybePatchValue,
+    property: &Key<PushSubscriptionProperty>,
+    value: Value<'_, PushSubscriptionProperty, PushSubscriptionValue>,
     push: &mut PushSubscription,
     is_create: bool,
-) -> Result<(), SetError> {
+) -> Result<(), SetError<PushSubscriptionProperty>> {
+    let Key::Property(property) = property else {
+        return Err(SetError::invalid_properties()
+            .with_property(property.to_owned())
+            .with_description("Invalid property."));
+    };
+
     match (property, value) {
-        (Property::DeviceClientId, MaybePatchValue::Value(Value::Text(value)))
+        (PushSubscriptionProperty::DeviceClientId, Value::Str(value))
             if is_create && value.len() < 255 =>
         {
-            push.device_client_id = value;
+            push.device_client_id = value.into_owned();
         }
-        (Property::Url, MaybePatchValue::Value(Value::Text(value)))
+        (PushSubscriptionProperty::Url, Value::Str(value))
             if is_create && value.len() < 512 && value.starts_with("https://") =>
         {
-            push.url = value;
+            push.url = value.into_owned();
         }
-        (Property::Keys, MaybePatchValue::Value(Value::Object(value)))
-            if is_create && value.0.len() == 2 =>
-        {
+        (PushSubscriptionProperty::Keys, Value::Object(value)) if is_create && value.len() == 2 => {
             if let (Some(auth), Some(p256dh)) = (
                 value
-                    .get(&Property::Auth)
-                    .as_string()
-                    .and_then(|v| general_purpose::URL_SAFE.decode(v).ok()),
+                    .get(&Key::Property(PushSubscriptionProperty::Auth))
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| general_purpose::URL_SAFE.decode(v.as_ref()).ok()),
                 value
-                    .get(&Property::P256dh)
-                    .as_string()
-                    .and_then(|v| general_purpose::URL_SAFE.decode(v).ok()),
+                    .get(&Key::Property(PushSubscriptionProperty::P256dh))
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| general_purpose::URL_SAFE.decode(v.as_ref()).ok()),
             ) {
                 push.keys = Some(Keys { auth, p256dh });
             } else {
@@ -240,7 +306,7 @@ fn validate_push_value(
                     .with_description("Failed to decode keys."));
             }
         }
-        (Property::Expires, MaybePatchValue::Value(Value::Date(value))) => {
+        (PushSubscriptionProperty::Expires, Value::Element(PushSubscriptionValue::Date(value))) => {
             let current_time = now() as i64;
             let expires = value.timestamp();
             push.expires = if expires > current_time && (expires - current_time) > EXPIRES_MAX {
@@ -249,17 +315,14 @@ fn validate_push_value(
                 expires
             } as u64;
         }
-        (Property::Expires, MaybePatchValue::Value(Value::Null)) => {
+        (PushSubscriptionProperty::Expires, Value::Null) => {
             push.expires = now() + EXPIRES_MAX as u64;
         }
-        (Property::Types, MaybePatchValue::Value(Value::List(value))) => {
+        (PushSubscriptionProperty::Types, Value::Array(value)) => {
             push.types.clear();
 
             for item in value {
-                if let Some(dt) = item
-                    .as_string()
-                    .and_then(|value| DataType::try_from(value).ok())
-                {
+                if let Value::Element(PushSubscriptionValue::Types(dt)) = item {
                     push.types.insert(dt);
                 } else {
                     return Err(SetError::invalid_properties()
@@ -268,7 +331,7 @@ fn validate_push_value(
                 }
             }
         }
-        (Property::VerificationCode, MaybePatchValue::Value(Value::Text(value))) if !is_create => {
+        (PushSubscriptionProperty::VerificationCode, Value::Str(value)) if !is_create => {
             if push.verification_code == value {
                 push.verified = true;
             } else {
@@ -277,13 +340,13 @@ fn validate_push_value(
                     .with_description("Verification code does not match.".to_string()));
             }
         }
-        (Property::Keys, MaybePatchValue::Value(Value::Null)) => {
+        (PushSubscriptionProperty::Keys, Value::Null) => {
             push.keys = None;
         }
-        (Property::Types, MaybePatchValue::Value(Value::Null)) => {
+        (PushSubscriptionProperty::Types, Value::Null) => {
             push.types = Bitmap::all();
         }
-        (Property::VerificationCode, MaybePatchValue::Value(Value::Null)) => {}
+        (PushSubscriptionProperty::VerificationCode, Value::Null) => {}
         (property, _) => {
             return Err(SetError::invalid_properties()
                 .with_property(property.clone())

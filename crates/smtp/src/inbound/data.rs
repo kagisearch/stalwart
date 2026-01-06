@@ -9,7 +9,7 @@ use crate::{
     core::{Session, SessionAddress, State},
     inbound::milter::Modification,
     queue::{
-        self, DomainPart, Message, MessageSource, MessageWrapper, QueueEnvelope,
+        self, Message, MessageSource, MessageWrapper, QueueEnvelope, RCPT_SPAM_PAYLOAD,
         quota::HasQueueQuota,
     },
     reporting::analysis::AnalyzeReport,
@@ -44,7 +44,7 @@ use std::{
     time::{Instant, SystemTime},
 };
 use trc::SmtpEvent;
-use utils::config::Rate;
+use utils::{DomainPart, config::Rate};
 
 impl<T: SessionStream> Session<T> {
     pub async fn queue_message(&mut self) -> Cow<'static, [u8]> {
@@ -425,6 +425,7 @@ impl<T: SessionStream> Session<T> {
         }
 
         // Run SPAM filter
+        let mut train_spam = None;
         if self.server.core.spam.enabled
             && self
                 .server
@@ -442,9 +443,18 @@ impl<T: SessionStream> Session<T> {
                 )
                 .await
             {
-                SpamFilterAction::Allow(spam_headers) => {
-                    if !spam_headers.is_empty() {
-                        headers.extend_from_slice(spam_headers.as_bytes());
+                SpamFilterAction::Allow(score) => {
+                    // Add headers
+                    headers.extend_from_slice(score.headers.as_bytes());
+                    train_spam = score.train_spam;
+
+                    // Add scores for local recipients
+                    for (is_spam, recipient) in
+                        score.results.into_iter().zip(self.data.rcpt_to.iter_mut())
+                    {
+                        if is_spam {
+                            recipient.flags |= RCPT_SPAM_PAYLOAD;
+                        }
                     }
                 }
                 SpamFilterAction::Discard => {
@@ -456,6 +466,7 @@ impl<T: SessionStream> Session<T> {
                     return (b"550 5.7.1 Message rejected due to excessive spam score.\r\n"[..])
                         .into();
                 }
+                SpamFilterAction::Disabled => {}
             }
         }
 
@@ -668,9 +679,23 @@ impl<T: SessionStream> Session<T> {
 
             // Queue message
             let source = if !self.is_authenticated() {
-                MessageSource::Unauthenticated(
-                    dmarc_result.is_some_and(|result| result == DmarcResult::Pass),
-                )
+                let dmarc_pass = dmarc_result.is_some_and(|result| result == DmarcResult::Pass);
+
+                #[cfg(feature = "test_mode")]
+                {
+                    MessageSource::Unauthenticated {
+                        dmarc_pass: dmarc_pass || message.message.return_path.starts_with("dmarc-"),
+                        train_spam,
+                    }
+                }
+
+                #[cfg(not(feature = "test_mode"))]
+                {
+                    MessageSource::Unauthenticated {
+                        dmarc_pass,
+                        train_spam,
+                    }
+                }
             } else {
                 MessageSource::Authenticated
             };
@@ -710,14 +735,14 @@ impl<T: SessionStream> Session<T> {
             .map_or(0, |d| d.as_secs());
         let mut message = Message {
             created,
-            return_path: mail_from.address.to_lowercase_domain(),
+            return_path: mail_from.address.to_lowercase_domain().into_boxed_str(),
             recipients: Vec::with_capacity(rcpt_to.len()),
             flags: mail_from.flags,
             priority: self.data.priority,
             size: 0,
-            env_id: mail_from.dsn_info,
+            env_id: mail_from.dsn_info.map(|i| i.into_boxed_str()),
             blob_hash: Default::default(),
-            quota_keys: Vec::new(),
+            quota_keys: Default::default(),
             received_from_ip: self.data.remote_ip,
             received_via_port: self.data.local_port,
         };
@@ -741,7 +766,7 @@ impl<T: SessionStream> Session<T> {
                             rcpt.flags | RCPT_NOTIFY_DELAY | RCPT_NOTIFY_FAILURE
                         },
                     )
-                    .with_orcpt(rcpt.dsn_info),
+                    .with_orcpt(rcpt.dsn_info.map(|v| v.into_boxed_str())),
             );
 
             let envelope = QueueEnvelope::new(&message, message.recipients.last().unwrap());

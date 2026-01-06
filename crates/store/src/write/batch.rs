@@ -5,11 +5,18 @@
  */
 
 use super::{
-    Batch, BatchBuilder, BitmapClass, ChangedCollection, IntoOperations, Operation, TagValue,
-    ValueClass, ValueOp, assert::ToAssertValue, log::VanishedItem,
+    Batch, BatchBuilder, ChangedCollection, IntoOperations, Operation, ValueClass, ValueOp,
+    assert::ToAssertValue, log::VanishedItem,
 };
-use crate::{SerializeInfallible, U32_LEN, write::MergeFn};
-use utils::map::{bitmap::ShortId, vec_map::VecMap};
+use crate::{
+    SerializeInfallible, U32_LEN,
+    write::{LogCollection, MergeFnc, MergeOperation, Params, SetFnc, SetOperation},
+};
+use types::{
+    collection::{Collection, SyncCollection, VanishedCollection},
+    field::FieldType,
+};
+use utils::map::vec_map::VecMap;
 
 impl BatchBuilder {
     pub fn new() -> Self {
@@ -38,8 +45,7 @@ impl BatchBuilder {
         self
     }
 
-    pub fn with_collection(&mut self, collection: impl Into<u8>) -> &mut Self {
-        let collection = collection.into();
+    pub fn with_collection(&mut self, collection: Collection) -> &mut Self {
         let collection_ = Some(collection);
         if collection_ != self.current_collection {
             self.current_collection = collection_;
@@ -48,35 +54,9 @@ impl BatchBuilder {
         self
     }
 
-    pub fn create_document(&mut self, document_id: u32) -> &mut Self {
-        self.ops.push(Operation::DocumentId { document_id });
-        self.ops.push(Operation::Bitmap {
-            class: BitmapClass::DocumentIds,
-            set: true,
-        });
-        self.current_document_id = Some(document_id);
-        self.batch_size += U32_LEN * 3;
-        self.batch_ops += 1;
-        self.has_assertions = false;
-        self
-    }
-
-    pub fn update_document(&mut self, document_id: u32) -> &mut Self {
+    pub fn with_document(&mut self, document_id: u32) -> &mut Self {
         self.ops.push(Operation::DocumentId { document_id });
         self.current_document_id = Some(document_id);
-        self.has_assertions = false;
-        self
-    }
-
-    pub fn delete_document(&mut self, document_id: u32) -> &mut Self {
-        self.ops.push(Operation::DocumentId { document_id });
-        self.ops.push(Operation::Bitmap {
-            class: BitmapClass::DocumentIds,
-            set: false,
-        });
-        self.current_document_id = Some(document_id);
-        self.batch_size += U32_LEN * 3;
-        self.batch_ops += 1;
         self.has_assertions = false;
         self
     }
@@ -95,7 +75,7 @@ impl BatchBuilder {
         self
     }
 
-    pub fn index(&mut self, field: impl Into<u8>, value: impl Into<Vec<u8>>) -> &mut Self {
+    pub fn index(&mut self, field: impl FieldType, value: impl Into<Vec<u8>>) -> &mut Self {
         let field = field.into();
         let value = value.into();
         let value_len = value.len();
@@ -110,7 +90,7 @@ impl BatchBuilder {
         self
     }
 
-    pub fn unindex(&mut self, field: impl Into<u8>, value: impl Into<Vec<u8>>) -> &mut Self {
+    pub fn unindex(&mut self, field: impl FieldType, value: impl Into<Vec<u8>>) -> &mut Self {
         let field = field.into();
         let value = value.into();
         let value_len = value.len();
@@ -125,34 +105,14 @@ impl BatchBuilder {
         self
     }
 
-    pub fn tag(&mut self, field: impl Into<u8>, value: impl Into<TagValue>) -> &mut Self {
-        let value = value.into();
-        let value_len = value.serialized_size();
-        self.ops.push(Operation::Bitmap {
-            class: BitmapClass::Tag {
-                field: field.into(),
-                value,
-            },
-            set: true,
-        });
-        self.batch_size += (U32_LEN * 3) + value_len;
-        self.batch_ops += 1;
-        self
+    #[inline(always)]
+    pub fn tag(&mut self, field: impl FieldType) -> &mut Self {
+        self.index(field, vec![])
     }
 
-    pub fn untag(&mut self, field: impl Into<u8>, value: impl Into<TagValue>) -> &mut Self {
-        let value = value.into();
-        let value_len = value.serialized_size();
-        self.ops.push(Operation::Bitmap {
-            class: BitmapClass::Tag {
-                field: field.into(),
-                value,
-            },
-            set: false,
-        });
-        self.batch_size += (U32_LEN * 3) + value_len;
-        self.batch_ops += 1;
-        self
+    #[inline(always)]
+    pub fn untag(&mut self, field: impl FieldType) -> &mut Self {
+        self.unindex(field, vec![])
     }
 
     pub fn add(&mut self, class: impl Into<ValueClass>, value: i64) -> &mut Self {
@@ -183,47 +143,35 @@ impl BatchBuilder {
         self.batch_size += class.serialized_size() + value.len();
         self.ops.push(Operation::Value {
             class,
-            op: ValueOp::Set {
-                value,
-                version_offset: None,
-            },
+            op: ValueOp::Set(value),
         });
         self.batch_ops += 1;
         self
     }
 
-    pub fn merge(
+    pub fn set_fnc(
         &mut self,
         class: impl Into<ValueClass>,
-        value: impl Fn(Option<&[u8]>) -> trc::Result<Vec<u8>> + Sync + Send + 'static,
+        params: Params,
+        fnc: SetFnc,
     ) -> &mut Self {
         self.ops.push(Operation::Value {
             class: class.into(),
-            op: ValueOp::Merge(MergeFn {
-                fnc: Box::new(value),
-                fnc_id: rand::random::<u64>(),
-            }),
+            op: ValueOp::SetFnc(SetOperation { fnc, params }),
         });
         self
     }
 
-    pub fn set_versioned(
+    pub fn merge_fnc(
         &mut self,
         class: impl Into<ValueClass>,
-        value: impl Into<Vec<u8>>,
-        version_offset: usize,
+        params: Params,
+        fnc: MergeFnc,
     ) -> &mut Self {
-        let class = class.into();
-        let value = value.into();
-        self.batch_size += class.serialized_size() + value.len();
         self.ops.push(Operation::Value {
-            class,
-            op: ValueOp::Set {
-                value,
-                version_offset: Some(version_offset),
-            },
+            class: class.into(),
+            op: ValueOp::MergeFnc(MergeOperation { fnc, params }),
         });
-        self.batch_ops += 1;
         self
     }
 
@@ -242,10 +190,7 @@ impl BatchBuilder {
         self.batch_size += (U32_LEN * 3) + op.len();
         self.ops.push(Operation::Value {
             class: ValueClass::Acl(grant_account_id),
-            op: ValueOp::Set {
-                value: op,
-                version_offset: None,
-            },
+            op: ValueOp::Set(op),
         });
         self.batch_ops += 1;
         self
@@ -261,12 +206,16 @@ impl BatchBuilder {
         self
     }
 
-    pub fn log_item_insert(&mut self, collection: impl Into<u8>, prefix: Option<u32>) -> &mut Self {
+    pub fn log_item_insert(
+        &mut self,
+        collection: SyncCollection,
+        prefix: Option<u32>,
+    ) -> &mut Self {
         if let (Some(account_id), Some(document_id)) =
             (self.current_account_id, self.current_document_id)
         {
             self.changes.get_mut_or_insert(account_id).log_item_insert(
-                collection.into(),
+                collection,
                 prefix,
                 document_id,
             );
@@ -274,12 +223,16 @@ impl BatchBuilder {
         self
     }
 
-    pub fn log_item_update(&mut self, collection: impl Into<u8>, prefix: Option<u32>) -> &mut Self {
+    pub fn log_item_update(
+        &mut self,
+        collection: SyncCollection,
+        prefix: Option<u32>,
+    ) -> &mut Self {
         if let (Some(account_id), Some(document_id)) =
             (self.current_account_id, self.current_document_id)
         {
             self.changes.get_mut_or_insert(account_id).log_item_update(
-                collection.into(),
+                collection,
                 prefix,
                 document_id,
             );
@@ -287,12 +240,16 @@ impl BatchBuilder {
         self
     }
 
-    pub fn log_item_delete(&mut self, collection: impl Into<u8>, prefix: Option<u32>) -> &mut Self {
+    pub fn log_item_delete(
+        &mut self,
+        collection: SyncCollection,
+        prefix: Option<u32>,
+    ) -> &mut Self {
         if let (Some(account_id), Some(document_id)) =
             (self.current_account_id, self.current_document_id)
         {
             self.changes.get_mut_or_insert(account_id).log_item_delete(
-                collection.into(),
+                collection,
                 prefix,
                 document_id,
             );
@@ -300,67 +257,83 @@ impl BatchBuilder {
         self
     }
 
-    pub fn log_container_insert(&mut self, collection: impl Into<u8>) -> &mut Self {
+    pub fn log_container_insert(&mut self, collection: SyncCollection) -> &mut Self {
         if let (Some(account_id), Some(document_id)) =
             (self.current_account_id, self.current_document_id)
         {
             self.changes
                 .get_mut_or_insert(account_id)
-                .log_container_insert(collection.into(), document_id);
+                .log_container_insert(collection, document_id);
         }
         self
     }
 
-    pub fn log_container_update(&mut self, collection: impl Into<u8>) -> &mut Self {
+    pub fn log_container_update(&mut self, collection: SyncCollection) -> &mut Self {
         if let (Some(account_id), Some(document_id)) =
             (self.current_account_id, self.current_document_id)
         {
             self.changes
                 .get_mut_or_insert(account_id)
-                .log_container_update(collection.into(), document_id);
+                .log_container_update(collection, document_id);
         }
         self
     }
 
-    pub fn log_container_delete(&mut self, collection: impl Into<u8>) -> &mut Self {
+    pub fn log_container_delete(&mut self, collection: SyncCollection) -> &mut Self {
         if let (Some(account_id), Some(document_id)) =
             (self.current_account_id, self.current_document_id)
         {
             self.changes
                 .get_mut_or_insert(account_id)
-                .log_container_delete(collection.into(), document_id);
+                .log_container_delete(collection, document_id);
         }
         self
     }
 
     pub fn log_container_property_change(
         &mut self,
-        collection: impl Into<u8>,
+        collection: SyncCollection,
         document_id: u32,
     ) -> &mut Self {
         if let Some(account_id) = self.current_account_id {
             self.changes
                 .get_mut_or_insert(account_id)
-                .log_container_property_update(collection.into(), document_id);
+                .log_container_property_update(collection, document_id);
         }
         self
     }
 
     pub fn log_vanished_item(
         &mut self,
-        collection: impl Into<u8>,
+        collection: VanishedCollection,
         item: impl Into<VanishedItem>,
     ) -> &mut Self {
         if let Some(account_id) = self.current_account_id {
             let item = item.into();
             self.batch_size += item.serialized_size();
-            let collection = collection.into();
-            debug_assert!(collection > 200);
             self.changes
                 .get_mut_or_insert(account_id)
                 .log_vanished_item(collection, item);
         }
         self
+    }
+
+    pub fn log_share_notification(
+        &mut self,
+        notification_id: u64,
+        notify_account_id: u32,
+        value: impl SerializeInfallible,
+    ) -> &mut Self {
+        self.changed_collections
+            .get_mut_or_insert(notify_account_id)
+            .share_notification_id = Some(notification_id);
+        self.set(
+            ValueClass::ShareNotification {
+                notification_id,
+                notify_account_id,
+            },
+            value.serialize(),
+        )
     }
 
     fn serialize_changes(&mut self) {
@@ -372,14 +345,14 @@ impl BatchBuilder {
                 for (collection, changes) in changelog.changes.into_iter() {
                     let cc = self.changed_collections.get_mut_or_insert(account_id);
                     if changes.has_container_changes() {
-                        cc.changed_containers.insert(ShortId(collection));
+                        cc.changed_containers.insert(collection);
                     }
                     if changes.has_item_changes() {
-                        cc.changed_items.insert(ShortId(collection));
+                        cc.changed_items.insert(collection);
                     }
 
                     self.ops.push(Operation::Log {
-                        collection,
+                        collection: LogCollection::Sync(collection),
                         set: changes.serialize(),
                     });
                 }
@@ -387,7 +360,7 @@ impl BatchBuilder {
                 // Serialize vanished items
                 for (collection, vanished) in changelog.vanished.into_iter() {
                     self.ops.push(Operation::Log {
-                        collection,
+                        collection: LogCollection::Vanished(collection),
                         set: vanished.serialize(),
                     });
                 }
@@ -429,6 +402,14 @@ impl BatchBuilder {
 
     pub fn last_account_id(&self) -> Option<u32> {
         self.current_account_id
+    }
+
+    pub fn last_collection(&self) -> Option<Collection> {
+        self.current_collection
+    }
+
+    pub fn last_document_id(&self) -> Option<u32> {
+        self.current_document_id
     }
 
     pub fn commit_points(&mut self) -> CommitPointIterator {

@@ -4,240 +4,206 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::{
-    Server,
-    auth::AccessToken,
-    ipc::{EncryptionKeys, PushSubscription, StateEvent, UpdateSubscription},
-};
+use common::{Server, auth::AccessToken, ipc::PushEvent};
+use email::push::PushSubscriptions;
 use jmap_proto::{
-    method::get::{GetRequest, GetResponse, RequestArguments},
-    types::{
-        collection::Collection,
-        date::UTCDate,
-        property::Property,
-        value::{Object, Value},
-    },
+    method::get::{GetRequest, GetResponse},
+    object::push_subscription::{self, PushSubscriptionProperty, PushSubscriptionValue},
+    types::date::UTCDate,
 };
+use jmap_tools::{Map, Value};
+use std::future::Future;
 use store::{
-    BitmapKey, ValueKey,
-    write::{AlignedBytes, Archive, ValueClass, now},
+    Serialize, ValueKey,
+    write::{AlignedBytes, Archive, Archiver, BatchBuilder, now},
 };
 use trc::{AddContext, ServerEvent};
+use types::{collection::Collection, field::PrincipalField, id::Id};
 use utils::map::bitmap::Bitmap;
-
-use std::future::Future;
 
 pub trait PushSubscriptionFetch: Sync + Send {
     fn push_subscription_get(
         &self,
-        request: GetRequest<RequestArguments>,
+        request: GetRequest<push_subscription::PushSubscription>,
         access_token: &AccessToken,
-    ) -> impl Future<Output = trc::Result<GetResponse>> + Send;
-
-    fn fetch_push_subscriptions(
-        &self,
-        account_id: u32,
-    ) -> impl Future<Output = trc::Result<StateEvent>> + Send;
-
-    fn update_push_subscriptions(&self, account_id: u32) -> impl Future<Output = bool> + Send;
+    ) -> impl Future<Output = trc::Result<GetResponse<push_subscription::PushSubscription>>> + Send;
 }
 
 impl PushSubscriptionFetch for Server {
     async fn push_subscription_get(
         &self,
-        mut request: GetRequest<RequestArguments>,
+        mut request: GetRequest<push_subscription::PushSubscription>,
         access_token: &AccessToken,
-    ) -> trc::Result<GetResponse> {
+    ) -> trc::Result<GetResponse<push_subscription::PushSubscription>> {
         let ids = request.unwrap_ids(self.core.jmap.get_max_objects)?;
         let properties = request.unwrap_properties(&[
-            Property::Id,
-            Property::DeviceClientId,
-            Property::VerificationCode,
-            Property::Expires,
-            Property::Types,
+            PushSubscriptionProperty::Id,
+            PushSubscriptionProperty::DeviceClientId,
+            PushSubscriptionProperty::VerificationCode,
+            PushSubscriptionProperty::Expires,
+            PushSubscriptionProperty::Types,
         ]);
+
         let account_id = access_token.primary_id();
-        let push_ids = self
-            .get_document_ids(account_id, Collection::PushSubscription)
+
+        let mut response = GetResponse {
+            account_id: request.account_id.into(),
+            state: None,
+            list: Vec::new(),
+            not_found: vec![],
+        };
+
+        let Some(subscriptions_) = self
+            .store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::property(
+                account_id,
+                Collection::Principal,
+                0,
+                PrincipalField::PushSubscriptions,
+            ))
             .await?
-            .unwrap_or_default();
+        else {
+            for id in ids.unwrap_or_default() {
+                response.not_found.push(id);
+            }
+            return Ok(response);
+        };
+        let subscriptions = subscriptions_
+            .to_unarchived::<PushSubscriptions>()
+            .caused_by(trc::location!())?;
+
         let ids = if let Some(ids) = ids {
             ids
         } else {
-            push_ids
+            subscriptions
+                .inner
+                .subscriptions
                 .iter()
                 .take(self.core.jmap.get_max_objects)
-                .map(Into::into)
+                .map(|s| Id::from(s.id.to_native()))
                 .collect::<Vec<_>>()
-        };
-        let mut response = GetResponse {
-            account_id: None,
-            state: None,
-            list: Vec::with_capacity(ids.len()),
-            not_found: vec![],
         };
 
         for id in ids {
             // Obtain the push subscription object
             let document_id = id.document_id();
-            if !push_ids.contains(document_id) {
-                response.not_found.push(id.into());
-                continue;
-            }
-            let push_ = if let Some(push) = self
-                .get_archive(account_id, Collection::PushSubscription, document_id)
-                .await?
-            {
-                push
-            } else {
-                response.not_found.push(id.into());
+            let Some(push) = subscriptions
+                .inner
+                .subscriptions
+                .iter()
+                .find(|p| p.id.to_native() == document_id)
+            else {
+                response.not_found.push(id);
                 continue;
             };
-            let push = push_
-                .unarchive::<email::push::PushSubscription>()
-                .caused_by(trc::location!())?;
-            let mut result = Object::with_capacity(properties.len());
+
+            let mut result = Map::with_capacity(properties.len());
             for property in &properties {
                 match property {
-                    Property::Id => {
-                        result.append(Property::Id, Value::Id(id));
+                    PushSubscriptionProperty::Id => {
+                        result.insert_unchecked(PushSubscriptionProperty::Id, id);
                     }
-                    Property::Url | Property::Keys | Property::Value => {
+                    PushSubscriptionProperty::Url | PushSubscriptionProperty::Keys => {
                         return Err(trc::JmapEvent::Forbidden.into_err().details(
                             "The 'url' and 'keys' properties are not readable".to_string(),
                         ));
                     }
-                    Property::DeviceClientId => {
-                        result.append(
-                            Property::DeviceClientId,
-                            Value::from(&push.device_client_id),
+                    PushSubscriptionProperty::DeviceClientId => {
+                        result.insert_unchecked(
+                            PushSubscriptionProperty::DeviceClientId,
+                            &push.device_client_id,
                         );
                     }
-                    Property::Types => {
+                    PushSubscriptionProperty::Types => {
                         let mut types = Vec::new();
                         for typ in Bitmap::from(&push.types).into_iter() {
-                            types.push(Value::Text(typ.to_string()));
+                            types.push(Value::Element(PushSubscriptionValue::Types(typ)));
                         }
-                        result.append(Property::Types, Value::List(types));
+                        result
+                            .insert_unchecked(PushSubscriptionProperty::Types, Value::Array(types));
                     }
-                    Property::Expires => {
+                    PushSubscriptionProperty::Expires => {
                         if push.expires > 0 {
-                            result.append(
-                                Property::Expires,
-                                Value::Date(
+                            result.insert_unchecked(
+                                PushSubscriptionProperty::Expires,
+                                Value::Element(PushSubscriptionValue::Date(
                                     UTCDate::from_timestamp(u64::from(push.expires) as i64),
-                                ),
+                                )),
                             );
                         } else {
-                            result.append(Property::Expires, Value::Null);
+                            result.insert_unchecked(PushSubscriptionProperty::Expires, Value::Null);
                         }
                     }
                     property => {
-                        result.append(property.clone(), Value::Null);
+                        result.insert_unchecked(property.clone(), Value::Null);
                     }
                 }
             }
-            response.list.push(result);
+            response.list.push(result.into());
+        }
+
+        // Purge old subscriptions
+        let current_time = now();
+        if subscriptions
+            .inner
+            .subscriptions
+            .iter()
+            .any(|s| s.expires.to_native() < current_time)
+        {
+            let mut updated_subscriptions = subscriptions.deserialize::<PushSubscriptions>()?;
+            updated_subscriptions
+                .subscriptions
+                .retain(|s| s.expires >= current_time);
+            let mut batch = BatchBuilder::new();
+
+            if updated_subscriptions.subscriptions.is_empty() {
+                batch
+                    .with_account_id(u32::MAX)
+                    .with_collection(Collection::Principal)
+                    .with_account_id(account_id)
+                    .tag(PrincipalField::PushSubscriptions);
+            }
+
+            batch
+                .with_account_id(account_id)
+                .with_collection(Collection::Principal)
+                .with_document(0)
+                .assert_value(PrincipalField::PushSubscriptions, subscriptions);
+
+            if !updated_subscriptions.subscriptions.is_empty() {
+                batch.set(
+                    PrincipalField::PushSubscriptions,
+                    Archiver::new(updated_subscriptions)
+                        .serialize()
+                        .caused_by(trc::location!())?,
+                );
+            } else {
+                batch.clear(PrincipalField::PushSubscriptions);
+            }
+
+            self.commit_batch(batch).await.caused_by(trc::location!())?;
+
+            // Update push servers
+            if self
+                .inner
+                .ipc
+                .push_tx
+                .clone()
+                .send(PushEvent::PushServerUpdate {
+                    account_id,
+                    broadcast: true,
+                })
+                .await
+                .is_err()
+            {
+                trc::event!(
+                    Server(ServerEvent::ThreadError),
+                    Details = "Error sending push updates.",
+                    CausedBy = trc::location!()
+                );
+            }
         }
 
         Ok(response)
-    }
-
-    async fn fetch_push_subscriptions(&self, account_id: u32) -> trc::Result<StateEvent> {
-        let mut subscriptions = Vec::new();
-        let document_ids = self
-            .core
-            .storage
-            .data
-            .get_bitmap(BitmapKey::document_ids(
-                account_id,
-                Collection::PushSubscription,
-            ))
-            .await?
-            .unwrap_or_default();
-
-        let current_time = now();
-
-        for document_id in document_ids {
-            let subscription = self
-                .core
-                .storage
-                .data
-                .get_value::<Archive<AlignedBytes>>(ValueKey {
-                    account_id,
-                    collection: Collection::PushSubscription.into(),
-                    document_id,
-                    class: ValueClass::Property(Property::Value.into()),
-                })
-                .await?
-                .ok_or_else(|| {
-                    trc::StoreEvent::NotFound
-                        .into_err()
-                        .caused_by(trc::location!())
-                        .document_id(document_id)
-                })?
-                .deserialize::<email::push::PushSubscription>()
-                .caused_by(trc::location!())?;
-
-            if subscription.expires > current_time {
-                if subscription.verified {
-                    // Add verified subscription
-                    subscriptions.push(UpdateSubscription::Verified(PushSubscription {
-                        id: document_id,
-                        url: subscription.url,
-                        expires: subscription.expires,
-                        types: subscription.types,
-                        keys: subscription.keys.map(|keys| EncryptionKeys {
-                            p256dh: keys.p256dh,
-                            auth: keys.auth,
-                        }),
-                    }));
-                } else {
-                    // Add unverified subscription
-                    subscriptions.push(UpdateSubscription::Unverified {
-                        id: document_id,
-                        url: subscription.url,
-                        code: subscription.verification_code,
-                        keys: subscription.keys.map(|keys| EncryptionKeys {
-                            p256dh: keys.p256dh,
-                            auth: keys.auth,
-                        }),
-                    });
-                }
-            }
-        }
-
-        Ok(StateEvent::UpdateSubscriptions {
-            account_id,
-            subscriptions,
-        })
-    }
-
-    async fn update_push_subscriptions(&self, account_id: u32) -> bool {
-        let push_subs = match self.fetch_push_subscriptions(account_id).await {
-            Ok(push_subs) => push_subs,
-            Err(err) => {
-                trc::error!(
-                    err.account_id(account_id)
-                        .details("Failed to fetch push subscriptions")
-                );
-                return false;
-            }
-        };
-
-        let state_tx = self.inner.ipc.state_tx.clone();
-        for event in [StateEvent::UpdateSharedAccounts { account_id }, push_subs] {
-            if state_tx.send(event).await.is_err() {
-                trc::event!(
-                    Server(ServerEvent::ThreadError),
-                    Details = "Error sending state change.",
-                    CausedBy = trc::location!()
-                );
-
-                return false;
-            }
-        }
-
-        true
     }
 }

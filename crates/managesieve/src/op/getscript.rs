@@ -4,17 +4,18 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::time::Instant;
-
+use crate::core::{Command, ResponseCode, Session, StatusResponse};
 use common::listener::SessionStream;
 use directory::Permission;
 use email::sieve::SieveScript;
 use imap_proto::receiver::Request;
-use jmap_proto::types::{blob::BlobSection, collection::Collection};
+use std::time::Instant;
+use store::{
+    ValueKey,
+    write::{AlignedBytes, Archive},
+};
 use trc::AddContext;
-use utils::BlobHash;
-
-use crate::core::{Command, ResponseCode, Session, StatusResponse};
+use types::{blob::BlobSection, blob_hash::BlobHash, collection::Collection};
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_getscript(&mut self, request: Request<Command>) -> trc::Result<Vec<u8>> {
@@ -36,7 +37,12 @@ impl<T: SessionStream> Session<T> {
         let document_id = self.get_script_id(account_id, &name).await?;
         let sieve_ = self
             .server
-            .get_archive(account_id, Collection::SieveScript, document_id)
+            .store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                account_id,
+                Collection::SieveScript,
+                document_id,
+            ))
             .await
             .caused_by(trc::location!())?
             .ok_or_else(|| {

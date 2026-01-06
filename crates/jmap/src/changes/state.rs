@@ -4,10 +4,11 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::{MessageStoreCache, Server};
-use jmap_proto::types::{collection::SyncCollection, state::State};
+use common::{DavResources, MessageStoreCache, Server};
+use jmap_proto::types::state::State;
 use std::future::Future;
 use trc::AddContext;
+use types::collection::SyncCollection;
 
 pub trait StateManager: Sync + Send {
     fn get_state(
@@ -24,10 +25,18 @@ pub trait StateManager: Sync + Send {
     ) -> impl Future<Output = trc::Result<State>> + Send;
 }
 
-pub trait MessageCacheState: Sync + Send {
-    fn get_state(&self, is_mailbox: bool) -> State;
+pub trait JmapCacheState: Sync + Send {
+    fn get_state(&self, is_container: bool) -> State;
 
-    fn assert_state(&self, is_mailbox: bool, if_in_state: &Option<State>) -> trc::Result<State>;
+    fn assert_state(&self, is_container: bool, if_in_state: &Option<State>) -> trc::Result<State> {
+        let old_state: State = self.get_state(is_container);
+        if let Some(if_in_state) = if_in_state
+            && &old_state != if_in_state
+        {
+            return Err(trc::JmapEvent::StateMismatch.into_err());
+        }
+        Ok(old_state)
+    }
 }
 
 impl StateManager for Server {
@@ -35,7 +44,7 @@ impl StateManager for Server {
         self.core
             .storage
             .data
-            .get_last_change_id(account_id, collection)
+            .get_last_change_id(account_id, collection.into())
             .await
             .caused_by(trc::location!())
             .map(State::from)
@@ -58,22 +67,22 @@ impl StateManager for Server {
     }
 }
 
-impl MessageCacheState for MessageStoreCache {
-    fn get_state(&self, is_mailbox: bool) -> State {
-        if is_mailbox {
+impl JmapCacheState for MessageStoreCache {
+    fn get_state(&self, is_container: bool) -> State {
+        if is_container {
             State::from(self.mailboxes.change_id)
         } else {
             State::from(self.emails.change_id)
         }
     }
+}
 
-    fn assert_state(&self, is_mailbox: bool, if_in_state: &Option<State>) -> trc::Result<State> {
-        let old_state: State = self.get_state(is_mailbox);
-        if let Some(if_in_state) = if_in_state
-            && &old_state != if_in_state
-        {
-            return Err(trc::JmapEvent::StateMismatch.into_err());
+impl JmapCacheState for DavResources {
+    fn get_state(&self, is_container: bool) -> State {
+        if is_container {
+            State::from(self.container_change_id)
+        } else {
+            State::from(self.item_change_id)
         }
-        Ok(old_state)
     }
 }

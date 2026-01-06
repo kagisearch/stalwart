@@ -1,16 +1,16 @@
 [package]
 name = "spam-filter"
-version = "0.13.3"
+version = "0.15.3"
 edition = "2024"
-resolver = "2"
 
 [dependencies]
 utils = { path = "../utils" }
+types = { path = "../types" }
 nlp = { path = "../nlp" }
 store = { path = "../store" }
 trc = { path = "../trc" }
 common = { path =  "../common" }
-smtp-proto = { version = "0.1", features = ["rkyv"] }
+smtp-proto = { version = "0.2", features = ["rkyv"] }
 mail-parser = { version = "0.11", features = ["full_encoding"] } 
 mail-builder = { version = "0.4" }
 mail-auth = { version = "0.7.1" }
@@ -26,6 +26,10 @@ infer = "0.19"
 sha1 = "0.10"
 sha2 = "0.10.6"
 compact_str = "0.9.0"
+rkyv = { version = "0.8.10", features = ["little_endian"] }
+serde = { version = "1.0", features = ["derive"]}
+unicode-general-category = "1.1.0"
+unicode-normalization = "0.1.25"
 
 [features]
 test_mode = []

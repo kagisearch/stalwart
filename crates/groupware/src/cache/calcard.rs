@@ -9,23 +9,24 @@ use crate::{
     DavResourceName, RFC_3986,
     calendar::{
         ArchivedCalendar, ArchivedCalendarEvent, Calendar, CalendarEvent, SCHEDULE_INBOX_ID,
-        SCHEDULE_OUTBOX_ID,
+        SCHEDULE_OUTBOX_ID, storage::ItipAutoExpunge,
     },
     contact::{AddressBook, ArchivedAddressBook, ArchivedContactCard, ContactCard},
 };
 use calcard::common::timezone::Tz;
 use common::{
-    DavName, DavPath, DavResource, DavResourceMetadata, DavResources, Server, auth::AccessToken,
+    DavName, DavPath, DavResource, DavResourceMetadata, DavResources, Server,
+    TinyCalendarPreferences, auth::AccessToken,
 };
 use directory::backend::internal::manage::ManageDirectory;
-use jmap_proto::types::{
-    collection::{Collection, SyncCollection},
-    value::AclGrant,
-};
 use std::sync::Arc;
 use store::ahash::{AHashMap, AHashSet};
 use tokio::sync::Semaphore;
 use trc::AddContext;
+use types::{
+    acl::AclGrant,
+    collection::{Collection, SyncCollection},
+};
 use utils::map::bitmap::Bitmap;
 
 pub(super) async fn build_calcard_resources(
@@ -37,59 +38,13 @@ pub(super) async fn build_calcard_resources(
     item_collection: Collection,
     update_lock: Arc<Semaphore>,
 ) -> trc::Result<DavResources> {
-    let mut last_change_id = server
-        .core
-        .storage
-        .data
-        .get_last_change_id(account_id, sync_collection)
-        .await
-        .caused_by(trc::location!())?
-        .unwrap_or_default();
-
-    // Create default folders
     let is_calendar = matches!(sync_collection, SyncCollection::Calendar);
-    let mut container_ids = server
-        .get_document_ids(account_id, container_collection)
-        .await
-        .caused_by(trc::location!())?
-        .unwrap_or_default();
     let name = server
         .store()
         .get_principal_name(account_id)
         .await
         .caused_by(trc::location!())?
         .unwrap_or_else(|| format!("_{account_id}"));
-    if container_ids.is_empty() {
-        if is_calendar {
-            server
-                .create_default_calendar(access_token, account_id, &name)
-                .await?;
-        } else {
-            server
-                .create_default_addressbook(access_token, account_id, &name)
-                .await?;
-        }
-        last_change_id = server
-            .core
-            .storage
-            .data
-            .get_last_change_id(account_id, sync_collection)
-            .await
-            .caused_by(trc::location!())?
-            .unwrap_or_default();
-
-        container_ids = server
-            .get_document_ids(account_id, container_collection)
-            .await
-            .caused_by(trc::location!())?
-            .unwrap_or_default();
-    }
-    let item_ids = server
-        .get_document_ids(account_id, item_collection)
-        .await
-        .caused_by(trc::location!())?
-        .unwrap_or_default();
-
     let mut cache = DavResources {
         base_path: format!(
             "{}/{}/",
@@ -101,77 +56,116 @@ pub(super) async fn build_calcard_resources(
             .base_path(),
             percent_encoding::utf8_percent_encode(&name, RFC_3986),
         ),
-        paths: AHashSet::with_capacity((container_ids.len() + item_ids.len()) as usize),
-        resources: Vec::with_capacity((container_ids.len() + item_ids.len()) as usize),
-        item_change_id: last_change_id,
-        container_change_id: last_change_id,
-        highest_change_id: last_change_id,
+        paths: AHashSet::with_capacity(16),
+        resources: Vec::with_capacity(16),
+        item_change_id: 0,
+        container_change_id: 0,
+        highest_change_id: 0,
         size: std::mem::size_of::<DavResources>() as u64,
         update_lock,
     };
 
-    for document_id in container_ids {
-        if let Some(archive) = server
-            .get_archive(account_id, container_collection, document_id)
+    let mut is_first_check = true;
+    loop {
+        let last_change_id = server
+            .core
+            .storage
+            .data
+            .get_last_change_id(account_id, sync_collection.into())
             .await
             .caused_by(trc::location!())?
-        {
-            let resource = if is_calendar {
-                resource_from_calendar(archive.unarchive::<Calendar>()?, document_id)
-            } else {
-                resource_from_addressbook(archive.unarchive::<AddressBook>()?, document_id)
-            };
-            let path = DavPath {
-                path: resource.container_name().unwrap().to_string(),
-                parent_id: None,
-                hierarchy_seq: 1,
-                resource_idx: cache.resources.len(),
-            };
+            .unwrap_or_default();
+        cache.item_change_id = last_change_id;
+        cache.container_change_id = last_change_id;
+        cache.highest_change_id = last_change_id;
 
-            cache.size += (std::mem::size_of::<DavPath>()
-                + std::mem::size_of::<DavResource>()
-                + (path.path.len()) * 2) as u64;
-            cache.paths.insert(path);
-            cache.resources.push(resource);
-        }
-    }
-    let parent_range = cache.resources.len();
-
-    for document_id in item_ids {
-        if let Some(archive) = server
-            .get_archive(account_id, item_collection, document_id)
-            .await
-            .caused_by(trc::location!())?
-        {
-            let resource = if is_calendar {
-                resource_from_event(archive.unarchive::<CalendarEvent>()?, document_id)
-            } else {
-                resource_from_card(archive.unarchive::<ContactCard>()?, document_id)
-            };
-            let resource_idx = cache.resources.len();
-
-            for name in resource.child_names().unwrap_or_default().iter() {
-                if let Some(parent) = cache.resources.get(..parent_range).and_then(|resources| {
-                    resources.iter().find(|r| r.document_id == name.parent_id)
-                }) {
+        server
+            .archives(
+                account_id,
+                container_collection,
+                &(),
+                |document_id, archive| {
+                    let resource = if is_calendar {
+                        resource_from_calendar(archive.unarchive::<Calendar>()?, document_id)
+                    } else {
+                        resource_from_addressbook(archive.unarchive::<AddressBook>()?, document_id)
+                    };
                     let path = DavPath {
-                        path: format!("{}/{}", parent.container_name().unwrap(), name.name),
-                        parent_id: Some(name.parent_id),
-                        hierarchy_seq: 0,
-                        resource_idx,
+                        path: resource.container_name().unwrap().to_string(),
+                        parent_id: None,
+                        hierarchy_seq: 1,
+                        resource_idx: cache.resources.len(),
                     };
 
-                    cache.size +=
-                        (std::mem::size_of::<DavPath>() + name.name.len() + path.path.len()) as u64;
+                    cache.size += (std::mem::size_of::<DavPath>()
+                        + std::mem::size_of::<DavResource>()
+                        + (path.path.len()) * 2) as u64;
                     cache.paths.insert(path);
-                }
-            }
-            cache.size += std::mem::size_of::<DavResource>() as u64;
-            cache.resources.push(resource);
-        }
-    }
+                    cache.resources.push(resource);
 
-    Ok(cache)
+                    Ok(true)
+                },
+            )
+            .await
+            .caused_by(trc::location!())?;
+
+        if cache.paths.is_empty() {
+            if is_first_check {
+                if is_calendar {
+                    server
+                        .create_default_calendar(access_token, account_id, &name)
+                        .await?;
+                } else {
+                    server
+                        .create_default_addressbook(access_token, account_id, &name)
+                        .await?;
+                }
+                is_first_check = false;
+                continue;
+            } else {
+                return Ok(cache);
+            }
+        }
+
+        let parent_range = cache.resources.len();
+        server
+            .archives(account_id, item_collection, &(), |document_id, archive| {
+                let resource = if is_calendar {
+                    resource_from_event(archive.unarchive::<CalendarEvent>()?, document_id)
+                } else {
+                    resource_from_card(archive.unarchive::<ContactCard>()?, document_id)
+                };
+                let resource_idx = cache.resources.len();
+
+                for name in resource.child_names().unwrap_or_default().iter() {
+                    if let Some(parent) =
+                        cache.resources.get(..parent_range).and_then(|resources| {
+                            resources.iter().find(|r| r.document_id == name.parent_id)
+                        })
+                    {
+                        let path = DavPath {
+                            path: format!("{}/{}", parent.container_name().unwrap(), name.name),
+                            parent_id: Some(name.parent_id),
+                            hierarchy_seq: 0,
+                            resource_idx,
+                        };
+
+                        cache.size += (std::mem::size_of::<DavPath>()
+                            + name.name.len()
+                            + path.path.len()) as u64;
+                        cache.paths.insert(path);
+                    }
+                }
+                cache.size += std::mem::size_of::<DavResource>() as u64;
+                cache.resources.push(resource);
+
+                Ok(true)
+            })
+            .await
+            .caused_by(trc::location!())?;
+
+        return Ok(cache);
+    }
 }
 
 pub(super) async fn build_scheduling_resources(
@@ -183,7 +177,7 @@ pub(super) async fn build_scheduling_resources(
         .core
         .storage
         .data
-        .get_last_change_id(account_id, SyncCollection::CalendarScheduling)
+        .get_last_change_id(account_id, SyncCollection::CalendarEventNotification.into())
         .await
         .caused_by(trc::location!())?
         .unwrap_or_default();
@@ -196,10 +190,9 @@ pub(super) async fn build_scheduling_resources(
         .unwrap_or_else(|| format!("_{account_id}"));
 
     let item_ids = server
-        .get_document_ids(account_id, Collection::CalendarScheduling)
+        .itip_ids(account_id)
         .await
-        .caused_by(trc::location!())?
-        .unwrap_or_default();
+        .caused_by(trc::location!())?;
 
     let mut cache = DavResources {
         base_path: format!(
@@ -295,11 +288,15 @@ pub(super) fn resource_from_calendar(calendar: &ArchivedCalendar, document_id: u
                     grants: Bitmap::from(&acl.grants),
                 })
                 .collect(),
-            tz: calendar
+            preferences: calendar
                 .preferences
-                .first()
-                .and_then(|pref| pref.time_zone.tz())
-                .unwrap_or(Tz::UTC),
+                .iter()
+                .map(|pref| TinyCalendarPreferences {
+                    account_id: pref.account_id.to_native(),
+                    flags: pref.flags.to_native(),
+                    tz: pref.time_zone.tz().unwrap_or(Tz::UTC),
+                })
+                .collect(),
         },
     }
 }
@@ -326,7 +323,7 @@ pub(super) fn resource_from_event(event: &ArchivedCalendarEvent, document_id: u3
 pub(super) fn resource_from_scheduling(document_id: u32, is_container: bool) -> DavResource {
     DavResource {
         document_id,
-        data: DavResourceMetadata::CalendarScheduling {
+        data: DavResourceMetadata::CalendarEventNotification {
             names: if !is_container {
                 [DavName {
                     name: format!("{document_id}.ics"),

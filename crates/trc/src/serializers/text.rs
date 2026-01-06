@@ -432,19 +432,19 @@ mod tests {
         // sort by name
         names.sort_by(|a, b| a.0.cmp(b.0));
 
-        /*for (name, description, level) in names {
+        for (name, description, level) in names {
             //println!("{:?},", name);
             println!("|`{name}`|{description}|`{level}`|")
-        }*/
+        }
 
-        for (pos, (name, _, _)) in names.iter().enumerate() {
+        //for (pos, (name, _, _)) in names.iter().enumerate() {
             //println!("{:?},", name);
-            println!("{} => Some({}),", pos, event_to_class(name));
+            //println!("{} => Some({}),", pos, event_to_class(name));
             //println!("{} => {},", event_to_class(name), pos);
             /*println!(
                 "#[serde(rename = \"{name}\")]\n{},",
                 event_to_webadmin_class(name)
             );*/
-        }
+        //}
     }
 }

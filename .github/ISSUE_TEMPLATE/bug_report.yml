@@ -1,6 +1,6 @@
 name: I found a bug
 description: Most reported issues turn out to be configuration problems rather than actual bugs. If you are not 100% certain this is a bug, please start a new discussion instead.
-title: "🐛: "
+title: "🪲: "
 labels: ["bug"]
 body:
   - type: markdown
@@ -31,10 +31,10 @@ body:
       label: Version
       description: What version of our software are you running?
       options:
+        - v0.15.x
+        - v0.14.x
         - v0.13.x
-        - v0.12.x
-        - v0.11.x
-        - v0.10.x or lower
+        - v0.12.x or lower
     validations:
       required: true
   - type: dropdown

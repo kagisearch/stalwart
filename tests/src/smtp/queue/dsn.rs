@@ -4,23 +4,21 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use crate::smtp::{QueueReceiver, TestSMTP, inbound::sign::SIGNATURES};
+use common::config::smtp::queue::{QueueExpiry, QueueName};
+use smtp::queue::{
+    Error, ErrorDetails, HostResponse, Message, MessageWrapper, Recipient, Schedule, Status,
+    UnexpectedResponse, dsn::SendDsn,
+};
+use smtp_proto::{RCPT_NOTIFY_DELAY, RCPT_NOTIFY_FAILURE, RCPT_NOTIFY_SUCCESS, Response};
 use std::{
     fs,
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     time::SystemTime,
 };
-
-use common::config::smtp::queue::{QueueExpiry, QueueName};
-use smtp_proto::{RCPT_NOTIFY_DELAY, RCPT_NOTIFY_FAILURE, RCPT_NOTIFY_SUCCESS, Response};
 use store::write::now;
-use utils::BlobHash;
-
-use crate::smtp::{QueueReceiver, TestSMTP, inbound::sign::SIGNATURES};
-use smtp::queue::{
-    Error, ErrorDetails, HostResponse, Message, MessageWrapper, Recipient, Schedule, Status,
-    UnexpectedResponse, dsn::SendDsn,
-};
+use types::blob_hash::BlobHash;
 
 const CONFIG: &str = r#"
 [report]
@@ -88,7 +86,7 @@ async fn generate_dsn() {
             env_id: None,
             priority: 0,
             blob_hash: BlobHash::generate(dsn_original.as_bytes()),
-            quota_keys: vec![],
+            quota_keys: Default::default(),
             received_from_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             received_via_port: 0,
         },

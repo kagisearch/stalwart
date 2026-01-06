@@ -4,34 +4,31 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use crate::changes::state::StateManager;
 use common::{Server, storage::index::ObjectIndexBuilder};
-use directory::QueryParams;
+use directory::{PrincipalData, QueryParams};
 use email::identity::{ArchivedEmailAddress, Identity};
 use jmap_proto::{
-    method::get::{GetRequest, GetResponse, RequestArguments},
-    types::{
-        collection::{Collection, SyncCollection},
-        property::Property,
-        value::{Object, Value},
-    },
+    method::get::{GetRequest, GetResponse},
+    object::identity::{self, IdentityProperty, IdentityValue},
 };
+use jmap_tools::{Map, Value};
+use std::future::Future;
 use store::{
-    rkyv::{option::ArchivedOption, vec::ArchivedVec},
-    roaring::RoaringBitmap,
-    write::BatchBuilder,
+    ValueKey, rkyv::{option::ArchivedOption, vec::ArchivedVec}, roaring::RoaringBitmap, write::{AlignedBytes, Archive, BatchBuilder}
 };
 use trc::AddContext;
+use types::{
+    collection::{Collection, SyncCollection},
+    field::IdentityField,
+};
 use utils::sanitize_email;
-
-use crate::changes::state::StateManager;
-
-use std::future::Future;
 
 pub trait IdentityGet: Sync + Send {
     fn identity_get(
         &self,
-        request: GetRequest<RequestArguments>,
-    ) -> impl Future<Output = trc::Result<GetResponse>> + Send;
+        request: GetRequest<identity::Identity>,
+    ) -> impl Future<Output = trc::Result<GetResponse<identity::Identity>>> + Send;
 
     fn identity_get_or_create(
         &self,
@@ -42,18 +39,18 @@ pub trait IdentityGet: Sync + Send {
 impl IdentityGet for Server {
     async fn identity_get(
         &self,
-        mut request: GetRequest<RequestArguments>,
-    ) -> trc::Result<GetResponse> {
+        mut request: GetRequest<identity::Identity>,
+    ) -> trc::Result<GetResponse<identity::Identity>> {
         let ids = request.unwrap_ids(self.core.jmap.get_max_objects)?;
         let properties = request.unwrap_properties(&[
-            Property::Id,
-            Property::Name,
-            Property::Email,
-            Property::ReplyTo,
-            Property::Bcc,
-            Property::TextSignature,
-            Property::HtmlSignature,
-            Property::MayDelete,
+            IdentityProperty::Id,
+            IdentityProperty::Name,
+            IdentityProperty::Email,
+            IdentityProperty::ReplyTo,
+            IdentityProperty::Bcc,
+            IdentityProperty::TextSignature,
+            IdentityProperty::HtmlSignature,
+            IdentityProperty::MayDelete,
         ]);
         let account_id = request.account_id.document_id();
         let identity_ids = self.identity_get_or_create(account_id).await?;
@@ -80,54 +77,70 @@ impl IdentityGet for Server {
             // Obtain the identity object
             let document_id = id.document_id();
             if !identity_ids.contains(document_id) {
-                response.not_found.push(id.into());
+                response.not_found.push(id);
                 continue;
             }
             let _identity = if let Some(identity) = self
-                .get_archive(account_id, Collection::Identity, document_id)
+                .store()
+                .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                    account_id,
+                    Collection::Identity,
+                    document_id,
+                ))
                 .await?
             {
                 identity
             } else {
-                response.not_found.push(id.into());
+                response.not_found.push(id);
                 continue;
             };
             let identity = _identity
                 .unarchive::<Identity>()
                 .caused_by(trc::location!())?;
-            let mut result = Object::with_capacity(properties.len());
+            let mut result = Map::with_capacity(properties.len());
             for property in &properties {
                 match property {
-                    Property::Id => {
-                        result.append(Property::Id, Value::Id(id));
+                    IdentityProperty::Id => {
+                        result.insert_unchecked(IdentityProperty::Id, IdentityValue::Id(id));
                     }
-                    Property::MayDelete => {
-                        result.append(Property::MayDelete, Value::Bool(true));
+                    IdentityProperty::MayDelete => {
+                        result.insert_unchecked(IdentityProperty::MayDelete, Value::Bool(true));
                     }
-                    Property::Name => {
-                        result.append(Property::Name, identity.name.to_string());
+                    IdentityProperty::Name => {
+                        result.insert_unchecked(IdentityProperty::Name, identity.name.to_string());
                     }
-                    Property::Email => {
-                        result.append(Property::Email, identity.email.to_string());
+                    IdentityProperty::Email => {
+                        result
+                            .insert_unchecked(IdentityProperty::Email, identity.email.to_string());
                     }
-                    Property::TextSignature => {
-                        result.append(Property::TextSignature, identity.text_signature.to_string());
+                    IdentityProperty::TextSignature => {
+                        result.insert_unchecked(
+                            IdentityProperty::TextSignature,
+                            identity.text_signature.to_string(),
+                        );
                     }
-                    Property::HtmlSignature => {
-                        result.append(Property::HtmlSignature, identity.html_signature.to_string());
+                    IdentityProperty::HtmlSignature => {
+                        result.insert_unchecked(
+                            IdentityProperty::HtmlSignature,
+                            identity.html_signature.to_string(),
+                        );
                     }
-                    Property::Bcc => {
-                        result.append(Property::Bcc, email_to_value(&identity.bcc));
+                    IdentityProperty::Bcc => {
+                        result
+                            .insert_unchecked(IdentityProperty::Bcc, email_to_value(&identity.bcc));
                     }
-                    Property::ReplyTo => {
-                        result.append(Property::ReplyTo, email_to_value(&identity.reply_to));
+                    IdentityProperty::ReplyTo => {
+                        result.insert_unchecked(
+                            IdentityProperty::ReplyTo,
+                            email_to_value(&identity.reply_to),
+                        );
                     }
                     property => {
-                        result.append(property.clone(), Value::Null);
+                        result.insert_unchecked(property.clone(), Value::Null);
                     }
                 }
             }
-            response.list.push(result);
+            response.list.push(result.into());
         }
 
         Ok(response)
@@ -135,9 +148,8 @@ impl IdentityGet for Server {
 
     async fn identity_get_or_create(&self, account_id: u32) -> trc::Result<RoaringBitmap> {
         let mut identity_ids = self
-            .get_document_ids(account_id, Collection::Identity)
-            .await?
-            .unwrap_or_default();
+            .document_ids(account_id, Collection::Identity, IdentityField::DocumentId)
+            .await?;
         if !identity_ids.is_empty() {
             return Ok(identity_ids);
         }
@@ -155,7 +167,18 @@ impl IdentityGet for Server {
         } else {
             return Ok(identity_ids);
         };
-        let num_emails = principal.emails.len();
+
+        let mut emails = Vec::new();
+        let mut description = None;
+        for data in principal.data {
+            match data {
+                PrincipalData::PrimaryEmail(v) | PrincipalData::EmailAlias(v) => emails.push(v),
+                PrincipalData::Description(v) => description = Some(v),
+                _ => {}
+            }
+        }
+
+        let num_emails = emails.len();
         if num_emails == 0 {
             return Ok(identity_ids);
         }
@@ -166,13 +189,13 @@ impl IdentityGet for Server {
             .with_collection(Collection::Identity);
 
         // Create identities
-        let name = principal.description.unwrap_or(principal.name);
+        let name = description.unwrap_or(principal.name);
         let mut next_document_id = self
             .store()
             .assign_document_ids(account_id, Collection::Identity, num_emails as u64)
             .await
             .caused_by(trc::location!())?;
-        for email in &principal.emails {
+        for email in &emails {
             let email = sanitize_email(email).unwrap_or_default();
             if email.is_empty() || email.starts_with('@') {
                 continue;
@@ -185,7 +208,8 @@ impl IdentityGet for Server {
             let document_id = next_document_id;
             next_document_id -= 1;
             batch
-                .create_document(document_id)
+                .with_document(document_id)
+                .tag(IdentityField::DocumentId)
                 .custom(ObjectIndexBuilder::<(), _>::new().with_changes(Identity {
                     name,
                     email,
@@ -200,16 +224,18 @@ impl IdentityGet for Server {
     }
 }
 
-fn email_to_value(email: &ArchivedOption<ArchivedVec<ArchivedEmailAddress>>) -> Value {
+fn email_to_value(
+    email: &ArchivedOption<ArchivedVec<ArchivedEmailAddress>>,
+) -> Value<'static, IdentityProperty, IdentityValue> {
     if let ArchivedOption::Some(email) = email {
-        Value::List(
+        Value::Array(
             email
                 .iter()
                 .map(|email| {
                     Value::Object(
-                        Object::with_capacity(2)
-                            .with_property(Property::Name, &email.name)
-                            .with_property(Property::Email, &email.email),
+                        Map::with_capacity(2)
+                            .with_key_value(IdentityProperty::Name, &email.name)
+                            .with_key_value(IdentityProperty::Email, &email.email),
                     )
                 })
                 .collect(),

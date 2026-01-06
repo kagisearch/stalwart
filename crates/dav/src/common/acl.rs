@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use super::ArchivedResource;
 use crate::{
     DavError, DavErrorCondition, DavResourceName, common::uri::DavUriResource,
     principal::propfind::PrincipalPropFind,
@@ -22,17 +23,18 @@ use groupware::RFC_3986;
 use groupware::{cache::GroupwareCache, calendar::Calendar, contact::AddressBook, file::FileNode};
 use http_proto::HttpResponse;
 use hyper::StatusCode;
-use jmap_proto::types::{
-    acl::Acl,
-    collection::Collection,
-    value::{AclGrant, ArchivedAclGrant},
-};
 use rkyv::vec::ArchivedVec;
+use store::{
+    ValueKey,
+    write::{AlignedBytes, Archive},
+};
 use store::{ahash::AHashSet, roaring::RoaringBitmap, write::BatchBuilder};
 use trc::AddContext;
+use types::{
+    acl::{Acl, AclGrant, ArchivedAclGrant},
+    collection::Collection,
+};
 use utils::map::bitmap::Bitmap;
-
-use super::ArchivedResource;
 
 pub(crate) trait DavAclHandler: Sync + Send {
     fn handle_acl_request(
@@ -110,7 +112,12 @@ impl DavAclHandler for Server {
 
         // Fetch node
         let archive = self
-            .get_archive(account_id, collection, resource.document_id())
+            .store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                account_id,
+                collection,
+                resource.document_id(),
+            ))
             .await
             .caused_by(trc::location!())?
             .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
@@ -121,7 +128,7 @@ impl DavAclHandler for Server {
         // Validate ACL
         let acls = container.acls().unwrap();
         if !access_token.is_member(account_id)
-            && !acls.effective_acl(access_token).contains(Acl::Administer)
+            && !acls.effective_acl(access_token).contains(Acl::Share)
         {
             return Err(DavError::Code(StatusCode::FORBIDDEN));
         }
@@ -214,7 +221,12 @@ impl DavAclHandler for Server {
         }
 
         let archive = self
-            .get_archive(uri.account_id, uri.collection, uri.resource)
+            .store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                uri.account_id,
+                uri.collection,
+                uri.resource,
+            ))
             .await
             .caused_by(trc::location!())?
             .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
@@ -339,7 +351,7 @@ impl DavAclHandler for Server {
                     }
                     Privilege::ReadAcl => {}
                     Privilege::WriteAcl => {
-                        acls.insert(Acl::Administer);
+                        acls.insert(Acl::Share);
                     }
                     Privilege::ReadFreeBusy
                     | Privilege::ScheduleQueryFreeBusy
@@ -446,7 +458,7 @@ impl DavAclHandler for Server {
     ) -> crate::Result<Vec<Ace>> {
         let mut aces = Vec::with_capacity(grants.len());
         if access_token.is_member(account_id)
-            || grants.effective_acl(access_token).contains(Acl::Administer)
+            || grants.effective_acl(access_token).contains(Acl::Share)
         {
             for grant in grants.iter() {
                 let grant_account_id = u32::from(grant.account_id);
@@ -556,7 +568,7 @@ pub(crate) fn current_user_privilege_set(acl_bitmap: Bitmap<Acl>) -> Vec<Privile
             Acl::Delete | Acl::RemoveItems => {
                 acls.insert(Privilege::Write);
             }
-            Acl::Administer => {
+            Acl::Share => {
                 acls.insert(Privilege::ReadAcl);
                 acls.insert(Privilege::WriteAcl);
             }

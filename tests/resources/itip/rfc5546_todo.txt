@@ -107,6 +107,8 @@ PRODID:-//Stalwart Labs LLC//Stalwart Server//EN
 VERSION:2.0
 BEGIN:VTODO
 STATUS:IN-PROCESS
+DUE:19970722T170000Z
+DTSTART:19970701T170000Z
 ATTENDEE;PARTSTAT=ACCEPTED:mailto:b@example.com
 ORGANIZER:mailto:a@example.com
 UID:calsrv.example.com-873970198738777-00@example.com
@@ -175,6 +177,8 @@ VERSION:2.0
 BEGIN:VTODO
 PERCENT-COMPLETE:75
 STATUS:IN-PROCESS
+DUE:19970722T170000Z
+DTSTART:19970701T170000Z
 ATTENDEE;PARTSTAT=IN-PROCESS:mailto:b@example.com
 ORGANIZER:mailto:a@example.com
 UID:calsrv.example.com-873970198738777-00@example.com
@@ -240,6 +244,8 @@ METHOD:REPLY
 PRODID:-//Stalwart Labs LLC//Stalwart Server//EN
 VERSION:2.0
 BEGIN:VTODO
+DUE:19970722T170000Z
+DTSTART:19970701T170000Z
 ATTENDEE;PARTSTAT=COMPLETED:mailto:d@example.com
 ORGANIZER:mailto:a@example.com
 UID:calsrv.example.com-873970198738777-00@example.com
@@ -304,7 +310,7 @@ to: b@example.com, d@example.com
 summary: update REQUEST
 summary.attendee: Participants([ItipParticipant { email: "a@example.com", name: None, is_organizer: true }, ItipParticipant { email: "b@example.com", name: None, is_organizer: false }, ItipParticipant { email: "d@example.com", name: None, is_organizer: false }])
 summary.dtstart: Time(ItipTime { start: 883648800, tz_id: 32768 })
-summary.rrule: Rrule(ICalendarRecurrenceRule { freq: Monthly, until: None, count: Some(10), interval: None, bysecond: [], byminute: [], byhour: [], byday: [ICalendarDay { ordwk: Some(1), weekday: Friday }], bymonthday: [], byyearday: [], byweekno: [], bymonth: [], bysetpos: [], wkst: None })
+summary.rrule: Rrule(ICalendarRecurrenceRule { freq: Monthly, until: None, count: Some(10), interval: None, bysecond: [], byminute: [], byhour: [], byday: [ICalendarDay { ordwk: Some(1), weekday: Friday }], bymonthday: [], byyearday: [], byweekno: [], bymonth: [], bysetpos: [], wkst: None, rscale: None, skip: None })
 summary.summary: Text("Send Status Reports to Area Managers")
 ~summary.attendee: Participants([ItipParticipant { email: "a@example.com", name: None, is_organizer: true }, ItipParticipant { email: "b@example.com", name: None, is_organizer: false }, ItipParticipant { email: "c@example.com", name: None, is_organizer: false }, ItipParticipant { email: "d@example.com", name: None, is_organizer: false }])
 ~summary.dtstart: Time(ItipTime { start: 867776400, tz_id: 32768 })
@@ -337,7 +343,7 @@ to: c@example.com
 summary: cancel
 summary.attendee: Participants([ItipParticipant { email: "a@example.com", name: None, is_organizer: true }, ItipParticipant { email: "b@example.com", name: None, is_organizer: false }, ItipParticipant { email: "c@example.com", name: None, is_organizer: false }, ItipParticipant { email: "d@example.com", name: None, is_organizer: false }])
 summary.dtstart: Time(ItipTime { start: 867776400, tz_id: 32768 })
-summary.rrule: Rrule(ICalendarRecurrenceRule { freq: Monthly, until: None, count: Some(10), interval: None, bysecond: [], byminute: [], byhour: [], byday: [ICalendarDay { ordwk: Some(1), weekday: Friday }], bymonthday: [], byyearday: [], byweekno: [], bymonth: [], bysetpos: [], wkst: None })
+summary.rrule: Rrule(ICalendarRecurrenceRule { freq: Monthly, until: None, count: Some(10), interval: None, bysecond: [], byminute: [], byhour: [], byday: [ICalendarDay { ordwk: Some(1), weekday: Friday }], bymonthday: [], byyearday: [], byweekno: [], bymonth: [], bysetpos: [], wkst: None, rscale: None, skip: None })
 summary.summary: Text("Create the requirements document")
 BEGIN:VCALENDAR
 METHOD:CANCEL
@@ -441,7 +447,7 @@ to: a@example.com
 summary: rsvp NEEDS-ACTION
 summary.attendee: Participants([ItipParticipant { email: "a@example.com", name: None, is_organizer: true }, ItipParticipant { email: "b@example.com", name: None, is_organizer: false }, ItipParticipant { email: "d@example.com", name: None, is_organizer: false }])
 summary.dtstart: Time(ItipTime { start: 883648800, tz_id: 32768 })
-summary.rrule: Rrule(ICalendarRecurrenceRule { freq: Monthly, until: None, count: Some(10), interval: None, bysecond: [], byminute: [], byhour: [], byday: [ICalendarDay { ordwk: Some(1), weekday: Friday }], bymonthday: [], byyearday: [], byweekno: [], bymonth: [], bysetpos: [], wkst: None })
+summary.rrule: Rrule(ICalendarRecurrenceRule { freq: Monthly, until: None, count: Some(10), interval: None, bysecond: [], byminute: [], byhour: [], byday: [ICalendarDay { ordwk: Some(1), weekday: Friday }], bymonthday: [], byyearday: [], byweekno: [], bymonth: [], bysetpos: [], wkst: None, rscale: None, skip: None })
 summary.summary: Text("Send Status Reports to Area Managers")
 BEGIN:VCALENDAR
 METHOD:REPLY

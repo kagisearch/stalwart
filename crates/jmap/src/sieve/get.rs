@@ -4,52 +4,50 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::Server;
-use email::sieve::SieveScript;
-use jmap_proto::{
-    method::get::{GetRequest, GetResponse, RequestArguments},
-    types::{
-        blob::{BlobId, BlobSection},
-        collection::{Collection, SyncCollection},
-        property::Property,
-        value::{Object, Value},
-    },
-};
-use store::BlobClass;
-use trc::AddContext;
-
 use crate::changes::state::StateManager;
-
+use common::Server;
+use email::sieve::{SieveScript, ingest::SieveScriptIngest};
+use jmap_proto::{
+    method::get::{GetRequest, GetResponse},
+    object::sieve::{Sieve, SieveProperty, SieveValue},
+};
+use jmap_tools::{Map, Value};
+use store::{ValueKey, write::{AlignedBytes, Archive}};
 use std::future::Future;
+use trc::AddContext;
+use types::{
+    blob::{BlobClass, BlobId, BlobSection},
+    collection::{Collection, SyncCollection},
+    field::SieveField,
+};
 
 pub trait SieveScriptGet: Sync + Send {
     fn sieve_script_get(
         &self,
-        request: GetRequest<RequestArguments>,
-    ) -> impl Future<Output = trc::Result<GetResponse>> + Send;
+        request: GetRequest<Sieve>,
+    ) -> impl Future<Output = trc::Result<GetResponse<Sieve>>> + Send;
 }
 
 impl SieveScriptGet for Server {
     async fn sieve_script_get(
         &self,
-        mut request: GetRequest<RequestArguments>,
-    ) -> trc::Result<GetResponse> {
+        mut request: GetRequest<Sieve>,
+    ) -> trc::Result<GetResponse<Sieve>> {
         let ids = request.unwrap_ids(self.core.jmap.get_max_objects)?;
         let properties = request.unwrap_properties(&[
-            Property::Id,
-            Property::Name,
-            Property::BlobId,
-            Property::IsActive,
+            SieveProperty::Id,
+            SieveProperty::Name,
+            SieveProperty::BlobId,
+            SieveProperty::IsActive,
         ]);
         let account_id = request.account_id.document_id();
-        let push_ids = self
-            .get_document_ids(account_id, Collection::SieveScript)
-            .await?
-            .unwrap_or_default();
+        let script_ids = self
+            .document_ids(account_id, Collection::SieveScript, SieveField::Name)
+            .await?;
         let ids = if let Some(ids) = ids {
             ids
         } else {
-            push_ids
+            script_ids
                 .iter()
                 .take(self.core.jmap.get_max_objects)
                 .map(Into::into)
@@ -64,39 +62,48 @@ impl SieveScriptGet for Server {
             list: Vec::with_capacity(ids.len()),
             not_found: vec![],
         };
+        let active_script_id = self.sieve_script_get_active_id(account_id).await?;
 
         for id in ids {
             // Obtain the sieve script object
             let document_id = id.document_id();
-            if !push_ids.contains(document_id) {
-                response.not_found.push(id.into());
+            if !script_ids.contains(document_id) {
+                response.not_found.push(id);
                 continue;
             }
             let sieve_ = if let Some(sieve) = self
-                .get_archive(account_id, Collection::SieveScript, document_id)
+                .store()
+                .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                    account_id,
+                    Collection::SieveScript,
+                    document_id,
+                ))
                 .await?
             {
                 sieve
             } else {
-                response.not_found.push(id.into());
+                response.not_found.push(id);
                 continue;
             };
             let sieve = sieve_
                 .unarchive::<SieveScript>()
                 .caused_by(trc::location!())?;
-            let mut result = Object::with_capacity(properties.len());
+            let mut result = Map::with_capacity(properties.len());
             for property in &properties {
                 match property {
-                    Property::Id => {
-                        result.append(Property::Id, Value::Id(id));
+                    SieveProperty::Id => {
+                        result.insert_unchecked(SieveProperty::Id, id);
                     }
-                    Property::Name => {
-                        result.append(Property::Name, Value::from(&sieve.name));
+                    SieveProperty::Name => {
+                        result.insert_unchecked(SieveProperty::Name, &sieve.name);
                     }
-                    Property::IsActive => {
-                        result.append(Property::IsActive, Value::Bool(sieve.is_active));
+                    SieveProperty::IsActive => {
+                        result.insert_unchecked(
+                            SieveProperty::IsActive,
+                            active_script_id == Some(document_id),
+                        );
                     }
-                    Property::BlobId => {
+                    SieveProperty::BlobId => {
                         let blob_id = BlobId {
                             hash: (&sieve.blob_hash).into(),
                             class: BlobClass::Linked {
@@ -111,14 +118,14 @@ impl SieveScriptGet for Server {
                             .into(),
                         };
 
-                        result.append(Property::BlobId, Value::BlobId(blob_id));
-                    }
-                    property => {
-                        result.append(property.clone(), Value::Null);
+                        result.insert_unchecked(
+                            SieveProperty::BlobId,
+                            Value::Element(SieveValue::BlobId(blob_id)),
+                        );
                     }
                 }
             }
-            response.list.push(result);
+            response.list.push(result.into());
         }
 
         Ok(response)

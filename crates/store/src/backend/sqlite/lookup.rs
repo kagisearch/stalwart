@@ -11,7 +11,7 @@ use crate::{IntoRows, QueryResult, QueryType, Value};
 use super::{SqliteStore, into_error};
 
 impl SqliteStore {
-    pub(crate) async fn query<T: QueryResult>(
+    pub(crate) async fn sql_query<T: QueryResult>(
         &self,
         query: &str,
         params_: &[Value<'_>],
@@ -21,7 +21,7 @@ impl SqliteStore {
             let mut s = conn.prepare_cached(query).map_err(into_error)?;
             let params = params_
                 .iter()
-                .map(|v| v as &(dyn rusqlite::types::ToSql))
+                .map(|v| v as &dyn rusqlite::types::ToSql)
                 .collect::<Vec<_>>();
 
             match T::query_type() {

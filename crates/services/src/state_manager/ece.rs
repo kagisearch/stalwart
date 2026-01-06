@@ -3,11 +3,7 @@
  *
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
-
-use aes_gcm::{
-    Aes128Gcm, Nonce,
-    aead::{Aead, generic_array::GenericArray},
-};
+use aes_gcm::{Aes128Gcm, Nonce, aead::Aead};
 use hkdf::Hkdf;
 use p256::{
     PublicKey,
@@ -83,7 +79,7 @@ pub fn ece_encrypt(
     // Split into records
     let rs = ECE_WEBPUSH_DEFAULT_RS as usize - ECE_TAG_LENGTH;
     let mut min_num_records = data.len() / (rs - 1);
-    if data.len() % (rs - 1) != 0 {
+    if !data.len().is_multiple_of(rs - 1) {
         min_num_records += 1;
     }
     let mut pad_length = std::cmp::max(pad_length, min_num_records);
@@ -123,7 +119,7 @@ pub fn ece_encrypt(
             data_share = data.len();
         } else if extra_data > 0 {
             let mut extra_share = extra_data / (records_remaining - 1);
-            if extra_data % (records_remaining - 1) != 0 {
+            if !extra_data.is_multiple_of(records_remaining - 1) {
                 extra_share += 1;
             }
             data_share += extra_share;
@@ -161,10 +157,14 @@ fn hkdf_sha256(salt: &[u8], secret: &[u8], info: &[u8], len: usize) -> Result<Ve
     Ok(okm)
 }
 
+// TODO: Remove allow deprecated when aes-gcm 0.10 is updated
+#[allow(deprecated)]
 fn aes_gcm_128_encrypt(key: &[u8], nonce: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
-    <Aes128Gcm as aes_gcm::KeyInit>::new(&GenericArray::clone_from_slice(key))
-        .encrypt(Nonce::from_slice(nonce), data)
-        .map_err(|e| e.to_string())
+    <Aes128Gcm as aes_gcm::KeyInit>::new(
+        &sha2::digest::generic_array::GenericArray::clone_from_slice(key),
+    )
+    .encrypt(Nonce::from_slice(nonce), data)
+    .map_err(|e| e.to_string())
 }
 
 fn generate_info(

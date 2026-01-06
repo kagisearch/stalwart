@@ -5,89 +5,135 @@
  */
 
 use crate::{
-    calendar::migrate_calendar_events,
-    queue::{migrate_queue_v011, migrate_queue_v012},
-    tasks::migrate_tasks_v011,
+    blob::migrate_blobs_v014,
+    queue_v1::{migrate_queue_v011, migrate_queue_v012},
+    queue_v2::migrate_queue_v014,
+    v011::migrate_v0_11,
+    v012::migrate_v0_12,
+    v013::migrate_v0_13,
+    v014::{SUBSPACE_BITMAP_ID, migrate_principal_v0_14, migrate_v0_14},
 };
-use changelog::reset_changelog;
-use common::{
-    DATABASE_SCHEMA_VERSION, KV_LOCK_HOUSEKEEPER, Server, manager::boot::DEFAULT_SETTINGS,
-};
-use jmap_proto::types::{collection::Collection, property::Property};
-use principal::{migrate_principal, migrate_principals};
-use report::migrate_reports;
+use common::{DATABASE_SCHEMA_VERSION, Server, manager::boot::DEFAULT_SETTINGS};
 use std::time::Duration;
 use store::{
     Deserialize, IterateParams, SUBSPACE_PROPERTY, SUBSPACE_QUEUE_MESSAGE, SUBSPACE_REPORT_IN,
     SUBSPACE_REPORT_OUT, SUBSPACE_SETTINGS, SerializeInfallible, U32_LEN, Value, ValueKey,
-    dispatch::{DocumentSet, lookup::KeyValue},
-    rand::{self, seq::SliceRandom},
-    write::{AnyClass, AnyKey, BatchBuilder, ValueClass, key::DeserializeBigEndian},
+    dispatch::DocumentSet,
+    roaring::RoaringBitmap,
+    write::{
+        AnyClass, AnyKey, BatchBuilder, ValueClass,
+        key::{DeserializeBigEndian, KeySerializer},
+    },
 };
 use trc::AddContext;
+use types::collection::Collection;
 
-pub mod calendar;
+pub mod addressbook_v2;
+pub mod blob;
+pub mod calendar_v2;
 pub mod changelog;
-pub mod email;
-pub mod encryption;
-pub mod identity;
+pub mod contact_v2;
+pub mod email_v1;
+pub mod email_v2;
+pub mod encryption_v1;
+pub mod encryption_v2;
+pub mod event_v1;
+pub mod event_v2;
+pub mod identity_v1;
 pub mod mailbox;
 pub mod object;
-pub mod principal;
-pub mod push;
-pub mod queue;
+pub mod principal_v1;
+pub mod principal_v2;
+pub mod push_v1;
+pub mod push_v2;
+pub mod queue_v1;
+pub mod queue_v2;
 pub mod report;
-pub mod sieve;
+pub mod sieve_v1;
+pub mod sieve_v2;
 pub mod submission;
-pub mod tasks;
+pub mod tasks_v1;
+pub mod tasks_v2;
 pub mod threads;
+pub mod v011;
+pub mod v012;
+pub mod v013;
+pub mod v014;
 
 const LOCK_WAIT_TIME_ACCOUNT: u64 = 3 * 60;
 const LOCK_WAIT_TIME_CORE: u64 = 5 * 60;
 const LOCK_RETRY_TIME: Duration = Duration::from_secs(30);
 
 pub async fn try_migrate(server: &Server) -> trc::Result<()> {
-    if let Some(version) = std::env::var("FORCE_MIGRATE_QUEUE")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-    {
-        if version == 12 {
-            migrate_queue_v012(server)
-                .await
-                .caused_by(trc::location!())?;
-        } else {
-            migrate_queue_v011(server)
-                .await
-                .caused_by(trc::location!())?;
-        }
-        return Ok(());
-    } else if let Some(account_id) = std::env::var("FORCE_MIGRATE_ACCOUNT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        migrate_principal(server, account_id)
-            .await
-            .caused_by(trc::location!())?;
-        return Ok(());
-    } else if let Some(version) = std::env::var("FORCE_MIGRATE")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-    {
-        match version {
-            1 => {
-                migrate_v0_12(server, true)
+    for var in [
+        "FORCE_MIGRATE_QUEUE",
+        "FORCE_MIGRATE_BLOBS",
+        "FORCE_MIGRATE_ACCOUNT",
+        "FORCE_MIGRATE",
+    ] {
+        let Some(version) = std::env::var(var).ok().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        match var {
+            "FORCE_MIGRATE_QUEUE" => match version {
+                1 => {
+                    migrate_queue_v011(server)
+                        .await
+                        .caused_by(trc::location!())?;
+                }
+                2 => {
+                    migrate_queue_v012(server)
+                        .await
+                        .caused_by(trc::location!())?;
+                }
+                4 => {
+                    migrate_queue_v014(server)
+                        .await
+                        .caused_by(trc::location!())?;
+                }
+                _ => {
+                    panic!("Unknown migration queue version: {version}");
+                }
+            },
+            "FORCE_MIGRATE_BLOBS" => {
+                migrate_blobs_v014(server)
                     .await
                     .caused_by(trc::location!())?;
             }
-            2 => {
-                migrate_v0_12(server, false)
+            "FORCE_MIGRATE" => match version {
+                1 => {
+                    migrate_v0_12(server, true)
+                        .await
+                        .caused_by(trc::location!())?;
+                    migrate_v0_13(server).await.caused_by(trc::location!())?;
+                    migrate_v0_14(server).await.caused_by(trc::location!())?;
+                }
+                2 => {
+                    migrate_v0_12(server, false)
+                        .await
+                        .caused_by(trc::location!())?;
+                    migrate_v0_13(server).await.caused_by(trc::location!())?;
+                    migrate_v0_14(server).await.caused_by(trc::location!())?;
+                }
+                3 => {
+                    migrate_v0_13(server).await.caused_by(trc::location!())?;
+                    migrate_v0_14(server).await.caused_by(trc::location!())?;
+                }
+                4 => {
+                    migrate_v0_14(server).await.caused_by(trc::location!())?;
+                }
+                _ => {
+                    panic!("Unknown migration version: {version}");
+                }
+            },
+            "FORCE_MIGRATE_ACCOUNT" => {
+                migrate_principal_v0_14(server, version)
                     .await
                     .caused_by(trc::location!())?;
             }
-            _ => {
-                panic!("Unknown migration version: {version}");
-            }
+            _ => unreachable!(),
         }
+
         return Ok(());
     }
 
@@ -107,13 +153,26 @@ pub async fn try_migrate(server: &Server) -> trc::Result<()> {
             migrate_v0_12(server, true)
                 .await
                 .caused_by(trc::location!())?;
+            migrate_v0_13(server).await.caused_by(trc::location!())?;
+            migrate_v0_14(server).await.caused_by(trc::location!())?;
             true
         }
         Some(2) => {
             migrate_v0_12(server, false)
                 .await
                 .caused_by(trc::location!())?;
+            migrate_v0_13(server).await.caused_by(trc::location!())?;
+            migrate_v0_14(server).await.caused_by(trc::location!())?;
             true
+        }
+        Some(3) => {
+            migrate_v0_13(server).await.caused_by(trc::location!())?;
+            migrate_v0_14(server).await.caused_by(trc::location!())?;
+            false
+        }
+        Some(4) => {
+            migrate_v0_14(server).await.caused_by(trc::location!())?;
+            false
         }
         Some(version) => {
             panic!(
@@ -166,211 +225,6 @@ pub async fn try_migrate(server: &Server) -> trc::Result<()> {
     Ok(())
 }
 
-async fn migrate_v0_12(server: &Server, migrate_tasks: bool) -> trc::Result<()> {
-    let force_lock = std::env::var("FORCE_LOCK").is_ok();
-    let in_memory = server.in_memory_store();
-
-    loop {
-        if force_lock
-            || in_memory
-                .try_lock(
-                    KV_LOCK_HOUSEKEEPER,
-                    b"migrate_core_lock",
-                    LOCK_WAIT_TIME_CORE,
-                )
-                .await
-                .caused_by(trc::location!())?
-        {
-            migrate_queue_v012(server)
-                .await
-                .caused_by(trc::location!())?;
-
-            if migrate_tasks {
-                migrate_tasks_v011(server)
-                    .await
-                    .caused_by(trc::location!())?;
-            }
-
-            in_memory
-                .remove_lock(KV_LOCK_HOUSEKEEPER, b"migrate_core_lock")
-                .await
-                .caused_by(trc::location!())?;
-            break;
-        } else {
-            trc::event!(
-                Server(trc::ServerEvent::Startup),
-                Details = format!("Migration lock busy, waiting 30 seconds.",)
-            );
-
-            tokio::time::sleep(LOCK_RETRY_TIME).await;
-        }
-    }
-
-    if migrate_tasks {
-        migrate_calendar_events(server)
-            .await
-            .caused_by(trc::location!())
-    } else {
-        Ok(())
-    }
-}
-
-async fn migrate_v0_11(server: &Server) -> trc::Result<()> {
-    let force_lock = std::env::var("FORCE_LOCK").is_ok();
-    let in_memory = server.in_memory_store();
-    let principal_ids;
-
-    loop {
-        if force_lock
-            || in_memory
-                .try_lock(
-                    KV_LOCK_HOUSEKEEPER,
-                    b"migrate_core_lock",
-                    LOCK_WAIT_TIME_CORE,
-                )
-                .await
-                .caused_by(trc::location!())?
-        {
-            if in_memory
-                .key_get::<()>(KeyValue::<()>::build_key(
-                    KV_LOCK_HOUSEKEEPER,
-                    b"migrate_core_done",
-                ))
-                .await
-                .caused_by(trc::location!())?
-                .is_none()
-            {
-                migrate_queue_v011(server)
-                    .await
-                    .caused_by(trc::location!())?;
-                migrate_reports(server).await.caused_by(trc::location!())?;
-                reset_changelog(server).await.caused_by(trc::location!())?;
-                principal_ids = migrate_principals(server)
-                    .await
-                    .caused_by(trc::location!())?;
-
-                in_memory
-                    .key_set(
-                        KeyValue::new(
-                            KeyValue::<()>::build_key(KV_LOCK_HOUSEKEEPER, b"migrate_core_done"),
-                            b"1".to_vec(),
-                        )
-                        .expires(86400),
-                    )
-                    .await
-                    .caused_by(trc::location!())?;
-            } else {
-                principal_ids = server
-                    .get_document_ids(u32::MAX, Collection::Principal)
-                    .await
-                    .caused_by(trc::location!())?
-                    .unwrap_or_default();
-
-                trc::event!(
-                    Server(trc::ServerEvent::Startup),
-                    Details = format!("Migration completed by another node.",)
-                );
-            }
-
-            in_memory
-                .remove_lock(KV_LOCK_HOUSEKEEPER, b"migrate_core_lock")
-                .await
-                .caused_by(trc::location!())?;
-            break;
-        } else {
-            trc::event!(
-                Server(trc::ServerEvent::Startup),
-                Details = format!("Migration lock busy, waiting 30 seconds.",)
-            );
-
-            tokio::time::sleep(LOCK_RETRY_TIME).await;
-        }
-    }
-
-    if !principal_ids.is_empty() {
-        let mut principal_ids = principal_ids.into_iter().collect::<Vec<_>>();
-        principal_ids.shuffle(&mut rand::rng());
-
-        loop {
-            let mut skipped_principal_ids = Vec::new();
-            let mut num_migrated = 0;
-
-            for principal_id in principal_ids {
-                let lock_key = format!("migrate_{principal_id}_lock");
-                let done_key = format!("migrate_{principal_id}_done");
-
-                if force_lock
-                    || in_memory
-                        .try_lock(
-                            KV_LOCK_HOUSEKEEPER,
-                            lock_key.as_bytes(),
-                            LOCK_WAIT_TIME_ACCOUNT,
-                        )
-                        .await
-                        .caused_by(trc::location!())?
-                {
-                    if in_memory
-                        .key_get::<()>(KeyValue::<()>::build_key(
-                            KV_LOCK_HOUSEKEEPER,
-                            done_key.as_bytes(),
-                        ))
-                        .await
-                        .caused_by(trc::location!())?
-                        .is_none()
-                    {
-                        migrate_principal(server, principal_id)
-                            .await
-                            .caused_by(trc::location!())?;
-
-                        num_migrated += 1;
-
-                        in_memory
-                            .key_set(
-                                KeyValue::new(
-                                    KeyValue::<()>::build_key(
-                                        KV_LOCK_HOUSEKEEPER,
-                                        done_key.as_bytes(),
-                                    ),
-                                    b"1".to_vec(),
-                                )
-                                .expires(86400),
-                            )
-                            .await
-                            .caused_by(trc::location!())?;
-                    }
-
-                    in_memory
-                        .remove_lock(KV_LOCK_HOUSEKEEPER, lock_key.as_bytes())
-                        .await
-                        .caused_by(trc::location!())?;
-                } else {
-                    skipped_principal_ids.push(principal_id);
-                }
-            }
-
-            if !skipped_principal_ids.is_empty() {
-                trc::event!(
-                    Server(trc::ServerEvent::Startup),
-                    Details = format!(
-                        "Migrated {num_migrated} accounts and {} are locked by another node, waiting 30 seconds.",
-                        skipped_principal_ids.len()
-                    )
-                );
-                tokio::time::sleep(LOCK_RETRY_TIME).await;
-                principal_ids = skipped_principal_ids;
-            } else {
-                trc::event!(
-                    Server(trc::ServerEvent::Startup),
-                    Details = format!("Account migration completed.",)
-                );
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 async fn is_new_install(server: &Server) -> trc::Result<bool> {
     for subspace in [
         SUBSPACE_QUEUE_MESSAGE,
@@ -411,19 +265,17 @@ async fn is_new_install(server: &Server) -> trc::Result<bool> {
     Ok(true)
 }
 
-async fn get_properties<U, I, P>(
+async fn get_properties<U, I>(
     server: &Server,
     account_id: u32,
     collection: Collection,
     iterate: &I,
-    property: P,
+    property: u8,
 ) -> trc::Result<Vec<(u32, U)>>
 where
     I: DocumentSet + Send + Sync,
-    P: AsRef<Property> + Sync + Send,
     U: Deserialize + 'static,
 {
-    let property: u8 = property.as_ref().into();
     let collection: u8 = collection.into();
     let expected_results = iterate.len();
     let mut results = Vec::with_capacity(expected_results);
@@ -465,6 +317,62 @@ where
                 .id(property.to_string())
         })
         .map(|_| results)
+}
+
+pub async fn get_document_ids(
+    server: &Server,
+    account_id: u32,
+    collection: Collection,
+) -> trc::Result<Option<RoaringBitmap>> {
+    let collection: u8 = collection.into();
+    get_bitmap(
+        server,
+        AnyKey {
+            subspace: SUBSPACE_BITMAP_ID,
+            key: KeySerializer::new(U32_LEN + 1)
+                .write(account_id)
+                .write(collection)
+                .write(0u32)
+                .finalize(),
+        },
+        AnyKey {
+            subspace: SUBSPACE_BITMAP_ID,
+            key: KeySerializer::new(U32_LEN + 1)
+                .write(account_id)
+                .write(collection)
+                .write(u32::MAX)
+                .finalize(),
+        },
+    )
+    .await
+}
+
+pub async fn get_bitmap(
+    server: &Server,
+    from_key: AnyKey<Vec<u8>>,
+    to_key: AnyKey<Vec<u8>>,
+) -> trc::Result<Option<RoaringBitmap>> {
+    let mut results = RoaringBitmap::new();
+    server
+        .core
+        .storage
+        .data
+        .iterate(
+            IterateParams::new(from_key, to_key).no_values(),
+            |key, _| {
+                results.insert(key.deserialize_be_u32(key.len() - U32_LEN)?);
+                Ok(true)
+            },
+        )
+        .await
+        .caused_by(trc::location!())
+        .map(|_| {
+            if !results.is_empty() {
+                Some(results)
+            } else {
+                None
+            }
+        })
 }
 
 pub struct LegacyBincode<T: serde::de::DeserializeOwned> {

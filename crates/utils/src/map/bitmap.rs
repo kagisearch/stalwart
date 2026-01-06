@@ -35,6 +35,11 @@ pub trait BitmapItem: From<u64> + Into<u64> + Sized + Copy {
     fn is_valid(&self) -> bool;
 }
 
+pub trait BitPop {
+    fn bit_push(&mut self, item: u8);
+    fn bit_pop(&mut self) -> Option<u8>;
+}
+
 impl<T: BitmapItem> Bitmap<T> {
     pub fn new() -> Self {
         Self::default()
@@ -67,6 +72,12 @@ impl<T: BitmapItem> Bitmap<T> {
     pub fn insert(&mut self, item: T) {
         debug_assert!(item.is_valid());
         self.bitmap |= 1 << item.into();
+    }
+
+    pub fn insert_many(&mut self, items: impl IntoIterator<Item = T>) {
+        for item in items.into_iter() {
+            self.insert(item);
+        }
     }
 
     #[inline(always)]
@@ -133,6 +144,42 @@ impl<T: BitmapItem> Bitmap<T> {
         Bitmap {
             bitmap,
             _state: std::marker::PhantomData,
+        }
+    }
+
+    pub fn into_inner(self) -> u64 {
+        self.bitmap
+    }
+}
+
+impl BitPop for u32 {
+    fn bit_push(&mut self, item: u8) {
+        *self |= 1 << item;
+    }
+
+    fn bit_pop(&mut self) -> Option<u8> {
+        if *self != 0 {
+            let item = 31 - self.leading_zeros();
+            *self ^= 1 << item;
+            Some(item as u8)
+        } else {
+            None
+        }
+    }
+}
+
+impl BitPop for u64 {
+    fn bit_push(&mut self, item: u8) {
+        *self |= 1 << item;
+    }
+
+    fn bit_pop(&mut self) -> Option<u8> {
+        if *self != 0 {
+            let item = 63 - self.leading_zeros();
+            *self ^= 1 << item;
+            Some(item as u8)
+        } else {
+            None
         }
     }
 }
@@ -258,31 +305,5 @@ impl<T: BitmapItem> Default for Bitmap<T> {
             bitmap: 0,
             _state: std::marker::PhantomData,
         }
-    }
-}
-
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ShortId(pub u8);
-
-impl BitmapItem for ShortId {
-    fn max() -> u64 {
-        u8::MAX as u64
-    }
-
-    fn is_valid(&self) -> bool {
-        true
-    }
-}
-
-impl From<u64> for ShortId {
-    fn from(value: u64) -> Self {
-        ShortId(value as u8)
-    }
-}
-
-impl From<ShortId> for u64 {
-    fn from(value: ShortId) -> Self {
-        value.0 as u64
     }
 }

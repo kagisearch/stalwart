@@ -240,6 +240,8 @@ pub enum HousekeeperEvent {
 pub enum TaskQueueEvent {
     TaskAcquired,
     TaskLocked,
+    TaskIgnored,
+    TaskFailed,
     BlobNotFound,
     MetadataNotFound,
 }
@@ -613,12 +615,14 @@ pub enum SpamEvent {
     PyzorError,
     Dnsbl,
     DnsblError,
-    Train,
-    TrainBalance,
-    TrainError,
+    TrainStarted,
+    TrainCompleted,
+    TrainSampleAdded,
+    TrainSampleNotFound,
     Classify,
-    ClassifyError,
-    TrainAccount,
+    ModelLoaded,
+    ModelNotReady,
+    ModelNotFound,
 }
 
 #[event_type]
@@ -723,7 +727,7 @@ pub enum PurgeEvent {
     Error,
     InProgress,
     AutoExpunge,
-    TombstoneCleanup,
+    BlobCleanup,
 }
 
 #[event_type]
@@ -836,6 +840,7 @@ pub enum StoreEvent {
     SqliteError,
     LdapError,
     ElasticsearchError,
+    MeilisearchError,
     RedisError,
     S3Error,
     AzureError,

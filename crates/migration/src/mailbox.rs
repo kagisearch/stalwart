@@ -5,24 +5,26 @@
  */
 
 use super::object::Object;
-use crate::object::FromLegacy;
-use common::{Server, config::jmap::settings::SpecialUse};
+use crate::{
+    get_document_ids,
+    object::{FromLegacy, Property, Value},
+    v014::{SUBSPACE_BITMAP_TAG, SUBSPACE_BITMAP_TEXT},
+};
+use common::Server;
 use email::mailbox::Mailbox;
-use jmap_proto::types::{collection::Collection, property::Property, value::Value};
 use store::{
-    SUBSPACE_BITMAP_TAG, SUBSPACE_BITMAP_TEXT, SUBSPACE_INDEXES, Serialize, U64_LEN, ValueKey,
-    rand,
+    SUBSPACE_INDEXES, Serialize, U64_LEN, ValueKey, rand,
     write::{
         AlignedBytes, AnyKey, Archive, Archiver, BatchBuilder, ValueClass, key::KeySerializer,
     },
 };
 use trc::AddContext;
+use types::{collection::Collection, field::Field, special_use::SpecialUse};
 use utils::config::utils::ParseValue;
 
 pub(crate) async fn migrate_mailboxes(server: &Server, account_id: u32) -> trc::Result<u64> {
     // Obtain email ids
-    let mailbox_ids = server
-        .get_document_ids(account_id, Collection::Mailbox)
+    let mailbox_ids = get_document_ids(server, account_id, Collection::Mailbox)
         .await
         .caused_by(trc::location!())?
         .unwrap_or_default();
@@ -39,7 +41,7 @@ pub(crate) async fn migrate_mailboxes(server: &Server, account_id: u32) -> trc::
                 account_id,
                 collection: Collection::Mailbox.into(),
                 document_id: mailbox_id,
-                class: ValueClass::Property(Property::Value.into()),
+                class: ValueClass::Property(Field::ARCHIVE.into()),
             })
             .await
         {
@@ -48,9 +50,9 @@ pub(crate) async fn migrate_mailboxes(server: &Server, account_id: u32) -> trc::
                 batch
                     .with_account_id(account_id)
                     .with_collection(Collection::Mailbox)
-                    .update_document(mailbox_id)
+                    .with_document(mailbox_id)
                     .set(
-                        Property::Value,
+                        Field::ARCHIVE,
                         Archiver::new(Mailbox::from_legacy(legacy))
                             .serialize()
                             .caused_by(trc::location!())?,
@@ -71,7 +73,7 @@ pub(crate) async fn migrate_mailboxes(server: &Server, account_id: u32) -> trc::
                         account_id,
                         collection: Collection::Mailbox.into(),
                         document_id: mailbox_id,
-                        class: ValueClass::Property(Property::Value.into()),
+                        class: ValueClass::Property(Field::ARCHIVE.into()),
                     })
                     .await
                     .is_err()

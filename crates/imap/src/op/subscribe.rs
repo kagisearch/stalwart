@@ -4,20 +4,20 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::time::Instant;
-
+use super::ImapContext;
 use crate::{
     core::{Session, SessionData},
     spawn_op,
 };
 use common::{listener::SessionStream, storage::index::ObjectIndexBuilder};
-
 use directory::Permission;
 use imap_proto::{Command, ResponseCode, StatusResponse, receiver::Request};
-use jmap_proto::types::collection::Collection;
-use store::write::BatchBuilder;
-
-use super::ImapContext;
+use std::time::Instant;
+use store::{
+    ValueKey,
+    write::{AlignedBytes, Archive, BatchBuilder},
+};
+use types::collection::Collection;
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_subscribe(
@@ -95,7 +95,12 @@ impl<T: SessionStream> SessionData<T> {
         // Obtain mailbox
         let mailbox_ = self
             .server
-            .get_archive(account_id, Collection::Mailbox, mailbox_id)
+            .store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                account_id,
+                Collection::Mailbox,
+                mailbox_id,
+            ))
             .await
             .imap_ctx(&tag, trc::location!())?
             .ok_or_else(|| {
@@ -124,7 +129,7 @@ impl<T: SessionStream> SessionData<T> {
             batch
                 .with_account_id(account_id)
                 .with_collection(Collection::Mailbox)
-                .update_document(mailbox_id)
+                .with_document(mailbox_id)
                 .custom(
                     ObjectIndexBuilder::new()
                         .with_current(mailbox)

@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::jmap::{assert_is_empty, mailbox::destroy_all_mailboxes_no_wait, wait_for_index};
+use crate::jmap::{assert_is_empty, mail::mailbox::destroy_all_mailboxes_no_wait, wait_for_index};
 use common::Server;
 use directory::backend::internal::manage::ManageDirectory;
 use email::{
@@ -17,12 +17,14 @@ use jmap_client::{
     core::set::{SetErrorType, SetObject},
     mailbox::{self, Mailbox, Role},
 };
-use jmap_proto::types::{collection::Collection, id::Id};
-use std::{sync::Arc, time::Duration};
+use std::{str::FromStr, sync::Arc, time::Duration};
 use store::{
+    ValueKey,
     rand::{self, Rng},
     roaring::RoaringBitmap,
+    write::{AlignedBytes, Archive},
 };
+use types::{collection::Collection, id::Id};
 
 const TEST_USER_ID: u32 = 1;
 const NUM_PASSES: usize = 1;
@@ -200,28 +202,25 @@ async fn email_tests(server: Server, client: Arc<Client>) {
 
         join_all(futures).await;
 
-        let email_ids = server
-            .get_document_ids(TEST_USER_ID, Collection::Email)
-            .await
-            .unwrap()
-            .unwrap_or_default();
-        let mailbox_ids = server
-            .get_document_ids(TEST_USER_ID, Collection::Mailbox)
-            .await
-            .unwrap()
-            .unwrap_or_default();
+        let cache = server.get_cached_messages(TEST_USER_ID).await.unwrap();
+        let email_ids = cache
+            .emails
+            .items
+            .iter()
+            .map(|e| e.document_id)
+            .collect::<RoaringBitmap>();
+        let mailbox_ids = cache
+            .mailboxes
+            .items
+            .iter()
+            .map(|m| m.document_id)
+            .collect::<RoaringBitmap>();
         assert_eq!(mailbox_ids.len(), 8);
 
         for mailbox in mailboxes.iter() {
-            let mailbox_id = Id::from_bytes(mailbox.as_bytes()).unwrap().document_id();
-            let email_ids_in_mailbox = RoaringBitmap::from_iter(
-                server
-                    .get_cached_messages(TEST_USER_ID)
-                    .await
-                    .unwrap()
-                    .in_mailbox(mailbox_id)
-                    .map(|m| m.document_id),
-            );
+            let mailbox_id = Id::from_str(mailbox).unwrap().document_id();
+            let email_ids_in_mailbox =
+                RoaringBitmap::from_iter(cache.in_mailbox(mailbox_id).map(|m| m.document_id));
             let mut email_ids_check = email_ids_in_mailbox.clone();
             email_ids_check &= &email_ids;
             assert_eq!(email_ids_in_mailbox, email_ids_check);
@@ -230,7 +229,12 @@ async fn email_tests(server: Server, client: Arc<Client>) {
 
             for email_id in &email_ids_in_mailbox {
                 if let Some(mailbox_tags) = server
-                    .get_archive(TEST_USER_ID, Collection::Email, email_id)
+                    .store()
+                    .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                        TEST_USER_ID,
+                        Collection::Email,
+                        email_id,
+                    ))
                     .await
                     .unwrap()
                 {
@@ -263,7 +267,7 @@ async fn email_tests(server: Server, client: Arc<Client>) {
 
         wait_for_index(&server).await;
         destroy_all_mailboxes_no_wait(&client).await;
-        assert_is_empty(server.clone()).await;
+        assert_is_empty(&server).await;
     }
 }
 
@@ -358,7 +362,7 @@ async fn mailbox_tests(server: Server, client: Arc<Client>) {
     {
         let _ = client.mailbox_destroy(&mailbox_id, true).await;
     }
-    assert_is_empty(server).await;
+    assert_is_empty(&server).await;
 }
 
 async fn create_mailbox(client: &Client, mailbox: &str) -> Vec<String> {

@@ -28,16 +28,22 @@ use imap_proto::{
     },
     receiver::Request,
 };
-use jmap_proto::types::{acl::Acl, collection::Collection, value::AclGrant};
 use std::{sync::Arc, time::Instant};
-use store::write::{AlignedBytes, Archive, BatchBuilder};
+use store::{
+    ValueKey,
+    write::{AlignedBytes, Archive, BatchBuilder},
+};
 use trc::AddContext;
+use types::{
+    acl::{Acl, AclGrant},
+    collection::Collection,
+};
 use utils::map::bitmap::Bitmap;
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_get_acl(&mut self, request: Request<Command>) -> trc::Result<()> {
         // Validate access
-        self.assert_has_permission(Permission::ImapAuthenticate)?;
+        self.assert_has_permission(Permission::ImapAclGet)?;
 
         let op_start = Instant::now();
         let arguments = request.parse_acl(self.is_utf8)?;
@@ -117,7 +123,7 @@ impl<T: SessionStream> Session<T> {
                             Acl::CreateChild => {
                                 rights.push(Rights::CreateMailbox);
                             }
-                            Acl::Administer => {
+                            Acl::Share => {
                                 rights.push(Rights::Administer);
                             }
                             Acl::Submit => {
@@ -338,6 +344,13 @@ impl<T: SessionStream> Session<T> {
                 }
             }
 
+            if mailbox.acls.len() > data.server.core.groupware.max_shares_per_item {
+                return Err(trc::ImapEvent::Error
+                    .into_err()
+                    .details("Maximum shares per item exceeded")
+                    .caused_by(trc::location!()));
+            }
+
             let grants = mailbox
                 .acls
                 .iter()
@@ -349,7 +362,7 @@ impl<T: SessionStream> Session<T> {
             batch
                 .with_account_id(mailbox_id.account_id)
                 .with_collection(Collection::Mailbox)
-                .update_document(mailbox_id.mailbox_id)
+                .with_document(mailbox_id.mailbox_id)
                 .custom(
                     ObjectIndexBuilder::new()
                         .with_changes(mailbox)
@@ -450,7 +463,12 @@ impl<T: SessionStream> SessionData<T> {
         if let Some(mailbox) = self.get_mailbox_by_name(&arguments.mailbox_name) {
             if let Some(values) = self
                 .server
-                .get_archive(mailbox.account_id, Collection::Mailbox, mailbox.mailbox_id)
+                .store()
+                .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                    mailbox.account_id,
+                    Collection::Mailbox,
+                    mailbox.mailbox_id,
+                ))
                 .await
                 .caused_by(trc::location!())?
             {
@@ -462,7 +480,7 @@ impl<T: SessionStream> SessionData<T> {
                         .caused_by(trc::location!())?
                         .acls
                         .effective_acl(&access_token)
-                        .contains(Acl::Administer)
+                        .contains(Acl::Share)
                 {
                     Ok((mailbox, values, access_token))
                 } else {

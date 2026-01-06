@@ -8,20 +8,18 @@
  *
  */
 
-use std::sync::Arc;
-
+use crate::{
+    directory::DirectoryTest,
+    http_server::{HttpMessage, spawn_mock_http_server},
+};
 use base64::{Engine, engine::general_purpose};
 use directory::QueryParams;
 use http_proto::{JsonProblemResponse, JsonResponse, ToHttpResponse};
 use hyper::{Method, StatusCode};
 use mail_send::Credentials;
 use serde_json::json;
+use std::sync::Arc;
 use trc::{AuthEvent, EventType};
-
-use crate::{
-    directory::DirectoryTest,
-    http_server::{HttpMessage, spawn_mock_http_server},
-};
 
 static TEST_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ";
 
@@ -131,10 +129,7 @@ async fn oidc_directory() {
             .unwrap()
             .unwrap();
         assert_eq!(principal.name(), "jdoe");
-        assert_eq!(
-            principal.emails.first().map(|s| s.as_str()),
-            Some("john@example.org")
-        );
+        assert_eq!(principal.email_addresses().next(), Some("john@example.org"));
         assert_eq!(principal.description(), Some("John Doe"));
     }
 }

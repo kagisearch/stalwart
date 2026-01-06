@@ -5,10 +5,7 @@
  */
 
 use super::{QueueEnvelope, QuotaKey, Status};
-use crate::{
-    core::throttle::NewKey,
-    queue::{DomainPart, MessageWrapper},
-};
+use crate::{core::throttle::NewKey, queue::MessageWrapper};
 use ahash::AHashSet;
 use common::{Server, config::smtp::queue::QueueQuota, expr::functions::ResolveVariable};
 use std::future::Future;
@@ -17,6 +14,7 @@ use store::{
     write::{BatchBuilder, QueueClass, ValueClass},
 };
 use trc::QueueEvent;
+use utils::DomainPart;
 
 pub trait HasQueueQuota: Sync + Send {
     fn has_quota(&self, message: &mut MessageWrapper) -> impl Future<Output = bool> + Send;
@@ -114,7 +112,7 @@ impl HasQueueQuota for Server {
             }
         }
 
-        message.message.quota_keys = quota_keys;
+        message.message.quota_keys = quota_keys.into_boxed_slice();
 
         true
     }
@@ -149,7 +147,7 @@ impl HasQueueQuota for Server {
                     return false;
                 } else {
                     refs.push(QuotaKey::Size {
-                        key: key.as_ref().to_vec(),
+                        key: key.as_ref().into(),
                         id,
                     });
                 }
@@ -169,7 +167,7 @@ impl HasQueueQuota for Server {
                     return false;
                 } else {
                     refs.push(QuotaKey::Count {
-                        key: key.as_ref().to_vec(),
+                        key: key.as_ref().into(),
                         id,
                     });
                 }
@@ -204,11 +202,14 @@ impl MessageWrapper {
             for quota_key in std::mem::take(&mut self.message.quota_keys) {
                 match quota_key {
                     QuotaKey::Count { id, key } if quota_ids.contains(&id) => {
-                        batch.add(ValueClass::Queue(QueueClass::QuotaCount(key)), -1);
+                        batch.add(
+                            ValueClass::Queue(QueueClass::QuotaCount(key.into_vec())),
+                            -1,
+                        );
                     }
                     QuotaKey::Size { id, key } if quota_ids.contains(&id) => {
                         batch.add(
-                            ValueClass::Queue(QueueClass::QuotaSize(key)),
+                            ValueClass::Queue(QueueClass::QuotaSize(key.into_vec())),
                             -(self.message.size as i64),
                         );
                     }
@@ -217,7 +218,7 @@ impl MessageWrapper {
                     }
                 }
             }
-            self.message.quota_keys = quota_keys;
+            self.message.quota_keys = quota_keys.into_boxed_slice();
         }
     }
 }

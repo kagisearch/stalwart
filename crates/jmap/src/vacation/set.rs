@@ -5,39 +5,41 @@
  */
 
 use super::get::VacationResponseGet;
-use crate::{JmapMethods, changes::state::StateManager};
+use crate::changes::state::StateManager;
 use common::{Server, auth::AccessToken, storage::index::ObjectIndexBuilder};
 use email::sieve::{
-    SieveScript, VacationResponse, activate::SieveScriptActivate, delete::SieveScriptDelete,
+    SieveScript, VacationResponse, delete::SieveScriptDelete, ingest::SieveScriptIngest,
 };
 use jmap_proto::{
     error::set::{SetError, SetErrorType},
-    method::set::{RequestArguments, SetRequest, SetResponse},
-    response::references::EvalObjectReferences,
-    types::{
-        collection::{Collection, SyncCollection},
-        date::UTCDate,
-        id::Id,
-        property::Property,
-        value::{MaybePatchValue, Object, Value},
-    },
+    method::set::{SetRequest, SetResponse},
+    object::vacation_response::{self, VacationResponseProperty, VacationResponseValue},
+    references::resolve::ResolveCreatedReference,
+    request::IntoValid,
+    types::date::UTCDate,
 };
+use jmap_tools::{Key, Map, Value};
 use mail_builder::MessageBuilder;
 use mail_parser::decoders::html::html_to_text;
 use std::borrow::Cow;
 use std::future::Future;
 use store::{
-    Serialize,
-    write::{Archiver, BatchBuilder},
+    Serialize, SerializeInfallible, ValueKey,
+    write::{AlignedBytes, Archive, Archiver, BatchBuilder},
 };
 use trc::AddContext;
+use types::{
+    collection::{Collection, SyncCollection},
+    field::PrincipalField,
+    id::Id,
+};
 
 pub trait VacationResponseSet: Sync + Send {
     fn vacation_response_set(
         &self,
-        request: SetRequest<RequestArguments>,
+        request: SetRequest<'_, vacation_response::VacationResponse>,
         access_token: &AccessToken,
-    ) -> impl Future<Output = trc::Result<SetResponse>> + Send;
+    ) -> impl Future<Output = trc::Result<SetResponse<vacation_response::VacationResponse>>> + Send;
 
     fn build_script(&self, obj: &mut SieveScript) -> trc::Result<Vec<u8>>;
 }
@@ -45,23 +47,20 @@ pub trait VacationResponseSet: Sync + Send {
 impl VacationResponseSet for Server {
     async fn vacation_response_set(
         &self,
-        mut request: SetRequest<RequestArguments>,
+        mut request: SetRequest<'_, vacation_response::VacationResponse>,
         access_token: &AccessToken,
-    ) -> trc::Result<SetResponse> {
+    ) -> trc::Result<SetResponse<vacation_response::VacationResponse>> {
         let account_id = request.account_id.document_id();
-        let mut response = self
-            .prepare_set_response(
-                &request,
+        let mut response = SetResponse::from_request(&request, self.core.jmap.set_max_objects)?
+            .with_state(
                 self.assert_state(
                     account_id,
                     SyncCollection::SieveScript,
                     &request.if_in_state,
                 )
                 .await?,
-            )
-            .await?;
-        let will_destroy = request.unwrap_destroy();
-        let resource_token = self.get_resource_token(access_token, account_id).await?;
+            );
+        let will_destroy = request.unwrap_destroy().into_valid().collect::<Vec<_>>();
 
         // Process set or update requests
         let mut create_id = None;
@@ -93,7 +92,7 @@ impl VacationResponseSet for Server {
                 }
             }
             (_, Some(update)) if !update.is_empty() => {
-                for (id, obj) in update {
+                for (id, obj) in update.into_valid() {
                     if id.is_singleton() {
                         if !will_destroy.contains(&id) {
                             changes = Some(obj);
@@ -126,14 +125,19 @@ impl VacationResponseSet for Server {
             .with_collection(Collection::SieveScript);
 
         // Process changes
+        let active_script_id = self.sieve_script_get_active_id(account_id).await?;
         if let Some(changes) = changes {
             // Obtain current script
             let document_id = self.get_vacation_sieve_script_id(account_id).await?;
-            let mut was_active = false;
 
             let (mut sieve, prev_sieve) = if let Some(document_id) = document_id {
                 let prev_sieve = self
-                    .get_archive(account_id, Collection::SieveScript, document_id)
+                    .store()
+                    .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                        account_id,
+                        Collection::SieveScript,
+                        document_id,
+                    ))
                     .await?
                     .ok_or_else(|| {
                         trc::StoreEvent::NotFound
@@ -142,7 +146,6 @@ impl VacationResponseSet for Server {
                     })?
                     .into_deserialized::<SieveScript>()
                     .caused_by(trc::location!())?;
-                was_active = prev_sieve.inner.is_active;
                 let mut sieve = prev_sieve.inner.clone();
                 if sieve.vacation_response.is_none() {
                     sieve.vacation_response = VacationResponse::default().into();
@@ -153,7 +156,6 @@ impl VacationResponseSet for Server {
                 (
                     SieveScript {
                         name: "vacation".into(),
-                        is_active: false,
                         blob_hash: Default::default(),
                         size: 0,
                         vacation_response: VacationResponse::default().into(),
@@ -167,70 +169,76 @@ impl VacationResponseSet for Server {
             let mut build_script = create_id.is_some();
             let vacation = sieve.vacation_response.as_mut().unwrap();
 
-            for (property, value) in changes.0 {
-                let value = match response.eval_object_references(value) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        return Ok(set_error(response, create_id, err));
-                    }
+            for (property, mut value) in changes.into_expanded_object() {
+                if let Err(err) = response.resolve_self_references(&mut value) {
+                    return Ok(set_error(response, create_id, err));
                 };
+
                 match (&property, value) {
-                    (Property::Subject, MaybePatchValue::Value(Value::Text(value)))
+                    (Key::Property(VacationResponseProperty::Subject), Value::Str(value))
                         if value.len() < 512 =>
                     {
                         build_script = true;
-                        vacation.subject = Some(value);
+                        vacation.subject = Some(value.into_owned());
                     }
-                    (Property::HtmlBody, MaybePatchValue::Value(Value::Text(value)))
+                    (Key::Property(VacationResponseProperty::HtmlBody), Value::Str(value))
                         if value.len() < 2048 =>
                     {
                         build_script = true;
-                        vacation.html_body = Some(value);
+                        vacation.html_body = Some(value.into_owned());
                     }
-                    (Property::TextBody, MaybePatchValue::Value(Value::Text(value)))
+                    (Key::Property(VacationResponseProperty::TextBody), Value::Str(value))
                         if value.len() < 2048 =>
                     {
                         build_script = true;
-                        vacation.text_body = Some(value);
+                        vacation.text_body = Some(value.into_owned());
                     }
-                    (Property::FromDate, MaybePatchValue::Value(Value::Date(date))) => {
+                    (
+                        Key::Property(VacationResponseProperty::FromDate),
+                        Value::Element(VacationResponseValue::Date(date)),
+                    ) => {
                         vacation.from_date = Some(date.timestamp() as u64);
                         build_script = true;
                     }
-                    (Property::ToDate, MaybePatchValue::Value(Value::Date(date))) => {
+                    (
+                        Key::Property(VacationResponseProperty::ToDate),
+                        Value::Element(VacationResponseValue::Date(date)),
+                    ) => {
                         vacation.to_date = Some(date.timestamp() as u64);
                         build_script = true;
                     }
-                    (Property::IsEnabled, MaybePatchValue::Value(Value::Bool(value))) => {
+                    (Key::Property(VacationResponseProperty::IsEnabled), Value::Bool(value)) => {
                         is_active = value;
                     }
-                    (Property::IsEnabled, MaybePatchValue::Value(Value::Null)) => {
+                    (Key::Property(VacationResponseProperty::IsEnabled), Value::Null) => {
                         is_active = false;
                     }
                     (
-                        Property::Subject
-                        | Property::HtmlBody
-                        | Property::TextBody
-                        | Property::ToDate
-                        | Property::FromDate,
-                        MaybePatchValue::Value(Value::Null),
+                        Key::Property(
+                            VacationResponseProperty::Subject
+                            | VacationResponseProperty::HtmlBody
+                            | VacationResponseProperty::TextBody
+                            | VacationResponseProperty::ToDate
+                            | VacationResponseProperty::FromDate,
+                        ),
+                        Value::Null,
                     ) => {
                         if create_id.is_none() {
                             build_script = true;
                             match property {
-                                Property::Subject => {
+                                Key::Property(VacationResponseProperty::Subject) => {
                                     vacation.subject = None;
                                 }
-                                Property::HtmlBody => {
+                                Key::Property(VacationResponseProperty::HtmlBody) => {
                                     vacation.html_body = None;
                                 }
-                                Property::TextBody => {
+                                Key::Property(VacationResponseProperty::TextBody) => {
                                     vacation.text_body = None;
                                 }
-                                Property::FromDate => {
+                                Key::Property(VacationResponseProperty::FromDate) => {
                                     vacation.from_date = None;
                                 }
-                                Property::ToDate => {
+                                Key::Property(VacationResponseProperty::ToDate) => {
                                     vacation.to_date = None;
                                 }
                                 _ => unreachable!(),
@@ -242,22 +250,21 @@ impl VacationResponseSet for Server {
                             response,
                             create_id,
                             SetError::invalid_properties()
-                                .with_property(property)
+                                .with_property(property.into_owned())
                                 .with_description("Field could not be set."),
                         ));
                     }
                 }
             }
-            sieve.is_active = is_active;
 
             let mut obj = ObjectIndexBuilder::new()
                 .with_current_opt(prev_sieve)
                 .with_changes(sieve)
-                .with_tenant_id(&resource_token);
+                .with_access_token(access_token);
 
             // Update id
             let document_id = if let Some(document_id) = document_id {
-                batch.update_document(document_id);
+                batch.with_document(document_id);
                 document_id
             } else {
                 let document_id = self
@@ -265,25 +272,42 @@ impl VacationResponseSet for Server {
                     .assign_document_ids(account_id, Collection::SieveScript, 1)
                     .await
                     .caused_by(trc::location!())?;
-                batch.create_document(document_id);
+                batch.with_document(document_id);
                 document_id
             };
 
             // Create sieve script only if there are changes
             if build_script {
                 // Upload new blob
-                obj.changes_mut().unwrap().blob_hash = self
-                    .put_blob(
+                let (blob_hash, blob_hold) = self
+                    .put_temporary_blob(
                         account_id,
                         &self.build_script(obj.changes_mut().unwrap())?,
-                        false,
+                        60,
                     )
-                    .await?
-                    .hash;
+                    .await?;
+                obj.changes_mut().unwrap().blob_hash = blob_hash;
+                batch.clear(blob_hold);
             };
+            batch.custom(obj).caused_by(trc::location!())?;
+
+            // Deactivate other sieve scripts
+            let was_active = active_script_id == Some(document_id);
+            if is_active {
+                if !was_active {
+                    batch
+                        .with_collection(Collection::Principal)
+                        .with_document(0)
+                        .set(PrincipalField::ActiveScriptId, document_id.serialize());
+                }
+            } else if was_active {
+                batch
+                    .with_collection(Collection::Principal)
+                    .with_document(0)
+                    .clear(PrincipalField::ActiveScriptId);
+            }
 
             // Write changes
-            batch.custom(obj).caused_by(trc::location!())?;
             if !batch.is_empty() {
                 response.new_state = Some(
                     self.commit_batch(batch)
@@ -294,21 +318,13 @@ impl VacationResponseSet for Server {
                 );
             }
 
-            // Deactivate other sieve scripts
-            if !was_active && is_active {
-                let (change_id, _) = self
-                    .sieve_activate_script(account_id, document_id.into())
-                    .await?;
-                if change_id > 0 {
-                    response.new_state = Some(change_id.into());
-                }
-            }
-
             // Add result
             if let Some(create_id) = create_id {
                 response.created.insert(
                     create_id,
-                    Object::with_capacity(1).with_property(Property::Id, Id::singleton()),
+                    Map::with_capacity(1)
+                        .with_key_value(VacationResponseProperty::Id, Id::singleton())
+                        .into(),
                 );
             } else {
                 response.updated.append(Id::singleton(), None);
@@ -318,10 +334,17 @@ impl VacationResponseSet for Server {
                 if id.is_singleton()
                     && let Some(document_id) = self.get_vacation_sieve_script_id(account_id).await?
                 {
-                    self.sieve_script_delete(&resource_token, document_id, false, &mut batch)
+                    self.sieve_script_delete(account_id, document_id, access_token, &mut batch)
                         .await?;
+                    if active_script_id == Some(document_id) {
+                        batch
+                            .with_collection(Collection::Principal)
+                            .with_document(0)
+                            .clear(PrincipalField::ActiveScriptId);
+                    }
+
                     response.destroyed.push(id);
-                    continue;
+                    break;
                 }
 
                 response.not_destroyed.append(id, SetError::not_found());
@@ -464,7 +487,11 @@ impl VacationResponseSet for Server {
     }
 }
 
-fn set_error(mut response: SetResponse, id: Option<String>, err: SetError) -> SetResponse {
+fn set_error(
+    mut response: SetResponse<vacation_response::VacationResponse>,
+    id: Option<String>,
+    err: SetError<VacationResponseProperty>,
+) -> SetResponse<vacation_response::VacationResponse> {
     if let Some(id) = id {
         response.not_created.append(id, err);
     } else {
