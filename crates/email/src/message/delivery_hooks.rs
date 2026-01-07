@@ -9,11 +9,12 @@
 //! This module provides functionality to call external webhooks during email delivery,
 //! allowing for custom routing, filtering, and message modification logic.
 
-use common::{Server, config::jmap::settings::SpecialUse, expr::functions::ResolveVariable};
+use common::{Server, expr::functions::ResolveVariable};
 use futures::future::join_all;
-use std::{collections::HashSet, time::Instant};
+use std::{collections::HashSet, str::FromStr, time::Instant};
 use trc::AddContext;
-use utils::config::utils::ParseValue;
+
+use types::{id::Id, special_use::SpecialUse};
 
 use crate::{
     cache::{MessageCacheFetch, mailbox::MailboxCacheAccess},
@@ -85,7 +86,7 @@ pub async fn try_delivery_hook(
     };
 
     let request = hooks::Request::new(
-        jmap_proto::types::id::Id::from(user_id).as_string(),
+        Id::from(user_id).as_string(),
         principal.name,
     )
     .with_envelope(envelope)
@@ -171,9 +172,7 @@ pub async fn try_delivery_hook(
 
                             // Find mailbox by Id first (similar to sieve ingest logic)
                             if !mailbox_id.is_empty() {
-                                if let Some(id) =
-                                    jmap_proto::types::id::Id::from_bytes(mailbox_id.as_bytes())
-                                {
+                                if let Some(id) = Id::from_str(&mailbox_id).ok() {
                                     let document_id = id.document_id();
                                     if cache.has_mailbox_id(&document_id) {
                                         target_id = document_id;
@@ -189,7 +188,7 @@ pub async fn try_delivery_hook(
                                     target_id = INBOX_ID;
                                 } else if special_use_role.eq_ignore_ascii_case("trash") {
                                     target_id = TRASH_ID;
-                                } else if let Ok(role) = SpecialUse::parse_value(special_use_role)
+                                } else if let Some(role) = SpecialUse::parse(special_use_role)
                                     && let Some(item) = cache.mailbox_by_role(&role)
                                 {
                                     target_id = item.document_id;

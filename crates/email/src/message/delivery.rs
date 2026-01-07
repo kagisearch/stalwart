@@ -11,7 +11,7 @@ use common::{
     ipc::{EmailPush, PushNotification},
 };
 use directory::Permission;
-use jmap_proto::types::{id::Id, keyword::Keyword};
+use types::{id::Id, keyword::Keyword};
 use mail_parser::MessageParser;
 use std::{borrow::Cow, future::Future};
 use store::ahash::AHashMap;
@@ -19,7 +19,7 @@ use types::blob_hash::BlobHash;
 
 use crate::{
     message::ingest::IngestedEmail,
-    sieve::ingest::{SieveOutputMessage, SieveScriptIngest},
+    sieve::ingest::SieveOutputMessage,
 };
 
 use super::delivery_hooks::try_delivery_hook;
@@ -439,9 +439,7 @@ async fn deliver_to_recipient(
             .sieve_script_ingest(
                 &access_token,
                 message_blob,
-                raw_message,
                 &sender,
-                is_sender_authenticated,
                 rcpt,
                 session_id,
                 active_script,
@@ -450,11 +448,11 @@ async fn deliver_to_recipient(
             .await
         {
             Ok(sieve_result) => {
-                if let Some(reason) = sieve_result.reject_reason.as_ref() {
+                if let Some(reason) = &sieve_result.reject_reason {
                     // Rejection
                     let err = trc::EventType::MessageIngest(trc::MessageIngestEvent::Error)
                         .ctx(trc::Key::Code, 571)
-                        .ctx(trc::Key::Reason, reason.clone());
+                        .ctx(trc::Key::Reason, reason.to_string());
                     return Err(err);
                 } else if sieve_result.discarded {
                     // Discard (internally looks like success, without ingest)
@@ -474,9 +472,6 @@ async fn deliver_to_recipient(
             did_file_into: false,
         }]
     };
-
-    let can_spam_classify = access_token.has_permission(Permission::SpamFilterClassify);
-    let spam_train = server.email_bayes_can_train(&access_token);
 
     let mut last_temp_error = None;
     let mut has_delivered = false;
@@ -530,8 +525,8 @@ async fn deliver_to_recipient(
                 }
 
                 for k in hook_flags
-                    .iter()
-                    .map(jmap_proto::types::keyword::Keyword::from)
+                    .into_iter()
+                    .map(types::keyword::Keyword::from)
                 {
                     if !keywords.contains(&k) {
                         keywords.push(k);
@@ -595,6 +590,8 @@ async fn deliver_to_recipient(
         match server
             .email_ingest(IngestEmail {
                 raw_message: raw_for_ingest,
+                // we don't use blob_hash here since the message may be modified by the per-recipient hook
+                // and thus differ from the original blob
                 blob_hash: None,
                 message: Some(parsed_for_ingest),
                 access_token: &access_token,
@@ -606,7 +603,7 @@ async fn deliver_to_recipient(
                     is_sender_authenticated,
                     is_spam: rcpt.is_spam,
                 },
-                session_id: session_id,
+                session_id,
             })
             .await
         {
