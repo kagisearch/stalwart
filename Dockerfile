@@ -1,3 +1,7 @@
+# FORK CHANGES:
+# trixie provides v19 of libclang-dev, not v16, https://packages.debian.org/trixie/libclang-dev
+# elastic is no longer a feature, and wasn't updated here https://github.com/stalwartlabs/stalwart/commit/472bddf733377018e9c8d0828358f91dc0602ffa#diff-b803fcb7f17ed9235f1e5cb1fcd2f5d3b2838429d4368ae4c57ce4436577f03fL314
+
 # Stalwart Dockerfile
 # Credits: https://github.com/33KK 
 
@@ -17,14 +21,14 @@ RUN case "${TARGETPLATFORM}" in \
     esac
 RUN export DEBIAN_FRONTEND=noninteractive && \
     apt-get update && \
-    apt-get install -yq --no-install-recommends build-essential libclang-16-dev \
+    apt-get install -yq --no-install-recommends build-essential libclang-19-dev \
     g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
     g++-x86-64-linux-gnu binutils-x86-64-linux-gnu
 RUN rustup target add "$(cat /target.txt)"
 COPY --from=planner /recipe.json /recipe.json
-RUN RUSTFLAGS="$(cat /flags.txt)" cargo chef cook --target "$(cat /target.txt)" --release --no-default-features --features "sqlite postgres mysql rocks elastic s3 redis azure nats enterprise" --recipe-path /recipe.json
+RUN RUSTFLAGS="$(cat /flags.txt)" cargo chef cook --target "$(cat /target.txt)" --release --no-default-features --features "sqlite postgres mysql rocks s3 redis azure nats enterprise" --recipe-path /recipe.json
 COPY . .
-RUN RUSTFLAGS="$(cat /flags.txt)" cargo build --target "$(cat /target.txt)" --release -p stalwart --no-default-features --features "sqlite postgres mysql rocks elastic s3 redis azure nats enterprise"
+RUN RUSTFLAGS="$(cat /flags.txt)" cargo build --target "$(cat /target.txt)" --release -p stalwart --no-default-features --features "sqlite postgres mysql rocks s3 redis azure nats enterprise"
 RUN RUSTFLAGS="$(cat /flags.txt)" cargo build --target "$(cat /target.txt)" --release -p stalwart-cli
 RUN mv "/build/target/$(cat /target.txt)/release" "/output"
 
