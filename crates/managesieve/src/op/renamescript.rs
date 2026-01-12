@@ -4,17 +4,18 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::time::Instant;
-
+use crate::core::{Command, ResponseCode, Session, StatusResponse};
 use common::{listener::SessionStream, storage::index::ObjectIndexBuilder};
 use directory::Permission;
 use email::sieve::SieveScript;
 use imap_proto::receiver::Request;
-use jmap_proto::types::collection::Collection;
-use store::write::BatchBuilder;
+use std::time::Instant;
+use store::{
+    ValueKey,
+    write::{AlignedBytes, Archive, BatchBuilder},
+};
 use trc::AddContext;
-
-use crate::core::{Command, ResponseCode, Session, StatusResponse};
+use types::collection::Collection;
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_renamescript(&mut self, request: Request<Command>) -> trc::Result<Vec<u8>> {
@@ -60,7 +61,12 @@ impl<T: SessionStream> Session<T> {
         // Obtain script values
         let script = self
             .server
-            .get_archive(account_id, Collection::SieveScript, document_id)
+            .store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                account_id,
+                Collection::SieveScript,
+                document_id,
+            ))
             .await
             .caused_by(trc::location!())?
             .ok_or_else(|| {
@@ -77,7 +83,7 @@ impl<T: SessionStream> Session<T> {
         batch
             .with_account_id(account_id)
             .with_collection(Collection::SieveScript)
-            .update_document(document_id)
+            .with_document(document_id)
             .custom(
                 ObjectIndexBuilder::new()
                     .with_changes(script.inner.clone().with_name(new_name.clone()))

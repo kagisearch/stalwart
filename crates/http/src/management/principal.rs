@@ -4,12 +4,12 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::{KV_BAYES_MODEL_USER, Server, auth::AccessToken};
+use crate::management::stores::destroy_account_data;
+use common::{Server, auth::AccessToken};
 use directory::{
-    DirectoryInner, Permission, QueryBy, QueryParams, Type,
+    DirectoryInner, Permission, PrincipalData, QueryBy, QueryParams, Type,
     backend::internal::{
         PrincipalAction, PrincipalField, PrincipalSet, PrincipalUpdate, PrincipalValue,
-        SpecialSecrets,
         lookup::DirectoryStore,
         manage::{
             self, ChangedPrincipals, ManageDirectory, PrincipalList, UpdatePrincipal, not_found,
@@ -103,11 +103,27 @@ impl PrincipalManager for Server {
                 // SPDX-License-Identifier: LicenseRef-SEL
 
                 #[cfg(feature = "enterprise")]
-                if (matches!(principal.typ(), Type::Tenant)
-                    || principal.has_field(PrincipalField::Tenant))
-                    && !self.core.is_enterprise_edition()
                 {
-                    return Err(manage::enterprise());
+                    if (matches!(principal.typ(), Type::Tenant)
+                        || principal.has_field(PrincipalField::Tenant))
+                        && !self.core.is_enterprise_edition()
+                    {
+                        return Err(manage::enterprise());
+                    }
+
+                    if matches!(principal.typ(), Type::Individual)
+                        && self.core.is_enterprise_edition()
+                        && !self.can_create_account().await?
+                    {
+                        return Err(manage::error(
+                            "License account limit reached",
+                            format!(
+                                "Enterprise licensed account limit reached: {} accounts licensed.",
+                                self.licensed_accounts()
+                            )
+                            .into(),
+                        ));
+                    }
                 }
 
                 // SPDX-SnippetEnd
@@ -257,22 +273,24 @@ impl PrincipalManager for Server {
                 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
                 // SPDX-License-Identifier: LicenseRef-SEL
                 #[cfg(feature = "enterprise")]
-                if self.core.is_enterprise_edition() {
-                    if tenant.is_none() {
-                        // Limit search to current tenant
-                        if let Some(tenant_name) = params.get("tenant") {
-                            tenant = self
-                                .core
-                                .storage
-                                .data
-                                .get_principal_info(tenant_name)
-                                .await?
-                                .filter(|p| p.typ == Type::Tenant)
-                                .map(|p| p.id);
+                {
+                    if self.core.is_enterprise_edition() {
+                        if tenant.is_none() {
+                            // Limit search to current tenant
+                            if let Some(tenant_name) = params.get("tenant") {
+                                tenant = self
+                                    .core
+                                    .storage
+                                    .data
+                                    .get_principal_info(tenant_name)
+                                    .await?
+                                    .filter(|p| p.typ == Type::Tenant)
+                                    .map(|p| p.id);
+                            }
                         }
+                    } else if types.contains(&Type::Tenant) {
+                        return Err(manage::enterprise());
                     }
-                } else if types.contains(&Type::Tenant) {
-                    return Err(manage::enterprise());
                 }
                 // SPDX-SnippetEnd
 
@@ -348,22 +366,24 @@ impl PrincipalManager for Server {
                 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
                 // SPDX-License-Identifier: LicenseRef-SEL
                 #[cfg(feature = "enterprise")]
-                if self.core.is_enterprise_edition() {
-                    if tenant.is_none() {
-                        // Limit search to current tenant
-                        if let Some(tenant_name) = params.get("tenant") {
-                            tenant = self
-                                .core
-                                .storage
-                                .data
-                                .get_principal_info(tenant_name)
-                                .await?
-                                .filter(|p| p.typ == Type::Tenant)
-                                .map(|p| p.id);
+                {
+                    if self.core.is_enterprise_edition() {
+                        if tenant.is_none() {
+                            // Limit search to current tenant
+                            if let Some(tenant_name) = params.get("tenant") {
+                                tenant = self
+                                    .core
+                                    .storage
+                                    .data
+                                    .get_principal_info(tenant_name)
+                                    .await?
+                                    .filter(|p| p.typ == Type::Tenant)
+                                    .map(|p| p.id);
+                            }
                         }
+                    } else if typ == Type::Tenant {
+                        return Err(manage::enterprise());
                     }
-                } else if typ == Type::Tenant {
-                    return Err(manage::enterprise());
                 }
                 // SPDX-SnippetEnd
 
@@ -376,12 +396,6 @@ impl PrincipalManager for Server {
                 if found {
                     let server = self.clone();
                     tokio::spawn(async move {
-                        let has_bayes = server
-                            .core
-                            .spam
-                            .bayes
-                            .as_ref()
-                            .is_some_and(|c| c.account_classify);
                         for principal in principals.items {
                             // Delete account
                             match server
@@ -399,29 +413,14 @@ impl PrincipalManager for Server {
                                 }
                             }
 
-                            if matches!(typ, Type::Individual | Type::Group) {
-                                // Remove FTS index
-                                if let Err(err) =
-                                    server.core.storage.fts.remove_all(principal.id()).await
-                                {
-                                    trc::error!(err.details("Failed to delete FTS index"));
-                                }
-
-                                // Delete bayes model
-                                if has_bayes {
-                                    let mut key =
-                                        Vec::with_capacity(std::mem::size_of::<u32>() + 1);
-                                    key.push(KV_BAYES_MODEL_USER);
-                                    key.extend_from_slice(&principal.id().to_be_bytes());
-
-                                    if let Err(err) =
-                                        server.in_memory_store().key_delete_prefix(&key).await
-                                    {
-                                        trc::error!(
-                                            err.details("Failed to delete user bayes model")
-                                        );
-                                    }
-                                }
+                            if let Err(err) = destroy_account_data(
+                                &server,
+                                principal.id(),
+                                matches!(typ, Type::Individual | Type::Group),
+                            )
+                            .await
+                            {
+                                trc::error!(err.details("Failed to delete principal"));
                             }
                         }
                     });
@@ -450,8 +449,10 @@ impl PrincipalManager for Server {
                 // SPDX-License-Identifier: LicenseRef-SEL
 
                 #[cfg(feature = "enterprise")]
-                if matches!(typ, Type::Tenant) && !self.core.is_enterprise_edition() {
-                    return Err(manage::enterprise());
+                {
+                    if matches!(typ, Type::Tenant) && !self.core.is_enterprise_edition() {
+                        return Err(manage::enterprise());
+                    }
                 }
 
                 // SPDX-SnippetEnd
@@ -515,28 +516,14 @@ impl PrincipalManager for Server {
                             .delete_principal(QueryBy::Id(account_id))
                             .await?;
 
-                        if matches!(typ, Type::Individual | Type::Group) {
-                            // Remove FTS index
-                            self.core.storage.fts.remove_all(account_id).await?;
-
-                            // Delete bayes model
-                            if self
-                                .core
-                                .spam
-                                .bayes
-                                .as_ref()
-                                .is_some_and(|c| c.account_classify)
-                            {
-                                let mut key = Vec::with_capacity(std::mem::size_of::<u32>() + 1);
-                                key.push(KV_BAYES_MODEL_USER);
-                                key.extend_from_slice(&account_id.to_be_bytes());
-
-                                if let Err(err) =
-                                    self.in_memory_store().key_delete_prefix(&key).await
-                                {
-                                    trc::error!(err.details("Failed to delete user bayes model"));
-                                }
-                            }
+                        if let Err(err) = destroy_account_data(
+                            self,
+                            account_id,
+                            matches!(typ, Type::Individual | Type::Group),
+                        )
+                        .await
+                        {
+                            trc::error!(err.details("Failed to delete principal"));
                         }
 
                         // Increment revision
@@ -710,13 +697,19 @@ impl PrincipalManager for Server {
                 .await?
                 .ok_or_else(|| trc::ManageEvent::NotFound.into_err())?;
 
-            for secret in &principal.secrets {
-                if secret.is_otp_auth() {
-                    response.otp_auth = true;
-                } else if let Some((app_name, _)) =
-                    secret.strip_prefix("$app$").and_then(|s| s.split_once('$'))
-                {
-                    response.app_passwords.push(app_name.into());
+            for data in &principal.data {
+                match data {
+                    PrincipalData::OtpAuth(_) => {
+                        response.otp_auth = true;
+                    }
+                    PrincipalData::AppPassword(secret) => {
+                        if let Some((app_name, _)) =
+                            secret.strip_prefix("$app$").and_then(|s| s.split_once('$'))
+                        {
+                            response.app_passwords.push(app_name.into());
+                        }
+                    }
+                    _ => {}
                 }
             }
         }

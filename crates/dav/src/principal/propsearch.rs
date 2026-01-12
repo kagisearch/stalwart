@@ -4,10 +4,8 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::{
-    Server,
-    auth::{AccessToken, AsTenantId},
-};
+use super::propfind::PrincipalPropFind;
+use common::{Server, auth::AccessToken};
 use dav_proto::schema::{
     property::{DavProperty, WebDavProperty},
     request::{PrincipalPropertySearch, PropFind},
@@ -16,11 +14,9 @@ use dav_proto::schema::{
 use directory::{Type, backend::internal::manage::ManageDirectory};
 use http_proto::HttpResponse;
 use hyper::StatusCode;
-use jmap_proto::types::collection::Collection;
 use store::roaring::RoaringBitmap;
 use trc::AddContext;
-
-use super::propfind::PrincipalPropFind;
+use types::collection::Collection;
 
 pub(crate) trait PrincipalPropSearch: Sync + Send {
     fn handle_principal_property_search(

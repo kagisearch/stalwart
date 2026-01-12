@@ -4,31 +4,38 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use super::{
+    ArchivedCalendar, ArchivedCalendarEvent, Calendar, CalendarEvent, CalendarPreferences,
+    alarm::CalendarAlarm,
+};
 use crate::{
     DavResourceName, DestroyArchive, RFC_3986,
-    calendar::{ArchivedCalendarScheduling, CalendarScheduling},
+    calendar::{
+        ArchivedCalendarEventNotification, CalendarEventNotification, alarm::CalendarAlarmType,
+    },
     scheduling::{ItipMessages, event_cancel::itip_cancel},
 };
 use calcard::common::timezone::Tz;
-use common::{IDX_CREATED, Server, auth::AccessToken, storage::index::ObjectIndexBuilder};
-use jmap_proto::types::collection::{Collection, VanishedCollection};
+use common::{Server, auth::AccessToken, storage::index::ObjectIndexBuilder};
 use store::{
-    IndexKey, IterateParams, SerializeInfallible, U16_LEN, U32_LEN, U64_LEN,
+    IterateParams, U16_LEN, U32_LEN, U64_LEN, ValueKey,
     roaring::RoaringBitmap,
     write::{
-        Archive, BatchBuilder, TaskQueueClass, ValueClass,
+        AlignedBytes, Archive, BatchBuilder, IndexPropertyClass, TaskEpoch, TaskQueueClass,
+        ValueClass,
         key::{DeserializeBigEndian, KeySerializer},
         now,
     },
 };
 use trc::AddContext;
-
-use super::{
-    ArchivedCalendar, ArchivedCalendarEvent, Calendar, CalendarEvent, CalendarPreferences,
-    alarm::CalendarAlarm,
+use types::{
+    collection::{Collection, VanishedCollection},
+    field::CalendarNotificationField,
 };
 
 pub trait ItipAutoExpunge: Sync + Send {
+    fn itip_ids(&self, account_id: u32) -> impl Future<Output = trc::Result<RoaringBitmap>> + Send;
+
     fn itip_auto_expunge(
         &self,
         account_id: u32,
@@ -37,34 +44,71 @@ pub trait ItipAutoExpunge: Sync + Send {
 }
 
 impl ItipAutoExpunge for Server {
-    async fn itip_auto_expunge(&self, account_id: u32, hold_period: u64) -> trc::Result<()> {
-        // Filter messages by received date
-        let mut destroy_ids = RoaringBitmap::new();
+    async fn itip_ids(&self, account_id: u32) -> trc::Result<RoaringBitmap> {
+        let mut document_ids = RoaringBitmap::new();
         self.store()
             .iterate(
                 IterateParams::new(
-                    IndexKey {
+                    ValueKey {
                         account_id,
-                        collection: Collection::CalendarScheduling.into(),
+                        collection: Collection::CalendarEventNotification.into(),
                         document_id: 0,
-                        field: IDX_CREATED,
-                        key: 0u64.serialize(),
+                        class: ValueClass::IndexProperty(IndexPropertyClass::Integer {
+                            property: CalendarNotificationField::CreatedToId.into(),
+                            value: 0,
+                        }),
                     },
-                    IndexKey {
+                    ValueKey {
                         account_id,
-                        collection: Collection::CalendarScheduling.into(),
-                        document_id: u32::MAX,
-                        field: IDX_CREATED,
-                        key: now().saturating_sub(hold_period).serialize(),
+                        collection: Collection::CalendarEventNotification.into(),
+                        document_id: 0,
+                        class: ValueClass::IndexProperty(IndexPropertyClass::Integer {
+                            property: CalendarNotificationField::CreatedToId.into(),
+                            value: u64::MAX,
+                        }),
                     },
                 )
                 .no_values()
                 .ascending(),
                 |key, _| {
-                    destroy_ids.insert(
-                        key.deserialize_be_u32(key.len() - U32_LEN)
-                            .caused_by(trc::location!())?,
-                    );
+                    document_ids.insert(key.deserialize_be_u32(key.len() - U32_LEN)?);
+
+                    Ok(true)
+                },
+            )
+            .await
+            .caused_by(trc::location!())
+            .map(|_| document_ids)
+    }
+
+    async fn itip_auto_expunge(&self, account_id: u32, hold_period: u64) -> trc::Result<()> {
+        let mut destroy_ids = RoaringBitmap::new();
+        self.store()
+            .iterate(
+                IterateParams::new(
+                    ValueKey {
+                        account_id,
+                        collection: Collection::CalendarEventNotification.into(),
+                        document_id: 0,
+                        class: ValueClass::IndexProperty(IndexPropertyClass::Integer {
+                            property: CalendarNotificationField::CreatedToId.into(),
+                            value: 0,
+                        }),
+                    },
+                    ValueKey {
+                        account_id,
+                        collection: Collection::CalendarEventNotification.into(),
+                        document_id: 0,
+                        class: ValueClass::IndexProperty(IndexPropertyClass::Integer {
+                            property: CalendarNotificationField::CreatedToId.into(),
+                            value: now().saturating_sub(hold_period),
+                        }),
+                    },
+                )
+                .no_values()
+                .ascending(),
+                |key, _| {
+                    destroy_ids.insert(key.deserialize_be_u32(key.len() - U32_LEN)?);
 
                     Ok(true)
                 },
@@ -79,7 +123,7 @@ impl ItipAutoExpunge for Server {
         trc::event!(
             Purge(trc::PurgeEvent::AutoExpunge),
             AccountId = account_id,
-            Collection = Collection::CalendarScheduling.as_str(),
+            Collection = Collection::CalendarEventNotification.as_str(),
             Total = destroy_ids.len(),
         );
 
@@ -93,12 +137,17 @@ impl ItipAutoExpunge for Server {
         for document_id in destroy_ids {
             // Fetch event
             if let Some(event_) = self
-                .get_archive(account_id, Collection::CalendarScheduling, document_id)
+                .store()
+                .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                    account_id,
+                    Collection::CalendarEventNotification,
+                    document_id,
+                ))
                 .await
                 .caused_by(trc::location!())?
             {
                 let event = event_
-                    .to_unarchived::<CalendarScheduling>()
+                    .to_unarchived::<CalendarEventNotification>()
                     .caused_by(trc::location!())?;
                 DestroyArchive(event)
                     .delete(&access_token, account_id, document_id, &mut batch)
@@ -130,12 +179,12 @@ impl CalendarEvent {
         batch
             .with_account_id(account_id)
             .with_collection(Collection::CalendarEvent)
-            .update_document(document_id)
+            .with_document(document_id)
             .custom(
                 ObjectIndexBuilder::new()
                     .with_current(event)
                     .with_changes(new_event)
-                    .with_tenant_id(access_token),
+                    .with_access_token(access_token),
             )
             .map(|b| b.commit_point())
     }
@@ -158,11 +207,11 @@ impl CalendarEvent {
         batch
             .with_account_id(account_id)
             .with_collection(Collection::CalendarEvent)
-            .create_document(document_id)
+            .with_document(document_id)
             .custom(
                 ObjectIndexBuilder::<(), _>::new()
                     .with_changes(event)
-                    .with_tenant_id(access_token),
+                    .with_access_token(access_token),
             )
             .map(|batch| {
                 if let Some(next_alarm) = next_alarm {
@@ -200,11 +249,11 @@ impl Calendar {
         batch
             .with_account_id(account_id)
             .with_collection(Collection::Calendar)
-            .create_document(document_id)
+            .with_document(document_id)
             .custom(
                 ObjectIndexBuilder::<(), _>::new()
                     .with_changes(calendar)
-                    .with_tenant_id(access_token),
+                    .with_access_token(access_token),
             )
             .map(|b| b.commit_point())
     }
@@ -225,18 +274,18 @@ impl Calendar {
         batch
             .with_account_id(account_id)
             .with_collection(Collection::Calendar)
-            .update_document(document_id)
+            .with_document(document_id)
             .custom(
                 ObjectIndexBuilder::new()
                     .with_current(calendar)
                     .with_changes(new_calendar)
-                    .with_tenant_id(access_token),
+                    .with_access_token(access_token),
             )
             .map(|b| b.commit_point())
     }
 }
 
-impl CalendarScheduling {
+impl CalendarEventNotification {
     pub fn insert<'x>(
         self,
         access_token: &AccessToken,
@@ -253,12 +302,12 @@ impl CalendarScheduling {
         // Prepare write batch
         batch
             .with_account_id(account_id)
-            .with_collection(Collection::CalendarScheduling)
-            .create_document(document_id)
+            .with_collection(Collection::CalendarEventNotification)
+            .with_document(document_id)
             .custom(
                 ObjectIndexBuilder::<(), _>::new()
                     .with_changes(event)
-                    .with_tenant_id(access_token),
+                    .with_access_token(access_token),
             )
             .map(|batch| batch.commit_point())
     }
@@ -281,7 +330,12 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
         let calendar_id = document_id;
         for document_id in children_ids {
             if let Some(event_) = server
-                .get_archive(account_id, Collection::CalendarEvent, document_id)
+                .store()
+                .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                    account_id,
+                    Collection::CalendarEvent,
+                    document_id,
+                ))
                 .await?
             {
                 DestroyArchive(
@@ -317,10 +371,10 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
         batch
             .with_account_id(account_id)
             .with_collection(Collection::Calendar)
-            .delete_document(document_id)
+            .with_document(document_id)
             .custom(
                 ObjectIndexBuilder::<_, ()>::new()
-                    .with_tenant_id(access_token)
+                    .with_access_token(access_token)
                     .with_current(calendar),
             )
             .caused_by(trc::location!())?;
@@ -345,67 +399,33 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
         send_itip: bool,
         batch: &mut BatchBuilder,
     ) -> trc::Result<()> {
-        let event = self.0;
-        if let Some(delete_idx) = event
+        if let Some(delete_idx) = self
+            .0
             .inner
             .names
             .iter()
             .position(|name| name.parent_id == calendar_id)
         {
-            batch
-                .with_account_id(account_id)
-                .with_collection(Collection::CalendarEvent);
-
-            if event.inner.names.len() > 1 {
+            if self.0.inner.names.len() > 1 {
                 // Unlink calendar id from event
+                let event = self.0;
                 let mut new_event = event
                     .deserialize::<CalendarEvent>()
                     .caused_by(trc::location!())?;
                 new_event.names.swap_remove(delete_idx);
                 batch
-                    .update_document(document_id)
+                    .with_account_id(account_id)
+                    .with_collection(Collection::CalendarEvent)
+                    .with_document(document_id)
                     .custom(
                         ObjectIndexBuilder::new()
-                            .with_tenant_id(access_token)
+                            .with_access_token(access_token)
                             .with_current(event)
                             .with_changes(new_event),
                     )
                     .caused_by(trc::location!())?;
             } else {
-                // Delete event
-                batch.delete_document(document_id);
-
-                // Remove next alarm if it exists
-                let now = now() as i64;
-                if let Some(next_alarm) = event.inner.data.next_alarm(now, Tz::Floating) {
-                    next_alarm.delete_task(batch);
-                }
-
-                // Scheduling
-                if send_itip
-                    && event.inner.schedule_tag.is_some()
-                    && event.inner.data.event_range_end() > now
-                {
-                    let event = event
-                        .deserialize::<CalendarEvent>()
-                        .caused_by(trc::location!())?;
-
-                    if let Ok(messages) =
-                        itip_cancel(&event.data.event, access_token.emails.as_slice(), true)
-                    {
-                        ItipMessages::new(vec![messages])
-                            .queue(batch)
-                            .caused_by(trc::location!())?;
-                    }
-                }
-
-                batch
-                    .custom(
-                        ObjectIndexBuilder::<_, ()>::new()
-                            .with_tenant_id(access_token)
-                            .with_current(event),
-                    )
-                    .caused_by(trc::location!())?;
+                self.delete_all(access_token, account_id, document_id, send_itip, batch)?;
             }
 
             if let Some(delete_path) = delete_path {
@@ -417,9 +437,60 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
 
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn delete_all(
+        self,
+        access_token: &AccessToken,
+        account_id: u32,
+        document_id: u32,
+        send_itip: bool,
+        batch: &mut BatchBuilder,
+    ) -> trc::Result<()> {
+        let event = self.0;
+        // Delete event
+        batch
+            .with_account_id(account_id)
+            .with_collection(Collection::CalendarEvent)
+            .with_document(document_id);
+
+        // Remove next alarm if it exists
+        let now = now() as i64;
+        if let Some(next_alarm) = event.inner.data.next_alarm(now, Tz::Floating) {
+            next_alarm.delete_task(batch);
+        }
+
+        // Scheduling
+        if send_itip
+            && event.inner.schedule_tag.is_some()
+            && event.inner.data.event_range_end() > now
+        {
+            let event = event
+                .deserialize::<CalendarEvent>()
+                .caused_by(trc::location!())?;
+
+            if let Ok(messages) =
+                itip_cancel(&event.data.event, access_token.emails.as_slice(), true)
+            {
+                ItipMessages::new(vec![messages])
+                    .queue(batch)
+                    .caused_by(trc::location!())?;
+            }
+        }
+
+        batch
+            .custom(
+                ObjectIndexBuilder::<_, ()>::new()
+                    .with_access_token(access_token)
+                    .with_current(event),
+            )
+            .caused_by(trc::location!())?;
+
+        Ok(())
+    }
 }
 
-impl DestroyArchive<Archive<&ArchivedCalendarScheduling>> {
+impl DestroyArchive<Archive<&ArchivedCalendarEventNotification>> {
     #[allow(clippy::too_many_arguments)]
     pub fn delete(
         self,
@@ -431,11 +502,11 @@ impl DestroyArchive<Archive<&ArchivedCalendarScheduling>> {
         // Delete event
         batch
             .with_account_id(account_id)
-            .with_collection(Collection::CalendarScheduling)
-            .delete_document(document_id)
+            .with_collection(Collection::CalendarEventNotification)
+            .with_document(document_id)
             .custom(
                 ObjectIndexBuilder::<_, ()>::new()
-                    .with_tenant_id(access_token)
+                    .with_access_token(access_token)
                     .with_current(self.0),
             )
             .caused_by(trc::location!())?
@@ -447,26 +518,50 @@ impl DestroyArchive<Archive<&ArchivedCalendarScheduling>> {
 
 impl CalendarAlarm {
     pub fn write_task(&self, batch: &mut BatchBuilder) {
-        batch.set(
-            ValueClass::TaskQueue(TaskQueueClass::SendAlarm {
-                due: self.alarm_time as u64,
-                event_id: self.event_id,
-                alarm_id: self.alarm_id,
-            }),
-            KeySerializer::new((U64_LEN * 2) + (U16_LEN * 2))
-                .write(self.event_start as u64)
-                .write(self.event_end as u64)
-                .write(self.event_start_tz)
-                .write(self.event_end_tz)
-                .finalize(),
-        );
+        match &self.typ {
+            CalendarAlarmType::Email {
+                event_start,
+                event_start_tz,
+                event_end,
+                event_end_tz,
+            } => {
+                batch.set(
+                    ValueClass::TaskQueue(TaskQueueClass::SendAlarm {
+                        due: TaskEpoch::new(self.alarm_time as u64),
+                        event_id: self.event_id,
+                        alarm_id: self.alarm_id,
+                        is_email_alert: true,
+                    }),
+                    KeySerializer::new((U64_LEN * 2) + (U16_LEN * 2))
+                        .write(*event_start as u64)
+                        .write(*event_end as u64)
+                        .write(*event_start_tz)
+                        .write(*event_end_tz)
+                        .finalize(),
+                );
+            }
+            CalendarAlarmType::Display { recurrence_id } => {
+                batch.set(
+                    ValueClass::TaskQueue(TaskQueueClass::SendAlarm {
+                        due: TaskEpoch::new(self.alarm_time as u64),
+                        event_id: self.event_id,
+                        alarm_id: self.alarm_id,
+                        is_email_alert: false,
+                    }),
+                    KeySerializer::new(U64_LEN)
+                        .write(recurrence_id.unwrap_or_default() as u64)
+                        .finalize(),
+                );
+            }
+        }
     }
 
     pub fn delete_task(&self, batch: &mut BatchBuilder) {
         batch.clear(ValueClass::TaskQueue(TaskQueueClass::SendAlarm {
-            due: self.alarm_time as u64,
+            due: TaskEpoch::new(self.alarm_time as u64),
             event_id: self.event_id,
             alarm_id: self.alarm_id,
+            is_email_alert: matches!(self.typ, CalendarAlarmType::Email { .. }),
         }));
     }
 }
@@ -479,11 +574,12 @@ impl ArchivedCalendarEvent {
     ) -> trc::Result<String> {
         for event_name in self.names.iter() {
             if let Some(calendar_) = server
-                .get_archive(
+                .store()
+                .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
                     access_token.primary_id,
                     Collection::Calendar,
                     event_name.parent_id.to_native(),
-                )
+                ))
                 .await
                 .caused_by(trc::location!())?
             {

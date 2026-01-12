@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use super::{UploadResponse, download::BlobDownload};
 use common::{Server, auth::AccessToken};
 use directory::Permission;
 use jmap_proto::{
@@ -13,14 +14,11 @@ use jmap_proto::{
     method::upload::{
         BlobUploadRequest, BlobUploadResponse, BlobUploadResponseObject, DataSourceObject,
     },
-    request::reference::MaybeReference,
-    types::id::Id,
+    request::reference::MaybeIdReference,
 };
-
-use trc::AddContext;
-
-use super::{UploadResponse, download::BlobDownload};
 use std::future::Future;
+use trc::AddContext;
+use types::id::Id;
 
 #[cfg(feature = "test_mode")]
 pub static DISABLE_UPLOAD_QUOTA: std::sync::atomic::AtomicBool =
@@ -66,8 +64,8 @@ impl BlobUpload for Server {
                 let bytes = match data_source {
                     DataSourceObject::Id { id, length, offset } => {
                         let id = match id {
-                            MaybeReference::Value(id) => id,
-                            MaybeReference::Reference(reference) => {
+                            MaybeIdReference::Id(id) => id,
+                            MaybeIdReference::Reference(reference) => {
                                 if let Some(obj) = response.created.get(&reference) {
                                     obj.id.clone()
                                 } else {
@@ -79,6 +77,14 @@ impl BlobUpload for Server {
                                     );
                                     continue 'outer;
                                 }
+                            }
+                            MaybeIdReference::Invalid(id) => {
+                                response.not_created.append(
+                                    create_id,
+                                    SetError::invalid_properties()
+                                        .with_description(format!("Invalid blobId {id}.")),
+                                );
+                                continue 'outer;
                             }
                         };
 
@@ -110,7 +116,9 @@ impl BlobUpload for Server {
                                     }
                                 })
                         } else {
-                            self.get_blob(&id.hash, offset..length).await?
+                            self.blob_store()
+                                .get_blob(id.hash.as_slice(), offset..length)
+                                .await?
                         };
                         if let Some(bytes) = bytes {
                             bytes
@@ -124,6 +132,14 @@ impl BlobUpload for Server {
                         }
                     }
                     DataSourceObject::Value(bytes) => bytes,
+                    DataSourceObject::Null => {
+                        response.not_created.append(
+                            create_id,
+                            SetError::invalid_properties()
+                                .with_description("Invalid DataSourceObject."),
+                        );
+                        continue 'outer;
+                    }
                 };
 
                 if bytes.len() + data.len() < self.core.jmap.upload_max_size {
@@ -179,7 +195,7 @@ impl BlobUpload for Server {
             response.created.insert(
                 create_id,
                 BlobUploadResponseObject {
-                    id: self.put_blob(account_id, &data, true).await?,
+                    id: self.put_jmap_blob(account_id, &data).await?,
                     type_: upload_object.type_,
                     size: data.len(),
                 },
@@ -241,7 +257,7 @@ impl BlobUpload for Server {
         Ok(UploadResponse {
             account_id,
             blob_id: self
-                .put_blob(account_id.document_id(), data, true)
+                .put_jmap_blob(account_id.document_id(), data)
                 .await
                 .caused_by(trc::location!())?,
             c_type: content_type.to_string(),

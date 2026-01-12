@@ -4,15 +4,18 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::time::Instant;
-
+use crate::{Session, protocol::response::Response};
 use common::listener::SessionStream;
 use directory::Permission;
 use email::message::metadata::MessageMetadata;
-use jmap_proto::types::{collection::Collection, property::Property};
+use std::time::Instant;
+use store::{
+    ValueKey,
+    write::{AlignedBytes, Archive},
+};
 use trc::AddContext;
-
-use crate::{Session, protocol::response::Response};
+use types::{collection::Collection, field::EmailField};
+use utils::chained_bytes::ChainedBytes;
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_fetch(&mut self, msg: u32, lines: Option<u32>) -> trc::Result<()> {
@@ -26,12 +29,13 @@ impl<T: SessionStream> Session<T> {
         if let Some(message) = mailbox.messages.get(msg.saturating_sub(1) as usize) {
             if let Some(metadata_) = self
                 .server
-                .get_archive_by_property(
+                .store()
+                .get_value::<Archive<AlignedBytes>>(ValueKey::property(
                     mailbox.account_id,
                     Collection::Email,
                     message.id,
-                    Property::BodyStructure,
-                )
+                    EmailField::Metadata,
+                ))
                 .await
                 .caused_by(trc::location!())?
             {
@@ -51,6 +55,14 @@ impl<T: SessionStream> Session<T> {
                         DocumentId = message.id,
                         Elapsed = op_start.elapsed()
                     );
+
+                    let bytes = ChainedBytes::new(metadata.raw_headers.as_ref())
+                        .with_last(
+                            bytes
+                                .get(metadata.blob_body_offset.to_native() as usize..)
+                                .unwrap_or_default(),
+                        )
+                        .get_full_range();
 
                     self.write_bytes(
                         Response::Message::<u32> {

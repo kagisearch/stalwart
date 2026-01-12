@@ -7,7 +7,10 @@
 use crate::{
     RFC_3986,
     cache::GroupwareCache,
-    calendar::{CalendarEvent, CalendarEventData, CalendarScheduling},
+    calendar::{
+        CalendarEvent, CalendarEventData, CalendarEventNotification, ChangedBy,
+        EVENT_NOTIFICATION_IS_CHANGE,
+    },
     scheduling::{
         ItipError, ItipMessage,
         inbound::{
@@ -17,25 +20,28 @@ use crate::{
     },
 };
 use calcard::{
-    common::timezone::Tz,
+    common::{IanaString, timezone::Tz},
     icalendar::{
         ICalendar, ICalendarComponentType, ICalendarEntry, ICalendarMethod, ICalendarParameter,
-        ICalendarParticipationStatus, ICalendarProperty, ICalendarValue,
+        ICalendarParameterName, ICalendarParameterValue, ICalendarParticipationStatus,
+        ICalendarProperty, ICalendarValue,
     },
 };
 use common::{
-    DavName, IDX_EMAIL, IDX_UID, Server,
+    DavName, Server,
     auth::{AccessToken, ResourceToken, oauth::GrantType},
     config::groupware::CalendarTemplateVariable,
     i18n,
 };
-use jmap_proto::types::collection::Collection;
 use store::{
-    query::Filter,
-    rand,
-    write::{BatchBuilder, now},
+    ValueKey, rand,
+    write::{AlignedBytes, Archive, BatchBuilder, now},
 };
 use trc::AddContext;
+use types::{
+    collection::Collection,
+    field::{CalendarEventField, ContactField},
+};
 use utils::{template::Variables, url_params::UrlParams};
 
 pub enum ItipIngestError {
@@ -135,24 +141,35 @@ impl ItipIngest for Server {
             ));
         }
 
+        // Obtain changedBy
+        let changed_by = if let Some(id) = self.email_to_id(self.directory(), sender, 0).await? {
+            ChangedBy::PrincipalId(id)
+        } else {
+            ChangedBy::CalendarAddress(sender.into())
+        };
+
         // Find event by UID
         let account_id = access_token.primary_id;
         let document_id = self
-            .store()
-            .filter(
+            .document_ids_matching(
                 account_id,
                 Collection::CalendarEvent,
-                vec![Filter::eq(IDX_UID, itip_snapshots.uid.as_bytes().to_vec())],
+                CalendarEventField::Uid,
+                itip_snapshots.uid.as_bytes(),
             )
             .await
             .caused_by(trc::location!())?
-            .results
             .iter()
             .next();
 
         if let Some(document_id) = document_id {
             if let Some(archive) = self
-                .get_archive(account_id, Collection::CalendarEvent, document_id)
+                .store()
+                .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                    account_id,
+                    Collection::CalendarEvent,
+                    document_id,
+                ))
                 .await
                 .caused_by(trc::location!())?
             {
@@ -217,12 +234,18 @@ impl ItipIngest for Server {
                         // Build event for schedule inbox
                         let itip_document_id = self
                             .store()
-                            .assign_document_ids(account_id, Collection::CalendarScheduling, 1)
+                            .assign_document_ids(
+                                account_id,
+                                Collection::CalendarEventNotification,
+                                1,
+                            )
                             .await
                             .caused_by(trc::location!())?;
-                        let itip_message = CalendarScheduling {
-                            itip,
+                        let itip_message = CalendarEventNotification {
+                            event: itip,
+                            changed_by,
                             event_id: Some(document_id),
+                            flags: EVENT_NOTIFICATION_IS_CHANGE,
                             size: itip_message.len() as u32,
                             ..Default::default()
                         };
@@ -256,17 +279,16 @@ impl ItipIngest for Server {
         } else {
             // Verify that auto-adding invitations is allowed
             if !self.core.groupware.itip_auto_add
-                && self
-                    .store()
-                    .filter(
+                && !matches!(changed_by, ChangedBy::PrincipalId(_))
+                && !self
+                    .document_exists(
                         account_id,
                         Collection::ContactCard,
-                        vec![Filter::eq(IDX_EMAIL, sender.as_bytes().to_vec())],
+                        ContactField::Email,
+                        sender.as_bytes(),
                     )
                     .await
                     .caused_by(trc::location!())?
-                    .results
-                    .is_empty()
             {
                 return Err(ItipIngestError::Message(ItipError::AutoAddDisabled));
             } else if itip_method(&itip)? != &ICalendarMethod::Request {
@@ -288,7 +310,7 @@ impl ItipIngest for Server {
 
             // Obtain parent calendar
             let Some(parent_id) = self
-                .get_or_create_default_calendar(access_token, account_id, &access_token.name)
+                .get_or_create_default_calendar(access_token, account_id)
                 .await
                 .caused_by(trc::location!())?
             else {
@@ -322,12 +344,13 @@ impl ItipIngest for Server {
                 .caused_by(trc::location!())?;
             let itip_document_id = self
                 .store()
-                .assign_document_ids(account_id, Collection::CalendarScheduling, 1)
+                .assign_document_ids(account_id, Collection::CalendarEventNotification, 1)
                 .await
                 .caused_by(trc::location!())?;
-            let itip_message = CalendarScheduling {
-                itip,
+            let itip_message = CalendarEventNotification {
+                event: itip,
                 event_id: Some(document_id),
+                changed_by,
                 size: itip_message.len() as u32,
                 ..Default::default()
             };
@@ -385,7 +408,12 @@ impl ItipIngest for Server {
     async fn http_rsvp_handle(&self, query: &str, language: &str) -> trc::Result<String> {
         let response = if let Some(rsvp) = decode_rsvp_response(self, query).await {
             if let Some(archive) = self
-                .get_archive(rsvp.account_id, Collection::CalendarEvent, rsvp.document_id)
+                .store()
+                .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                    rsvp.account_id,
+                    Collection::CalendarEvent,
+                    rsvp.document_id,
+                ))
                 .await
                 .caused_by(trc::location!())?
             {
@@ -405,18 +433,16 @@ impl ItipIngest for Server {
                         'outer: for entry in &mut component.entries {
                             if entry.name == ICalendarProperty::Attendee
                                 && entry
-                                    .values
-                                    .first()
-                                    .and_then(|v| v.as_text())
-                                    .is_some_and(|v| {
-                                        v.strip_prefix("mailto:")
-                                            .unwrap_or(v)
-                                            .eq_ignore_ascii_case(&rsvp.attendee)
-                                    })
+                                    .calendar_address()
+                                    .is_some_and(|v| v.eq_ignore_ascii_case(&rsvp.attendee))
                             {
                                 let mut add_partstat = true;
                                 for param in &mut entry.params {
-                                    if let ICalendarParameter::Partstat(partstat) = param {
+                                    if let (
+                                        ICalendarParameterName::Partstat,
+                                        ICalendarParameterValue::Partstat(partstat),
+                                    ) = (&param.name, &mut param.value)
+                                    {
                                         if partstat != &rsvp.partstat {
                                             *partstat = rsvp.partstat.clone();
                                             add_partstat = false;
@@ -429,7 +455,7 @@ impl ItipIngest for Server {
                                 if add_partstat {
                                     entry
                                         .params
-                                        .push(ICalendarParameter::Partstat(rsvp.partstat.clone()));
+                                        .push(ICalendarParameter::partstat(rsvp.partstat.clone()));
                                 }
                                 found_participant = true;
                                 did_change = true;

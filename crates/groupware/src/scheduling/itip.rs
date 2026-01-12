@@ -6,16 +6,17 @@
 
 use crate::scheduling::{ArchivedItipSummary, ItipMessage, ItipMessages};
 use calcard::{
-    common::PartialDateTime,
+    common::{IanaString, PartialDateTime},
     icalendar::{
         ICalendar, ICalendarComponent, ICalendarComponentType, ICalendarEntry, ICalendarMethod,
-        ICalendarParameter, ICalendarParticipationStatus, ICalendarProperty, ICalendarValue,
+        ICalendarParameter, ICalendarParameterName, ICalendarParameterValue,
+        ICalendarParticipationStatus, ICalendarProperty, ICalendarValue,
     },
 };
 use common::PROD_ID;
 use store::{
     Serialize,
-    write::{Archiver, BatchBuilder, TaskQueueClass, ValueClass, now},
+    write::{Archiver, BatchBuilder, TaskEpoch, TaskQueueClass, ValueClass},
 };
 use trc::AddContext;
 
@@ -67,49 +68,57 @@ pub(crate) fn itip_export_component(
     comp.add_uid(uid);
 
     for (entry_id, entry) in component.entries.iter().enumerate() {
-        match &entry.name {
-            ICalendarProperty::Organizer | ICalendarProperty::Attendee => match &export_as {
-                ItipExportAs::Organizer(partstat) => {
-                    let mut new_entry = ICalendarEntry {
-                        name: entry.name.clone(),
-                        params: Vec::with_capacity(entry.params.len()),
-                        values: entry.values.clone(),
-                    };
-                    let mut has_partstat = false;
-                    let mut rsvp = true;
+        match (&entry.name, &export_as) {
+            (
+                ICalendarProperty::Organizer | ICalendarProperty::Attendee,
+                ItipExportAs::Organizer(partstat),
+            ) => {
+                let mut new_entry = ICalendarEntry {
+                    name: entry.name.clone(),
+                    params: Vec::with_capacity(entry.params.len()),
+                    values: entry.values.clone(),
+                };
+                let mut has_partstat = false;
+                let mut rsvp = true;
 
-                    for entry in &entry.params {
-                        match entry {
-                            ICalendarParameter::ScheduleStatus(_)
-                            | ICalendarParameter::ScheduleAgent(_)
-                            | ICalendarParameter::ScheduleForceSend(_) => {}
-                            _ => {
-                                match entry {
-                                    ICalendarParameter::Rsvp(false) => {
-                                        rsvp = false;
-                                    }
-                                    ICalendarParameter::Partstat(_) => {
-                                        has_partstat = true;
-                                    }
-                                    _ => {}
+                for entry in &entry.params {
+                    match &entry.name {
+                        ICalendarParameterName::ScheduleStatus
+                        | ICalendarParameterName::ScheduleAgent
+                        | ICalendarParameterName::ScheduleForceSend => {}
+                        _ => {
+                            match &entry.name {
+                                ICalendarParameterName::Rsvp => {
+                                    rsvp = !matches!(
+                                        entry.value,
+                                        ICalendarParameterValue::Bool(false)
+                                    );
                                 }
-
-                                new_entry.params.push(entry.clone())
+                                ICalendarParameterName::Partstat => {
+                                    has_partstat = true;
+                                }
+                                _ => {}
                             }
+
+                            new_entry.params.push(entry.clone())
                         }
                     }
-
-                    if !has_partstat && rsvp && entry.name == ICalendarProperty::Attendee {
-                        new_entry
-                            .params
-                            .push(ICalendarParameter::Partstat((*partstat).clone()));
-                    }
-
-                    comp.entries.push(new_entry);
                 }
-                ItipExportAs::Attendee(attendee_entry_ids)
-                    if attendee_entry_ids.contains(&(entry_id as u16))
-                        || entry.name == ICalendarProperty::Organizer =>
+
+                if !has_partstat && rsvp && entry.name == ICalendarProperty::Attendee {
+                    new_entry
+                        .params
+                        .push(ICalendarParameter::partstat((*partstat).clone()));
+                }
+
+                comp.entries.push(new_entry);
+            }
+            (
+                ICalendarProperty::Organizer | ICalendarProperty::Attendee,
+                ItipExportAs::Attendee(attendee_entry_ids),
+            ) => {
+                if attendee_entry_ids.contains(&(entry_id as u16))
+                    || entry.name == ICalendarProperty::Organizer
                 {
                     comp.entries.push(ICalendarEntry {
                         name: entry.name.clone(),
@@ -118,10 +127,10 @@ pub(crate) fn itip_export_component(
                             .iter()
                             .filter(|param| {
                                 !matches!(
-                                    param,
-                                    ICalendarParameter::ScheduleStatus(_)
-                                        | ICalendarParameter::ScheduleAgent(_)
-                                        | ICalendarParameter::ScheduleForceSend(_)
+                                    &param.name,
+                                    ICalendarParameterName::ScheduleStatus
+                                        | ICalendarParameterName::ScheduleAgent
+                                        | ICalendarParameterName::ScheduleForceSend
                                 )
                             })
                             .cloned()
@@ -129,26 +138,36 @@ pub(crate) fn itip_export_component(
                         values: entry.values.clone(),
                     });
                 }
-                _ => {}
-            },
-            ICalendarProperty::RequestStatus
-            | ICalendarProperty::Dtstamp
-            | ICalendarProperty::Sequence
-            | ICalendarProperty::Uid => {}
-            _ => {
-                if matches!(export_as, ItipExportAs::Organizer(_))
-                    || matches!(entry.name, ICalendarProperty::RecurrenceId)
-                    || (is_todo
-                        && matches!(
-                            entry.name,
-                            ICalendarProperty::Status
-                                | ICalendarProperty::PercentComplete
-                                | ICalendarProperty::Completed
-                        ))
-                {
-                    comp.entries.push(entry.clone());
-                }
             }
+            (
+                ICalendarProperty::RequestStatus
+                | ICalendarProperty::Dtstamp
+                | ICalendarProperty::Sequence
+                | ICalendarProperty::Uid,
+                _,
+            ) => {}
+            (_, ItipExportAs::Organizer(_))
+            | (
+                ICalendarProperty::RecurrenceId
+                | ICalendarProperty::Dtstart
+                | ICalendarProperty::Dtend
+                | ICalendarProperty::Duration
+                | ICalendarProperty::Due
+                | ICalendarProperty::Description
+                | ICalendarProperty::Summary,
+                _,
+            ) => {
+                comp.entries.push(entry.clone());
+            }
+            (
+                ICalendarProperty::Status
+                | ICalendarProperty::PercentComplete
+                | ICalendarProperty::Completed,
+                _,
+            ) if is_todo => {
+                comp.entries.push(entry.clone());
+            }
+            _ => {}
         }
     }
 
@@ -175,9 +194,9 @@ pub(crate) fn itip_finalize(ical: &mut ICalendar, scheduling_object_ids: &[u16])
                     entry.name,
                     ICalendarProperty::Organizer | ICalendarProperty::Attendee
                 ) {
-                    entry
-                        .params
-                        .retain(|param| !matches!(param, ICalendarParameter::ScheduleForceSend(_)));
+                    entry.params.retain(|param| {
+                        !matches!(param.name, ICalendarParameterName::ScheduleForceSend)
+                    });
                 }
             }
         }
@@ -214,7 +233,7 @@ pub(crate) fn itip_add_tz(message: &mut ICalendar, ical: &ICalendar) {
             && c.entries.iter().any(|e| {
                 e.params
                     .iter()
-                    .any(|p| matches!(p, ICalendarParameter::Tzid(_)))
+                    .any(|p| matches!(p.name, ICalendarParameterName::Tzid))
             })
     }) && !has_timezones
     {
@@ -259,7 +278,7 @@ impl ItipMessages {
     }
 
     pub fn queue(self, batch: &mut BatchBuilder) -> trc::Result<()> {
-        let due = now();
+        let due = TaskEpoch::now().with_random_sequence_id();
         batch.set(
             ValueClass::TaskQueue(TaskQueueClass::SendImip {
                 due,

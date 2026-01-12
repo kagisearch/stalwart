@@ -4,8 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::config::jmap::settings::SpecialUse;
-use jmap_proto::types::value::AclGrant;
+use types::{acl::AclGrant, special_use::SpecialUse};
 
 pub mod destroy;
 pub mod index;
@@ -17,7 +16,6 @@ pub const JUNK_ID: u32 = 2;
 pub const DRAFTS_ID: u32 = 3;
 pub const SENT_ID: u32 = 4;
 pub const ARCHIVE_ID: u32 = 5;
-pub const TOMBSTONE_ID: u32 = u32::MAX - 1;
 
 #[derive(rkyv::Archive, rkyv::Deserialize, rkyv::Serialize, Debug, Clone, PartialEq, Eq)]
 #[rkyv(derive(Debug))]

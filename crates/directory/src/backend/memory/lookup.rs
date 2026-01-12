@@ -35,7 +35,7 @@ impl MemoryDirectory {
 
                 for principal in &self.principals {
                     if principal.name() == username {
-                        return if principal.verify_secret(secret, false).await? {
+                        return if principal.verify_secret(secret, false, false).await? {
                             Ok(Some(principal.clone()))
                         } else {
                             Ok(None)
@@ -80,8 +80,8 @@ impl MemoryDirectory {
                     if let EmailType::List(uid) = item {
                         for principal in &self.principals {
                             if principal.id == *uid {
-                                if let Some(addr) = principal.emails.first() {
-                                    result.push(addr.clone())
+                                if let Some(addr) = principal.primary_email() {
+                                    result.push(addr.to_string())
                                 }
                                 break;
                             }

@@ -4,25 +4,24 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use crate::{
+    core::{Session, SessionAddress},
+    scripts::ScriptResult,
+};
 use common::{
     KV_GREYLIST, config::smtp::session::Stage, listener::SessionStream, scripts::ScriptModification,
 };
-
 use directory::backend::RcptType;
 use smtp_proto::{
     RCPT_NOTIFY_DELAY, RCPT_NOTIFY_FAILURE, RCPT_NOTIFY_NEVER, RCPT_NOTIFY_SUCCESS, RcptTo,
 };
+use std::borrow::Cow;
 use store::dispatch::lookup::KeyValue;
 use trc::{SecurityEvent, SmtpEvent};
-
-use crate::{
-    core::{Session, SessionAddress},
-    queue::DomainPart,
-    scripts::ScriptResult,
-};
+use utils::DomainPart;
 
 impl<T: SessionStream> Session<T> {
-    pub async fn handle_rcpt_to(&mut self, to: RcptTo<String>) -> Result<(), ()> {
+    pub async fn handle_rcpt_to(&mut self, to: RcptTo<Cow<'_, str>>) -> Result<(), ()> {
         #[cfg(feature = "test_mode")]
         if self.instance.id.ends_with("-debug") {
             if to.address.contains("fail@") {
@@ -72,9 +71,9 @@ impl<T: SessionStream> Session<T> {
         let rcpt = SessionAddress {
             domain: address_lcase.domain_part().into(),
             address_lcase,
-            address: to.address,
+            address: to.address.into_owned(),
             flags: to.flags,
-            dsn_info: to.orcpt,
+            dsn_info: to.orcpt.map(|e| e.into_owned()),
         };
 
         if self.data.rcpt_to.contains(&rcpt) {
@@ -89,13 +88,10 @@ impl<T: SessionStream> Session<T> {
         self.data.rcpt_to.push(rcpt);
 
         // Address rewriting and Sieve filtering
+        let rcpt_config = &self.server.core.smtp.session.rcpt;
         let rcpt_script = self
             .server
-            .eval_if::<String, _>(
-                &self.server.core.smtp.session.rcpt.script,
-                self,
-                self.data.session_id,
-            )
+            .eval_if::<String, _>(&rcpt_config.script, self, self.data.session_id)
             .await
             .and_then(|name| {
                 self.server
@@ -103,16 +99,17 @@ impl<T: SessionStream> Session<T> {
                     .map(|s| (s.clone(), name))
             });
 
+        let session_config = &self.server.core.smtp.session;
         if rcpt_script.is_some()
-            || !self.server.core.smtp.session.rcpt.rewrite.is_empty()
-            || self
-                .server
-                .core
-                .smtp
-                .session
+            || !rcpt_config.rewrite.is_empty()
+            || session_config
                 .milters
                 .iter()
                 .any(|m| m.run_on_stage.contains(&Stage::Rcpt))
+            || session_config
+                .hooks
+                .iter()
+                .any(|h| h.run_on_stage.contains(&Stage::Rcpt))
         {
             // Sieve filtering
             if let Some((script, script_id)) = rcpt_script {
@@ -158,11 +155,7 @@ impl<T: SessionStream> Session<T> {
             // Address rewriting
             if let Some(new_address) = self
                 .server
-                .eval_if::<String, _>(
-                    &self.server.core.smtp.session.rcpt.rewrite,
-                    self,
-                    self.data.session_id,
-                )
+                .eval_if::<String, _>(&rcpt_config.rewrite, self, self.data.session_id)
                 .await
             {
                 let rcpt = self.data.rcpt_to.last_mut().unwrap();
@@ -200,11 +193,7 @@ impl<T: SessionStream> Session<T> {
         let mut rcpt_members = None;
         if let Some(directory) = self
             .server
-            .eval_if::<String, _>(
-                &self.server.core.smtp.session.rcpt.directory,
-                self,
-                self.data.session_id,
-            )
+            .eval_if::<String, _>(&rcpt_config.directory, self, self.data.session_id)
             .await
             .and_then(|name| self.server.get_directory(&name))
         {
@@ -248,11 +237,7 @@ impl<T: SessionStream> Session<T> {
                 Ok(false) => {
                     if !self
                         .server
-                        .eval_if(
-                            &self.server.core.smtp.session.rcpt.relay,
-                            self,
-                            self.data.session_id,
-                        )
+                        .eval_if(&rcpt_config.relay, self, self.data.session_id)
                         .await
                         .unwrap_or(false)
                     {
@@ -283,11 +268,7 @@ impl<T: SessionStream> Session<T> {
             }
         } else if !self
             .server
-            .eval_if(
-                &self.server.core.smtp.session.rcpt.relay,
-                self,
-                self.data.session_id,
-            )
+            .eval_if(&rcpt_config.relay, self, self.data.session_id)
             .await
             .unwrap_or(false)
         {
@@ -309,8 +290,7 @@ impl<T: SessionStream> Session<T> {
                 .server
                 .core
                 .spam
-                .expiry
-                .grey_list
+                .grey_list_expiry
                 .filter(|_| self.data.authenticated_as.is_none())
             {
                 let from_addr = self

@@ -23,12 +23,12 @@ use dav_proto::{
 use groupware::{cache::GroupwareCache, file::FileNode};
 use http_proto::HttpResponse;
 use hyper::StatusCode;
-use jmap_proto::types::{
+use store::write::{BatchBuilder, now};
+use trc::AddContext;
+use types::{
     acl::Acl,
     collection::{Collection, SyncCollection},
 };
-use store::write::{BatchBuilder, now};
-use trc::AddContext;
 
 pub(crate) trait FileMkColRequestHandler: Sync + Send {
     fn handle_file_mkcol_request(
@@ -121,7 +121,7 @@ impl FileMkColRequestHandler for Server {
         batch
             .with_account_id(account_id)
             .with_collection(Collection::FileNode)
-            .create_document(document_id)
+            .with_document(document_id)
             .custom(ObjectIndexBuilder::<(), _>::new().with_changes(node))
             .caused_by(trc::location!())?;
         let etag = batch.etag();

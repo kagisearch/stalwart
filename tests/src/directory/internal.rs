@@ -4,7 +4,14 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use std::sync::Arc;
+
+use crate::{
+    directory::{DirectoryTest, IntoTestPrincipal, TestPrincipal},
+    store::cleanup::{store_assert_is_empty, store_destroy},
+};
 use ahash::AHashSet;
+use common::{Core, Inner, Server, config::storage::Storage};
 use directory::{
     Permission, QueryBy, QueryParams, Type,
     backend::{
@@ -16,15 +23,13 @@ use directory::{
         },
     },
 };
-use jmap_proto::types::collection::Collection;
+use http::management::stores::destroy_account_data;
 use mail_send::Credentials;
 use store::{
-    BitmapKey, Store, ValueKey,
-    roaring::RoaringBitmap,
-    write::{BatchBuilder, BitmapClass, ValueClass},
+    IterateParams, Store, ValueKey,
+    write::{BatchBuilder, ValueClass},
 };
-
-use crate::directory::{DirectoryTest, IntoTestPrincipal, TestPrincipal};
+use types::collection::Collection;
 
 #[tokio::test]
 async fn internal_directory() {
@@ -32,7 +37,7 @@ async fn internal_directory() {
 
     for (store_id, store) in config.stores.stores {
         println!("Testing internal directory with store {:?}", store_id);
-        store.destroy().await;
+        store_destroy(&store).await;
 
         // A principal without name should fail
         assert_eq!(
@@ -48,7 +53,7 @@ async fn internal_directory() {
                 TestPrincipal {
                     name: "john".into(),
                     description: Some("John Doe".into()),
-                    secrets: vec!["secret".into(), "secret2".into()],
+                    secrets: vec!["secret".into(), "$app$secret2".into()],
                     ..Default::default()
                 }
                 .into(),
@@ -149,7 +154,7 @@ async fn internal_directory() {
                 TestPrincipal {
                     name: "jane".into(),
                     description: Some("Jane Doe".into()),
-                    secrets: vec!["my_secret".into(), "my_secret2".into()],
+                    secrets: vec!["my_secret".into(), "$app$my_secret2".into()],
                     emails: vec!["jane@example.org".into()],
                     quota: 123,
                     ..Default::default()
@@ -189,7 +194,7 @@ async fn internal_directory() {
                 name: "jane".into(),
                 description: Some("Jane Doe".into()),
                 emails: vec!["jane@example.org".into()],
-                secrets: vec!["my_secret".into(), "my_secret2".into()],
+                secrets: vec!["my_secret".into(), "$app$my_secret2".into()],
                 quota: 123,
                 ..Default::default()
             })
@@ -367,7 +372,7 @@ async fn internal_directory() {
                 id: john_id,
                 name: "john".into(),
                 description: Some("John Doe".into()),
-                secrets: vec!["secret".into(), "secret2".into()],
+                secrets: vec!["secret".into(), "$app$secret2".into()],
                 emails: vec!["john@example.org".into()],
                 member_of: vec!["sales".into(), "support".into()],
                 lists: vec!["list".into()],
@@ -412,7 +417,7 @@ async fn internal_directory() {
                 id: john_id,
                 name: "john".into(),
                 description: Some("John Doe".into()),
-                secrets: vec!["secret".into(), "secret2".into()],
+                secrets: vec!["secret".into(), "$app$secret2".into()],
                 emails: vec!["john@example.org".into()],
                 member_of: vec!["sales".into()],
                 lists: vec!["list".into()],
@@ -656,7 +661,7 @@ async fn internal_directory() {
                     BatchBuilder::new()
                         .with_account_id(account_id)
                         .with_collection(Collection::Email)
-                        .create_document(document_id)
+                        .with_document(document_id)
                         .set(ValueClass::Property(0), "hello".as_bytes())
                         .build_all(),
                 )
@@ -677,7 +682,20 @@ async fn internal_directory() {
         }
 
         // Delete John's account and make sure his records are gone
+        let server = Server {
+            inner: Arc::new(Inner::default()),
+            core: Arc::new(Core {
+                storage: Storage {
+                    data: store.clone(),
+                    blob: store.clone().into(),
+                    fts: store.clone().into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        };
         store.delete_principal(QueryBy::Id(john_id)).await.unwrap();
+        destroy_account_data(&server, john_id, true).await.unwrap();
         assert_eq!(store.get_principal_id("john.doe").await.unwrap(), None);
         assert_eq!(
             store.email_to_id("john.doe@example.org").await.unwrap(),
@@ -708,18 +726,7 @@ async fn internal_directory() {
                 .map(|s| s.into())
                 .collect::<AHashSet<_>>()
         );
-        assert_eq!(
-            store
-                .get_bitmap(BitmapKey {
-                    account_id: john_id,
-                    collection: Collection::Email.into(),
-                    class: BitmapClass::DocumentIds,
-                    document_id: 0
-                })
-                .await
-                .unwrap(),
-            None
-        );
+        assert!(!account_has_emails(&store, john_id).await);
         assert_eq!(
             store
                 .get_value::<String>(ValueKey {
@@ -743,18 +750,7 @@ async fn internal_directory() {
             store.rcpt("jane@example.org").await.unwrap(),
             RcptType::Mailbox
         );
-        assert_eq!(
-            store
-                .get_bitmap(BitmapKey {
-                    account_id: jane_id,
-                    collection: Collection::Email.into(),
-                    class: BitmapClass::DocumentIds,
-                    document_id: 0
-                })
-                .await
-                .unwrap(),
-            Some(RoaringBitmap::from_sorted_iter([document_id]).unwrap())
-        );
+        assert!(account_has_emails(&store, jane_id).await);
         assert_eq!(
             store
                 .get_value::<String>(ValueKey {
@@ -767,6 +763,16 @@ async fn internal_directory() {
                 .unwrap(),
             Some("hello".into())
         );
+
+        // Clean up
+        destroy_account_data(&server, jane_id, true).await.unwrap();
+        for principal_name in ["jane", "list", "sales", "support", "example.org"] {
+            store
+                .delete_principal(QueryBy::Name(principal_name))
+                .await
+                .unwrap();
+        }
+        store_assert_is_empty(&store, store.clone().into(), true).await;
     }
 }
 
@@ -778,6 +784,11 @@ pub trait TestInternalDirectory {
     async fn create_test_list(&self, login: &str, name: &str, emails: &[&str]) -> u32;
     async fn set_test_quota(&self, login: &str, quota: u32);
     async fn add_permissions(&self, login: &str, permissions: impl IntoIterator<Item = Permission>);
+    async fn remove_permissions(
+        &self,
+        login: &str,
+        permissions: impl IntoIterator<Item = Permission>,
+    );
     async fn add_to_group(&self, login: &str, group: &str) -> ChangedPrincipals;
     async fn remove_from_group(&self, login: &str, group: &str) -> ChangedPrincipals;
     async fn remove_test_alias(&self, login: &str, alias: &str);
@@ -816,6 +827,10 @@ impl TestInternalDirectory for Store {
                     PrincipalField::Roles,
                     PrincipalValue::String(role.into()),
                 ),
+                PrincipalUpdate::add_item(
+                    PrincipalField::EnabledPermissions,
+                    PrincipalValue::String(Permission::UnlimitedRequests.name().into()),
+                ),
             ]))
             .await
             .unwrap();
@@ -836,6 +851,12 @@ impl TestInternalDirectory for Store {
                     .with_field(
                         PrincipalField::Roles,
                         PrincipalValue::StringList(vec![role.into()]),
+                    )
+                    .with_field(
+                        PrincipalField::EnabledPermissions,
+                        PrincipalValue::StringList(vec![
+                            Permission::UnlimitedRequests.name().into(),
+                        ]),
                     ),
                 None,
                 None,
@@ -936,6 +957,28 @@ impl TestInternalDirectory for Store {
         .unwrap();
     }
 
+    async fn remove_permissions(
+        &self,
+        login: &str,
+        permissions: impl IntoIterator<Item = Permission>,
+    ) {
+        self.update_principal(
+            UpdatePrincipal::by_name(login).with_updates(
+                permissions
+                    .into_iter()
+                    .map(|p| {
+                        PrincipalUpdate::remove_item(
+                            PrincipalField::EnabledPermissions,
+                            PrincipalValue::String(p.name().to_string()),
+                        )
+                    })
+                    .collect(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
     async fn add_to_group(&self, login: &str, group: &str) -> ChangedPrincipals {
         self.update_principal(UpdatePrincipal::by_name(login).with_updates(vec![
             PrincipalUpdate::add_item(
@@ -988,6 +1031,35 @@ impl TestInternalDirectory for Store {
             }
         }
     }
+}
+
+async fn account_has_emails(store: &Store, account_id: u32) -> bool {
+    let mut has_emails = false;
+    store
+        .iterate(
+            IterateParams::new(
+                ValueKey {
+                    account_id,
+                    collection: Collection::Email.into(),
+                    document_id: 0,
+                    class: ValueClass::Property(0),
+                },
+                ValueKey {
+                    account_id,
+                    collection: Collection::Email.into(),
+                    document_id: u32::MAX,
+                    class: ValueClass::Property(u8::MAX),
+                },
+            )
+            .no_values(),
+            |_, _| {
+                has_emails = true;
+                Ok(false)
+            },
+        )
+        .await
+        .unwrap();
+    has_emails
 }
 
 async fn assert_list_members(

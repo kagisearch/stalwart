@@ -7,6 +7,7 @@
 use super::assert_is_unique_uid;
 use crate::{
     DavError, DavErrorCondition, DavMethod,
+    calendar::ItipPrecondition,
     common::{
         ETag, ExtractETag,
         lock::{LockRequestHandler, ResourceState},
@@ -33,13 +34,17 @@ use groupware::{
 };
 use http_proto::HttpResponse;
 use hyper::StatusCode;
-use jmap_proto::types::{
+use std::collections::HashSet;
+use store::write::{BatchBuilder, now};
+use store::{
+    ValueKey,
+    write::{AlignedBytes, Archive},
+};
+use trc::AddContext;
+use types::{
     acl::Acl,
     collection::{Collection, SyncCollection},
 };
-use std::collections::HashSet;
-use store::write::{BatchBuilder, now};
-use trc::AddContext;
 
 pub(crate) trait CalendarUpdateRequestHandler: Sync + Send {
     fn handle_calendar_update_request(
@@ -120,7 +125,12 @@ impl CalendarUpdateRequestHandler for Server {
 
             // Update
             let event_ = self
-                .get_archive(account_id, Collection::CalendarEvent, document_id)
+                .store()
+                .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                    account_id,
+                    Collection::CalendarEvent,
+                    document_id,
+                ))
                 .await
                 .caused_by(trc::location!())?
                 .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
@@ -165,17 +175,6 @@ impl CalendarUpdateRequestHandler for Server {
             if ical == event.inner.data.event {
                 // No changes, return existing event
                 return Ok(HttpResponse::new(StatusCode::NO_CONTENT));
-            }
-
-            // Validate quota
-            let extra_bytes =
-                (bytes.len() as u64).saturating_sub(u32::from(event.inner.size) as u64);
-            if extra_bytes > 0 {
-                self.has_available_quota(
-                    &self.get_resource_token(access_token, account_id).await?,
-                    extra_bytes,
-                )
-                .await?;
             }
 
             // Validate iCal
@@ -276,7 +275,16 @@ impl CalendarUpdateRequestHandler for Server {
                     }
                 }
             }
-            let nudge_queue = next_email_alarm.is_some() || itip_messages.is_some();
+            // Validate quota
+            let extra_bytes =
+                (bytes.len() as u64).saturating_sub(u32::from(event.inner.size) as u64);
+            if extra_bytes > 0 {
+                self.has_available_quota(
+                    &self.get_resource_token(access_token, account_id).await?,
+                    extra_bytes,
+                )
+                .await?;
+            }
 
             // Prepare write batch
             let mut batch = BatchBuilder::new();
@@ -299,9 +307,7 @@ impl CalendarUpdateRequestHandler for Server {
                     .caused_by(trc::location!())?;
             }
             self.commit_batch(batch).await.caused_by(trc::location!())?;
-            if nudge_queue {
-                self.notify_task_queue();
-            }
+            self.notify_task_queue();
 
             Ok(HttpResponse::new(StatusCode::NO_CONTENT)
                 .with_etag_opt(etag)
@@ -337,15 +343,6 @@ impl CalendarUpdateRequestHandler for Server {
                 DavMethod::PUT,
             )
             .await?;
-
-            // Validate quota
-            if !bytes.is_empty() {
-                self.has_available_quota(
-                    &self.get_resource_token(access_token, account_id).await?,
-                    bytes.len() as u64,
-                )
-                .await?;
-            }
 
             // Validate ical object
             assert_is_unique_uid(
@@ -408,7 +405,15 @@ impl CalendarUpdateRequestHandler for Server {
                     }
                 }
             }
-            let nudge_queue = next_email_alarm.is_some() || itip_messages.is_some();
+
+            // Validate quota
+            if !bytes.is_empty() {
+                self.has_available_quota(
+                    &self.get_resource_token(access_token, account_id).await?,
+                    bytes.len() as u64,
+                )
+                .await?;
+            }
 
             // Prepare write batch
             let mut batch = BatchBuilder::new();
@@ -434,10 +439,7 @@ impl CalendarUpdateRequestHandler for Server {
                     .caused_by(trc::location!())?;
             }
             self.commit_batch(batch).await.caused_by(trc::location!())?;
-
-            if nudge_queue {
-                self.notify_task_queue();
-            }
+            self.notify_task_queue();
 
             Ok(HttpResponse::new(StatusCode::CREATED)
                 .with_etag_opt(etag)

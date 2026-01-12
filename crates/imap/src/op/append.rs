@@ -4,8 +4,12 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::{sync::Arc, time::Instant};
-
+use super::{ImapContext, ToModSeq};
+use crate::{
+    core::{ImapUidToId, MailboxId, SelectedMailbox, Session, SessionData},
+    spawn_op,
+};
+use common::{ipc::PushNotification, listener::SessionStream};
 use directory::Permission;
 use email::message::ingest::{EmailIngest, IngestEmail, IngestSource};
 use imap_proto::{
@@ -13,16 +17,13 @@ use imap_proto::{
     protocol::{append::Arguments, select::HighestModSeq},
     receiver::Request,
 };
-
-use crate::{
-    core::{ImapUidToId, MailboxId, SelectedMailbox, Session, SessionData},
-    spawn_op,
-};
-use common::listener::SessionStream;
-use jmap_proto::types::{acl::Acl, keyword::Keyword, state::StateChange, type_state::DataType};
 use mail_parser::MessageParser;
-
-use super::{ImapContext, ToModSeq};
+use std::{sync::Arc, time::Instant};
+use types::{
+    acl::Acl,
+    keyword::Keyword,
+    type_state::{DataType, StateChange},
+};
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_append(&mut self, request: Request<Command>) -> trc::Result<()> {
@@ -93,7 +94,6 @@ impl<T: SessionStream> SessionData<T> {
             .get_access_token(mailbox.account_id)
             .await
             .imap_ctx(&arguments.tag, trc::location!())?;
-        let spam_train = self.server.email_bayes_can_train(&access_token);
 
         // Append messages
         let mut response = StatusResponse::completed(Command::Append);
@@ -105,13 +105,14 @@ impl<T: SessionStream> SessionData<T> {
                 .email_ingest(IngestEmail {
                     raw_message: &message.message,
                     message: MessageParser::new().parse(&message.message),
+                    blob_hash: None,
                     access_token: &access_token,
                     mailbox_ids: vec![mailbox_id],
                     keywords: message.flags.into_iter().map(Keyword::from).collect(),
                     received_at: message.received_at.map(|d| d as u64),
-                    source: IngestSource::Imap,
-                    spam_classify: false,
-                    spam_train,
+                    source: IngestSource::Imap {
+                        train_classifier: true,
+                    },
                     session_id: self.session_id,
                 })
                 .await
@@ -119,7 +120,7 @@ impl<T: SessionStream> SessionData<T> {
                 Ok(email) => {
                     created_ids.push(ImapUidToId {
                         uid: email.imap_uids[0],
-                        id: email.id.document_id(),
+                        id: email.document_id,
                     });
                     last_change_id = Some(email.change_id);
                 }
@@ -143,12 +144,13 @@ impl<T: SessionStream> SessionData<T> {
         // Broadcast changes
         if let Some(change_id) = last_change_id {
             self.server
-                .broadcast_state_change(
-                    StateChange::new(account_id, change_id)
+                .broadcast_push_notification(PushNotification::StateChange(
+                    StateChange::new(account_id)
+                        .with_change_id(change_id)
                         .with_change(DataType::Email)
                         .with_change(DataType::Mailbox)
                         .with_change(DataType::Thread),
-                )
+                ))
                 .await;
         }
 

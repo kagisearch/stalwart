@@ -10,6 +10,7 @@ use crate::{
     backend::{
         RcptType,
         internal::{
+            SpecialSecrets,
             lookup::DirectoryStore,
             manage::{self, ManageDirectory, UpdatePrincipal},
         },
@@ -97,13 +98,33 @@ impl SqlDirectory {
                                 .await
                                 .caused_by(trc::location!())?;
 
-                            if !secrets.rows.is_empty() {
-                                principal.secrets = secrets.into();
+                            for row in secrets.rows {
+                                for value in row.values {
+                                    if let Value::Text(secret) = value {
+                                        let secret = secret.into_owned();
+
+                                        if secret.is_otp_secret() {
+                                            if !principal.data.iter().any(|data| {
+                                                matches!(data, PrincipalData::OtpAuth(_))
+                                            }) {
+                                                principal.data.push(PrincipalData::OtpAuth(secret));
+                                            }
+                                        } else if secret.is_app_secret() {
+                                            principal.data.push(PrincipalData::AppPassword(secret));
+                                        } else if !principal
+                                            .data
+                                            .iter()
+                                            .any(|data| matches!(data, PrincipalData::Password(_)))
+                                        {
+                                            principal.data.push(PrincipalData::Password(secret));
+                                        }
+                                    }
+                                }
                             }
                         }
 
                         if principal
-                            .verify_secret(secret, false)
+                            .verify_secret(secret, false, false)
                             .await
                             .caused_by(trc::location!())?
                         {
@@ -127,7 +148,6 @@ impl SqlDirectory {
 
         // Obtain members
         if by.return_member_of && !self.mappings.query_members.is_empty() {
-            let mut data = Vec::new();
             for row in self
                 .sql_store
                 .sql_query::<Rows>(
@@ -138,35 +158,44 @@ impl SqlDirectory {
                 .caused_by(trc::location!())?
                 .rows
             {
-                if let Some(Value::Text(account_id)) = row.values.first() {
-                    data.push(
-                        self.data_store
-                            .get_or_create_principal_id(account_id, Type::Group)
-                            .await
-                            .caused_by(trc::location!())?,
-                    );
+                if let Some(Value::Text(account_name)) = row.values.first() {
+                    let account_id = self
+                        .data_store
+                        .get_or_create_principal_id(account_name, Type::Group)
+                        .await
+                        .caused_by(trc::location!())?;
+                    external_principal
+                        .data
+                        .push(PrincipalData::MemberOf(account_id));
                 }
-            }
-            if !data.is_empty() {
-                external_principal.data.push(PrincipalData::MemberOf(data));
             }
         }
 
         // Obtain emails
         if !self.mappings.query_emails.is_empty() {
-            let rows = self
+            let mut rows = self
                 .sql_store
                 .sql_query::<Rows>(
                     &self.mappings.query_emails,
                     vec![external_principal.name().into()],
                 )
                 .await
-                .caused_by(trc::location!())?;
-            external_principal.emails.extend(
-                rows.rows
-                    .into_iter()
-                    .flat_map(|v| v.values.into_iter().map(|v| v.into_lower_string())),
-            );
+                .caused_by(trc::location!())?
+                .rows
+                .into_iter()
+                .flat_map(|v| v.values.into_iter().map(|v| v.into_lower_string()));
+
+            if external_principal.primary_email().is_none()
+                && let Some(email) = rows.next()
+            {
+                external_principal
+                    .data
+                    .push(PrincipalData::PrimaryEmail(email));
+            }
+
+            external_principal
+                .data
+                .extend(rows.map(PrincipalData::EmailAlias));
         }
 
         // Obtain account ID if not available
@@ -187,7 +216,7 @@ impl SqlDirectory {
         };
 
         // Keep the internal store up to date with the SQL server
-        let changes = principal.update_external(external_principal, true);
+        let changes = principal.update_external(external_principal);
         if !changes.is_empty() {
             self.data_store
                 .update_principal(
@@ -266,12 +295,14 @@ impl SqlMappings {
 
         let mut principal = Principal::new(u32::MAX, Type::Individual);
         let mut role = ROLE_USER;
+        let mut has_primary_email = false;
+        let mut secret = None;
 
         if let Some(row) = rows.rows.into_iter().next() {
             for (name, value) in rows.names.into_iter().zip(row.values) {
                 if name.eq_ignore_ascii_case(&self.column_secret) {
                     if let Value::Text(text) = value {
-                        principal.secrets.push(text.as_ref().into());
+                        secret = Some(text.into_owned());
                     }
                 } else if name.eq_ignore_ascii_case(&self.column_type) {
                     match value.to_str().as_ref() {
@@ -287,21 +318,37 @@ impl SqlMappings {
                     }
                 } else if name.eq_ignore_ascii_case(&self.column_description) {
                     if let Value::Text(text) = value {
-                        principal.description = Some(text.as_ref().into());
+                        principal
+                            .data
+                            .push(PrincipalData::Description(text.as_ref().into()));
                     }
                 } else if name.eq_ignore_ascii_case(&self.column_email) {
                     if let Value::Text(text) = value {
-                        principal.emails.push(text.to_lowercase());
+                        if !has_primary_email {
+                            has_primary_email = true;
+                            principal
+                                .data
+                                .push(PrincipalData::PrimaryEmail(text.to_lowercase()));
+                        } else {
+                            principal
+                                .data
+                                .push(PrincipalData::EmailAlias(text.to_lowercase()));
+                        }
                     }
                 } else if name.eq_ignore_ascii_case(&self.column_quota)
                     && let Value::Integer(quota) = value
+                    && quota > 0
                 {
-                    principal.quota = (quota as u64).into();
+                    principal.data.push(PrincipalData::DiskQuota(quota as u64));
                 }
             }
         }
 
-        principal.data.push(PrincipalData::Roles(vec![role]));
+        if let Some(secret) = secret {
+            principal.data.push(PrincipalData::Password(secret));
+        }
+
+        principal.data.push(PrincipalData::Role(role));
 
         Ok(Some(principal))
     }

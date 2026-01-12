@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use crate::Principal;
+use crate::PrincipalData;
 use argon2::Argon2;
 use compact_str::ToCompactString;
 use mail_builder::encoders::base64::base64_encode;
@@ -19,91 +21,80 @@ use sha2::Sha512;
 use tokio::sync::oneshot;
 use totp_rs::TOTP;
 
-use crate::Principal;
-use crate::backend::internal::SpecialSecrets;
-
 impl Principal {
-    pub async fn verify_secret(&self, mut code: &str, only_app_pass: bool) -> trc::Result<bool> {
-        let mut totp_token = None;
-        let mut is_totp_token_missing = false;
-        let mut is_totp_required = false;
-        let mut is_totp_verified = false;
-        let mut is_authenticated = false;
-        let mut is_app_authenticated = false;
+    pub async fn verify_secret(
+        &self,
+        code: &str,
+        only_app_pass: bool,
+        is_ordered: bool,
+    ) -> trc::Result<bool> {
+        let mut seen_password = false;
+        let mut password = None;
+        let mut otp_auth = None;
 
-        for secret in self.secrets.iter() {
-            if secret.is_otp_auth() {
-                if !is_totp_verified && !is_totp_token_missing {
-                    is_totp_required = true;
-
-                    let totp_token = if let Some(totp_token) = totp_token {
-                        totp_token
-                    } else if let Some((_code, _totp_token)) =
-                        code.rsplit_once('$').filter(|(c, t)| {
-                            !c.is_empty()
-                                && (6..=8).contains(&t.len())
-                                && t.as_bytes().iter().all(|b| b.is_ascii_digit())
-                        })
-                    {
-                        totp_token = Some(_totp_token);
-                        code = _code;
-                        _totp_token
-                    } else {
-                        is_totp_token_missing = true;
-                        continue;
-                    };
-
-                    // Token needs to validate with at least one of the TOTP secrets
-                    is_totp_verified = TOTP::from_url(secret)
-                        .map_err(|err| {
-                            trc::AuthEvent::Error
-                                .reason(err)
-                                .details(secret.to_compact_string())
-                        })?
-                        .check_current(totp_token)
-                        .unwrap_or(false);
+        for item in &self.data {
+            match item {
+                PrincipalData::OtpAuth(secret) => {
+                    if !only_app_pass {
+                        otp_auth = Some(secret);
+                    }
+                    seen_password = true;
                 }
-            } else if !is_authenticated && !is_app_authenticated {
-                if let Some((_, app_secret)) =
-                    secret.strip_prefix("$app$").and_then(|s| s.split_once('$'))
-                {
-                    is_app_authenticated = verify_secret_hash(app_secret, code).await?;
-                } else if !only_app_pass {
-                    is_authenticated = verify_secret_hash(secret, code).await?;
+                PrincipalData::Password(secret) => {
+                    if !only_app_pass {
+                        password = Some(secret);
+                    }
+                    seen_password = true;
+                }
+                PrincipalData::AppPassword(secret) => {
+                    // App passwords do not require TOTP
+                    if let Some((_, app_secret)) =
+                        secret.strip_prefix("$app$").and_then(|s| s.split_once('$'))
+                        && verify_secret_hash(app_secret, code).await?
+                    {
+                        return Ok(true);
+                    }
+
+                    seen_password = true;
+                }
+                _ => {
+                    if seen_password && is_ordered {
+                        // Password-related secrets are expected to be at the beginning of the list
+                        break;
+                    }
                 }
             }
         }
 
-        if is_authenticated {
-            if !is_totp_required {
-                // Authenticated without TOTP enabled
+        // Validate TOTP
+        match (otp_auth, password) {
+            (Some(otp_auth), Some(password)) => {
+                if let Some((code, totp_token)) = code.rsplit_once('$').filter(|(c, t)| {
+                    !c.is_empty()
+                        && (6..=8).contains(&t.len())
+                        && t.as_bytes().iter().all(|b| b.is_ascii_digit())
+                }) {
+                    let result = verify_secret_hash(password, code).await?
+                        && TOTP::from_url(otp_auth)
+                            .map_err(|err| {
+                                trc::AuthEvent::Error
+                                    .reason(err)
+                                    .details(otp_auth.to_compact_string())
+                            })?
+                            .check_current(totp_token)
+                            .unwrap_or(false);
+                    Ok(result)
+                } else if verify_secret_hash(password, code).await? {
+                    // Only let the client know if the TOTP code is missing
+                    // if the password is correct
 
-                Ok(true)
-            } else if is_totp_token_missing {
-                // Only let the client know if the TOTP code is missing
-                // if the password is correct
-
-                Err(trc::AuthEvent::MissingTotp.into_err())
-            } else {
-                // Return the TOTP verification status
-
-                Ok(is_totp_verified)
-            }
-        } else if is_app_authenticated {
-            // App passwords do not require TOTP
-
-            Ok(true)
-        } else {
-            if is_totp_verified {
-                // TOTP URL appeared after password hash in secrets list
-                for secret in &self.secrets {
-                    if secret.is_password() && verify_secret_hash(secret, code).await? {
-                        return Ok(true);
-                    }
+                    Err(trc::AuthEvent::MissingTotp.into_err())
+                } else {
+                    Ok(false)
                 }
             }
-
-            Ok(false)
+            (None, Some(password)) => verify_secret_hash(password, code).await,
+            _ => Ok(false),
         }
     }
 }

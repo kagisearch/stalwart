@@ -2,6 +2,147 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [0.15.3] - 2025-12-29
+
+If you are upgrading from v0.14.x and below, this version includes **multiple breaking changes**. Please read the [upgrading documentation](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING/v0_15.md) for more information on how to upgrade from previous versions.
+If you are upgrading from v0.15.x, replace the binary and update the webadmin.
+
+## Added
+- Polish locale support (contributed by @mrxkp) (#2480)
+
+## Changed
+
+## Fixed
+- Meilisearch: Return correct error messages when failing to create indexes (#2574)
+- PostgreSQL search: Truncate emails to 650kb for full-text search indexing.
+- FoundationDB search: Batch large transactions (#2567).
+- Spam filter: Fix training sample size checks
+- IMAP: Fix UTF7 encoding with Emojis (contributed by @dojiong) (#2564).
+
+## [0.15.2] - 2025-12-22
+
+If you are upgrading from v0.14.x and below, this version includes **multiple breaking changes**. Please read the [upgrading documentation](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING/v0_15.md) for more information on how to upgrade from previous versions.
+If you are upgrading from v0.15.x, replace the binary and update the webadmin.
+
+## Added
+- OAuth: Add device authorization endpoint (#2225).
+
+## Changed
+- Antispam: Only auto-learn spam from traps or multiple RBL hits.
+
+## Fixed
+- mySQL search: Use `MEDIUMTEXT` field type for email body and attachments (#2544).
+- PostgreSQL search: Truncate large text fields.
+- ElasticSearch: Implement pagination (#2551).
+- Antispam: Fix `NO_SPACE_IN_FROM` spam tag detection logic (#2372).
+- IMAP: Fix shared folder double nesting (test suite credits to @ochnygosch) (#2358).
+- JMAP: Use latest `Received` header in JMAP `Email/import` (credits to @apexskier) (#2374).
+- JMAP: Return unsorted search results when the index is not ready (#2544).
+- LDAP: Lowercase attribute comparison (credits to @pdf) (#2363).
+- CLI: Fix same-host JMAP redirection on non-standard ports (#2271).
+
+## [0.15.1] - 2025-12-17
+
+This version includes **multiple breaking changes**. If you are upgrading from v0.14.x and below, please read the [upgrading documentation](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING/v0_15.md) for more information on how to upgrade from previous versions.
+
+## Added
+
+## Changed
+
+## Fixed
+- PostgreSQL: Sanitize search index values (#2533)
+- Elasticsearch: Ignore `resource_already_exists_exception` errors when creating indexes (#2535)
+- Migrate 0.13.x data (#2534)
+
+## [0.15.0] - 2025-12-16
+
+This version includes **multiple breaking changes**. Please read the [upgrading documentation](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING/v0_15.md) for more information on how to upgrade from previous versions.
+
+## Added
+- Linear spam classifier using FTRL-Proximal and feature/cuckoo hashing.
+- Meilisearch store backend implementation (#1482).
+- PostgreSQL and mySQL native full-text search support.
+- Multiple performance improvements and database access optimizations.
+- Encryption-at-rest: Spam training privacy setting. 
+- Enterprise: Undelete e-mail feature now includes From/Subject/Received information.
+- IMAP: Implemented new keywords and mailbox attributes described in [draft-ietf-mailmaint-messageflag-mailboxattribute-13](https://datatracker.ietf.org/doc/html/draft-ietf-mailmaint-messageflag-mailboxattribute-13)
+
+## Changed
+- IMAP: Always return special use flags in responses.
+
+## Fixed
+- JMAP: `FileNode/set` fails to delete files (#2485).
+- JMAP: Return error when using `blobId` in JSContact and JSCalendar (#2431).
+- Directory: Deletion of list or domain issues (#2415).
+- MTA: Headers and body stripped from mail delivery subsystem failure notifications (#2344).
+- MTA: Hooks only run if sieve script, milter or rewrite is configured (#2317).
+- Autodiscover: Endpoint should be case insensitive (#2440).
+- Housekeeper: Panic during DST transition (#2366).
+- Import/Export: Fix import/export utility (#1882).
+- Enterprise: Remove tenant admin permissions when license is invalid.
+
+## [0.14.1] - 2025-10-28
+
+If you are upgrading from v0.13.4 and below, this version includes **breaking changes** to the internal directory, calendar and contacts. Please read the [upgrading documentation](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING/v0_14.md) for more information on how to upgrade from previous versions.
+
+## Added
+- Autoconfig for CalDAV, CardDAV and WebDAV (#1937)
+
+## Changed
+- HTTP: Remove HTTP STS `preload` directive.
+
+## Fixed
+- Directory: Keep OTP Auth and AppPasswords unless the remote directory provides new ones (#2319)
+- JMAP: Fix `ContactCard/set` and `CalendarEvent/set` destroy methods (#2308).
+
+## [0.14.0] - 2025-10-22
+
+If you are upgrading from v0.13.4 and below, this version includes **breaking changes** to the internal directory, calendar and contacts. Please read the [upgrading documentation](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING/v0_14.md) for more information on how to upgrade from previous versions.
+
+## Added
+- JMAP for Calendars ([draft-ietf-jmap-calendars](https://datatracker.ietf.org/doc/draft-ietf-jmap-calendars/)).
+- JMAP for Contacts  ([RFC 9610](https://datatracker.ietf.org/doc/rfc9610/)).
+- JMAP for File Storage ([draft-ietf-jmap-filenode](https://datatracker.ietf.org/doc/draft-ietf-jmap-filenode/)).
+- JMAP Sharing ([RFC 9670](https://datatracker.ietf.org/doc/rfc9670/))
+- CalDAV: support for `supported-calendar-component-set` (#1893)
+- i18n: Greek language support (contributed by @infl00p)
+- i18n: Swedish language support (contributed by @purung)
+
+## Changed
+- **Breaking Database Changes** (migrated automatically on first start):
+  - Internal directory schema changed.
+  - Calendar and Contacts storage schema changed.
+  - Sieve scripts storage schema changed.
+  - Push Subscriptions storage schema changed.
+- Replaced `sieve.untrusted.limits.max-scripts` and `jmap.push.max-total` with `object-quota.*` settings. 
+- Cluster node roles now allow sharding.
+
+
+## Fixed
+- Push Subscription: Clean-up of expired subscriptions and cluster notification of changes (#1248)
+- CalDAV: Per-user CalDAV properties (#2058)
+
+## [0.13.4] - 2025-09-30
+
+If you are upgrading from v0.11.x or v0.12.x, this version includes **breaking changes** to the message queue and MTA configuration. Please read the [UPGRADING.md](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING.md) file for more information on how to upgrade from previous versions.
+
+## Added
+
+## Changed
+- JMAP: Protocol layer rewrite for zero-copy deserialization and architectural improvements.
+
+## Fixed
+- IMAP: Unbounded memory allocation in request parser ([CVE-2025-61600 ](https://github.com/stalwartlabs/stalwart/security/advisories/GHSA-8jqj-qj5p-v5rr)).
+- IMAP: Wrong permission checked for GETACL.
+- JMAP: References to previous method fail when there are no results (#1507).
+- JMAP: Enforce quota checks on `Blob/copy`.
+- JMAP: `Mailbox/get` fails without `accountId` argument (#1936).
+- JMAP: Do not return `invalidProperties` when email update doesn't contain changes (#1139)
+- iTIP: Include date properties in `REPLY` (#2102).
+- OIDC: Do not set `username` field if it is the same as the `email` field.
+- Telemetry: Fix `calculateMetrics` housekeeper task (#2155).
+- Directory: Always use `rsplit` to extract the domain part from email addresses.
+
 ## [0.13.3] - 2025-09-10
 
 If you are upgrading from v0.11.x or v0.12.x, this version includes **breaking changes** to the message queue and MTA configuration. Please read the [UPGRADING.md](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING.md) file for more information on how to upgrade from previous versions.
@@ -26,9 +167,9 @@ If you are upgrading from v0.11.x or v0.12.x, this version includes **breaking c
 - IMAP: Include `administer` permission in ACL responses.
 - IMAP: Add owner rights to ACL get responses.
 - IMAP: Do not auto-train Bayes when moving messages from Junk to Trash.
-- IMAP/ManageSieve: Increase maximum quoted argument size (fixes #2039).
-- CalDAV: Limit recurrence expansions in calendar reports.
-- WebDAV: Do not fix percent encoding on WebDAV FS (closes #2036).
+- IMAP/ManageSieve: Increase maximum quoted argument size (#2039).
+- CalDAV: Limit recurrence expansions in calendar reports ([CVE-2025-59045](https://github.com/stalwartlabs/stalwart/security/advisories/GHSA-xv4r-q6gr-6pfg)).
+- WebDAV: Do not fix percent encoding on WebDAV FS (#2036).
 
 ## [0.13.2] - 2025-07-28
 

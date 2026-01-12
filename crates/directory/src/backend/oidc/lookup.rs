@@ -104,7 +104,7 @@ impl OpenIdDirectory {
                             .ok_or_else(|| manage::not_found(id).caused_by(trc::location!()))?;
 
                         // Keep the internal store up to date with the OIDC server
-                        let changes = principal.update_external(external_principal, false);
+                        let changes = principal.update_external(external_principal);
                         if !changes.is_empty() {
                             self.data_store
                                 .update_principal(
@@ -181,16 +181,18 @@ impl BuildPrincipal for OpenIdResponse {
             .as_ref()
             .and_then(|field| self.take_field(field));
 
+        // Build principal
+        let mut data = Vec::with_capacity(3);
+        data.push(PrincipalData::PrimaryEmail(email));
+        if let Some(name) = full_name {
+            data.push(PrincipalData::Description(name));
+        }
+        data.push(PrincipalData::Role(ROLE_USER));
         Ok(Principal {
             id: u32::MAX,
             typ: Type::Individual,
             name: username,
-            description: full_name,
-            secrets: Default::default(),
-            emails: vec![email],
-            quota: Default::default(),
-            tenant: Default::default(),
-            data: vec![PrincipalData::Roles(vec![ROLE_USER])],
+            data,
         })
     }
 

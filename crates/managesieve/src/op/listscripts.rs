@@ -4,15 +4,17 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::time::Instant;
-
+use crate::core::{Session, StatusResponse};
 use common::listener::SessionStream;
 use directory::Permission;
-use email::sieve::SieveScript;
-use jmap_proto::types::collection::Collection;
+use email::sieve::{SieveScript, ingest::SieveScriptIngest};
+use std::time::Instant;
+use store::{
+    ValueKey,
+    write::{AlignedBytes, Archive},
+};
 use trc::AddContext;
-
-use crate::core::{Session, StatusResponse};
+use types::{collection::Collection, field::SieveField};
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_listscripts(&mut self) -> trc::Result<Vec<u8>> {
@@ -23,10 +25,9 @@ impl<T: SessionStream> Session<T> {
         let account_id = self.state.access_token().primary_id();
         let document_ids = self
             .server
-            .get_document_ids(account_id, Collection::SieveScript)
+            .document_ids(account_id, Collection::SieveScript, SieveField::Name)
             .await
-            .caused_by(trc::location!())?
-            .unwrap_or_default();
+            .caused_by(trc::location!())?;
 
         if document_ids.is_empty() {
             return Ok(StatusResponse::ok("").into_bytes());
@@ -34,11 +35,17 @@ impl<T: SessionStream> Session<T> {
 
         let mut response = Vec::with_capacity(128);
         let count = document_ids.len();
+        let active_script_id = self.server.sieve_script_get_active_id(account_id).await?;
 
         for document_id in document_ids {
             if let Some(script_) = self
                 .server
-                .get_archive(account_id, Collection::SieveScript, document_id)
+                .store()
+                .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                    account_id,
+                    Collection::SieveScript,
+                    document_id,
+                ))
                 .await
                 .caused_by(trc::location!())?
             {
@@ -52,7 +59,7 @@ impl<T: SessionStream> Session<T> {
                     }
                     response.push(*ch);
                 }
-                if script.is_active {
+                if active_script_id == Some(document_id) {
                     response.extend_from_slice(b"\" ACTIVE\r\n");
                 } else {
                     response.extend_from_slice(b"\"\r\n");

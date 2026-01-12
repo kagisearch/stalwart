@@ -5,42 +5,48 @@
  */
 
 pub mod capability;
-pub mod echo;
+pub mod deserialize;
 pub mod method;
 pub mod parser;
 pub mod reference;
 pub mod websocket;
 
-use std::{
-    collections::HashMap,
-    fmt::{Debug, Display},
-};
-
+use self::method::MethodName;
 use crate::{
     method::{
+        availability::GetAvailabilityRequest,
         changes::ChangesRequest,
-        copy::{self, CopyBlobRequest, CopyRequest},
-        get::{self, GetRequest},
+        copy::{CopyBlobRequest, CopyRequest},
+        get::GetRequest,
         import::ImportEmailRequest,
         lookup::BlobLookupRequest,
-        parse::ParseEmailRequest,
-        query::{self, QueryRequest},
+        parse::ParseRequest,
+        query::QueryRequest,
         query_changes::QueryChangesRequest,
         search_snippet::GetSearchSnippetRequest,
-        set::{self, SetRequest},
+        set::SetRequest,
         upload::BlobUploadRequest,
         validate::ValidateSieveScriptRequest,
     },
-    parser::{JsonObjectParser, json::Parser},
-    types::any_id::AnyId,
+    object::{
+        AnyId, addressbook::AddressBook, blob::Blob, calendar::Calendar,
+        calendar_event::CalendarEvent, calendar_event_notification::CalendarEventNotification,
+        contact::ContactCard, email::Email, email_submission::EmailSubmission, file_node::FileNode,
+        identity::Identity, mailbox::Mailbox, participant_identity::ParticipantIdentity,
+        principal::Principal, push_subscription::PushSubscription, quota::Quota,
+        share_notification::ShareNotification, sieve::Sieve, thread::Thread,
+        vacation_response::VacationResponse,
+    },
+    request::{capability::CapabilityIds, reference::MaybeIdReference},
 };
+use jmap_tools::{Null, Value};
+use std::{collections::HashMap, fmt::Debug, str::FromStr};
+use utils::map::vec_map::VecMap;
 
-use self::{echo::Echo, method::MethodName};
-
-#[derive(Debug, Default)]
-pub struct Request {
-    pub using: u32,
-    pub method_calls: Vec<Call<RequestMethod>>,
+#[derive(Debug)]
+pub struct Request<'x> {
+    pub using: CapabilityIds,
+    pub method_calls: Vec<Call<RequestMethod<'x>>>,
     pub created_ids: Option<HashMap<String, AnyId>>,
 }
 
@@ -51,66 +57,198 @@ pub struct Call<T> {
     pub method: T,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct RequestProperty {
-    pub hash: [u128; 2],
-    pub is_ref: bool,
-}
-
 #[derive(Debug)]
-pub enum RequestMethod {
-    Get(GetRequest<get::RequestArguments>),
-    Set(SetRequest<set::RequestArguments>),
+pub enum RequestMethod<'x> {
+    Get(GetRequestMethod),
+    Set(SetRequestMethod<'x>),
     Changes(ChangesRequest),
-    Copy(CopyRequest<copy::RequestArguments>),
-    CopyBlob(CopyBlobRequest),
+    Copy(CopyRequestMethod<'x>),
     ImportEmail(ImportEmailRequest),
-    ParseEmail(ParseEmailRequest),
-    QueryChanges(QueryChangesRequest),
-    Query(QueryRequest<query::RequestArguments>),
+    Parse(ParseRequestMethod),
+    Query(QueryRequestMethod),
+    QueryChanges(QueryChangesRequestMethod),
     SearchSnippet(GetSearchSnippetRequest),
     ValidateScript(ValidateSieveScriptRequest),
     LookupBlob(BlobLookupRequest),
     UploadBlob(BlobUploadRequest),
-    Echo(Echo),
+    Echo(Value<'x, Null, Null>),
     Error(trc::Error),
 }
 
-impl JsonObjectParser for RequestProperty {
-    fn parse(parser: &mut Parser<'_>) -> trc::Result<Self>
+#[derive(Debug)]
+pub enum GetRequestMethod {
+    Email(GetRequest<Email>),
+    Mailbox(GetRequest<Mailbox>),
+    Thread(GetRequest<Thread>),
+    Identity(GetRequest<Identity>),
+    EmailSubmission(GetRequest<EmailSubmission>),
+    PushSubscription(GetRequest<PushSubscription>),
+    Sieve(GetRequest<Sieve>),
+    VacationResponse(GetRequest<VacationResponse>),
+    Principal(GetRequest<Principal>),
+    PrincipalAvailability(GetAvailabilityRequest),
+    Quota(GetRequest<Quota>),
+    Blob(GetRequest<Blob>),
+    AddressBook(GetRequest<AddressBook>),
+    ContactCard(GetRequest<ContactCard>),
+    FileNode(GetRequest<FileNode>),
+    Calendar(GetRequest<Calendar>),
+    CalendarEvent(GetRequest<CalendarEvent>),
+    CalendarEventNotification(GetRequest<CalendarEventNotification>),
+    ParticipantIdentity(GetRequest<ParticipantIdentity>),
+    ShareNotification(GetRequest<ShareNotification>),
+}
+
+#[derive(Debug)]
+pub enum SetRequestMethod<'x> {
+    Email(SetRequest<'x, Email>),
+    Mailbox(SetRequest<'x, Mailbox>),
+    Identity(SetRequest<'x, Identity>),
+    EmailSubmission(SetRequest<'x, EmailSubmission>),
+    PushSubscription(SetRequest<'x, PushSubscription>),
+    Sieve(SetRequest<'x, Sieve>),
+    VacationResponse(SetRequest<'x, VacationResponse>),
+    AddressBook(SetRequest<'x, AddressBook>),
+    ContactCard(SetRequest<'x, ContactCard>),
+    FileNode(SetRequest<'x, FileNode>),
+    ShareNotification(SetRequest<'x, ShareNotification>),
+    Calendar(SetRequest<'x, Calendar>),
+    CalendarEvent(SetRequest<'x, CalendarEvent>),
+    CalendarEventNotification(SetRequest<'x, CalendarEventNotification>),
+    ParticipantIdentity(SetRequest<'x, ParticipantIdentity>),
+}
+
+#[derive(Debug)]
+pub enum CopyRequestMethod<'x> {
+    Email(CopyRequest<'x, Email>),
+    ContactCard(CopyRequest<'x, ContactCard>),
+    CalendarEvent(CopyRequest<'x, CalendarEvent>),
+    Blob(CopyBlobRequest),
+}
+
+#[derive(Debug)]
+pub enum QueryRequestMethod {
+    Email(QueryRequest<Email>),
+    Mailbox(QueryRequest<Mailbox>),
+    EmailSubmission(QueryRequest<EmailSubmission>),
+    Sieve(QueryRequest<Sieve>),
+    Principal(QueryRequest<Principal>),
+    Quota(QueryRequest<Quota>),
+    ContactCard(QueryRequest<ContactCard>),
+    FileNode(QueryRequest<FileNode>),
+    CalendarEvent(QueryRequest<CalendarEvent>),
+    CalendarEventNotification(QueryRequest<CalendarEventNotification>),
+    ShareNotification(QueryRequest<ShareNotification>),
+}
+
+#[derive(Debug)]
+pub enum QueryChangesRequestMethod {
+    Email(QueryChangesRequest<Email>),
+    Mailbox(QueryChangesRequest<Mailbox>),
+    EmailSubmission(QueryChangesRequest<EmailSubmission>),
+    Sieve(QueryChangesRequest<Sieve>),
+    Principal(QueryChangesRequest<Principal>),
+    Quota(QueryChangesRequest<Quota>),
+    ContactCard(QueryChangesRequest<ContactCard>),
+    FileNode(QueryChangesRequest<FileNode>),
+    CalendarEvent(QueryChangesRequest<CalendarEvent>),
+    CalendarEventNotification(QueryChangesRequest<CalendarEventNotification>),
+    ShareNotification(QueryChangesRequest<ShareNotification>),
+}
+
+#[derive(Debug)]
+pub enum ParseRequestMethod {
+    Email(ParseRequest<Email>),
+    ContactCard(ParseRequest<ContactCard>),
+    CalendarEvent(ParseRequest<CalendarEvent>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaybeInvalid<V: FromStr> {
+    Value(V),
+    Invalid(String),
+}
+
+impl<'de, V: FromStr> serde::Deserialize<'de> for MaybeInvalid<V> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        Self: Sized,
+        D: serde::Deserializer<'de>,
     {
-        let mut hash = [0; 2];
-        let mut shift = 0;
-        let mut is_ref = false;
+        let value = <&str>::deserialize(deserializer)?;
 
-        'outer: for hash in hash.iter_mut() {
-            while let Some(ch) = parser.next_unescaped()? {
-                if ch != b'#' || parser.pos > parser.pos_marker + 1 {
-                    *hash |= (ch as u128) << shift;
-                    shift += 8;
-                    if shift == 128 {
-                        shift = 0;
-                        continue 'outer;
-                    }
-                } else {
-                    is_ref = true;
-                }
-            }
-            break;
+        if let Ok(id) = V::from_str(value) {
+            Ok(MaybeInvalid::Value(id))
+        } else {
+            Ok(MaybeInvalid::Invalid(value.to_string()))
         }
-
-        Ok(RequestProperty { hash, is_ref })
     }
 }
 
-impl Display for RequestProperty {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Ok(())
+impl<V: FromStr> Default for MaybeInvalid<V> {
+    fn default() -> Self {
+        MaybeInvalid::Invalid("".to_string())
     }
 }
 
-pub trait RequestPropertyParser {
-    fn parse(&mut self, parser: &mut Parser, property: RequestProperty) -> trc::Result<bool>;
+#[allow(clippy::derivable_impls)]
+impl Default for Request<'_> {
+    fn default() -> Self {
+        Request {
+            using: CapabilityIds::default(),
+            method_calls: Vec::new(),
+            created_ids: None,
+        }
+    }
+}
+
+impl<T> MaybeInvalid<T>
+where
+    T: FromStr,
+{
+    pub fn try_unwrap(self) -> Option<T> {
+        match self {
+            MaybeInvalid::Value(id) => Some(id),
+            MaybeInvalid::Invalid(_) => None,
+        }
+    }
+}
+
+pub trait IntoValid {
+    type Item;
+
+    fn into_valid(self) -> impl Iterator<Item = Self::Item>;
+}
+
+impl<T: FromStr> IntoValid for Vec<MaybeInvalid<T>> {
+    type Item = T;
+
+    fn into_valid(self) -> impl Iterator<Item = Self::Item> {
+        self.into_iter().filter_map(|v| v.try_unwrap())
+    }
+}
+
+impl<T: FromStr> IntoValid for Vec<MaybeIdReference<T>> {
+    type Item = T;
+
+    fn into_valid(self) -> impl Iterator<Item = Self::Item> {
+        self.into_iter().filter_map(|v| v.try_unwrap())
+    }
+}
+
+impl<T: FromStr + Eq, V> IntoValid for VecMap<MaybeInvalid<T>, V> {
+    type Item = (T, V);
+
+    fn into_valid(self) -> impl Iterator<Item = Self::Item> {
+        self.into_iter()
+            .filter_map(|(k, v)| k.try_unwrap().map(|k| (k, v)))
+    }
+}
+
+impl<T: FromStr + Eq, V> IntoValid for VecMap<MaybeIdReference<T>, V> {
+    type Item = (T, V);
+
+    fn into_valid(self) -> impl Iterator<Item = Self::Item> {
+        self.into_iter()
+            .filter_map(|(k, v)| k.try_unwrap().map(|k| (k, v)))
+    }
 }

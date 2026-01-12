@@ -4,15 +4,25 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::{fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
-
+use crate::{
+    AssertConfig, add_test_certs,
+    directory::internal::TestInternalDirectory,
+    jmap::server::{
+        enterprise::{EnterpriseCore, insert_test_metrics},
+        webhooks::{MockWebhookEndpoint, spawn_mock_webhook_endpoint},
+    },
+    store::{
+        TempDir, build_store_config,
+        cleanup::{search_store_destroy, store_assert_is_empty, store_destroy},
+    },
+};
+use ahash::AHashMap;
 use base64::{
     Engine,
     engine::general_purpose::{self, STANDARD},
 };
 use common::{
-    Caches, Core, Data, Inner, KV_BAYES_MODEL_GLOBAL, Server,
-    auth::AccessToken,
+    Caches, Core, Data, Inner, Server,
     config::{
         server::{Listeners, ServerProtocol},
         telemetry::Telemetry,
@@ -23,100 +33,102 @@ use common::{
         config::{ConfigManager, Patterns},
     },
 };
-use email::message::delete::EmailDeletion;
-use enterprise::{EnterpriseCore, insert_test_metrics};
 use http::HttpSessionManager;
 use hyper::{Method, header::AUTHORIZATION};
 use imap::core::ImapSessionManager;
 use jmap_client::client::{Client, Credentials};
-use jmap_proto::{error::request::RequestError, types::id::Id};
+use jmap_proto::error::request::RequestError;
 use managesieve::core::ManageSieveSessionManager;
 use pop3::Pop3SessionManager;
 use reqwest::header;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use services::SpawnServices;
+use serde_json::{Value, json};
+use services::{
+    SpawnServices,
+    task_manager::{Task, TaskAction},
+};
 use smtp::{SpawnQueueManager, core::SmtpSessionManager};
-
+use std::{
+    fmt::{Debug, Display},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 use store::{
-    IterateParams, SUBSPACE_PROPERTY, Stores, ValueKey,
-    roaring::RoaringBitmap,
-    write::{AnyKey, TaskQueueClass, ValueClass, key::DeserializeBigEndian},
+    IterateParams, SUBSPACE_TASK_QUEUE, Stores, U32_LEN, U64_LEN,
+    write::{AnyKey, TaskEpoch, key::DeserializeBigEndian},
 };
 use tokio::sync::watch;
-use utils::{BlobHash, config::Config};
-use webhooks::{MockWebhookEndpoint, spawn_mock_webhook_endpoint};
+use types::id::Id;
+use utils::config::Config;
 
-use crate::{
-    AssertConfig, add_test_certs, directory::internal::TestInternalDirectory, store::TempDir,
-};
-
-pub mod auth_acl;
-pub mod auth_limits;
-pub mod auth_oauth;
-pub mod blob;
-pub mod crypto;
-pub mod delivery;
-pub mod email_changes;
-pub mod email_copy;
-pub mod email_get;
-pub mod email_parse;
-pub mod email_query;
-pub mod email_query_changes;
-pub mod email_search_snippet;
-pub mod email_set;
-pub mod email_submission;
-pub mod enterprise;
-pub mod event_source;
-pub mod mailbox;
-pub mod permissions;
-pub mod purge;
-pub mod push_subscription;
-pub mod quota;
-pub mod sieve_script;
-pub mod thread_get;
-pub mod thread_merge;
-pub mod vacation_response;
-pub mod webhooks;
-pub mod websocket;
+pub mod auth;
+pub mod calendar;
+pub mod contacts;
+pub mod core;
+pub mod files;
+pub mod mail;
+pub mod principal;
+pub mod server;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn jmap_tests() {
-    let delete = true;
-    let mut params = init_jmap_tests(
-        &std::env::var("STORE")
-            .expect("Missing store type. Try running `STORE=<store_type> cargo test`"),
-        delete,
-    )
-    .await;
+    let delete = std::env::var("NO_DELETE").is_err();
+    let mut params = init_jmap_tests(delete).await;
 
-    webhooks::test(&mut params).await;
-    /*email_query::test(&mut params, delete).await;
-    email_get::test(&mut params).await;
-    email_set::test(&mut params).await;
-    email_parse::test(&mut params).await;
-    email_search_snippet::test(&mut params).await;
-    email_changes::test(&mut params).await;
-    email_query_changes::test(&mut params).await;
-    email_copy::test(&mut params).await;
-    thread_get::test(&mut params).await;
-    thread_merge::test(&mut params).await;
-    mailbox::test(&mut params).await;
-    delivery::test(&mut params).await;
-    auth_acl::test(&mut params).await;
-    auth_limits::test(&mut params).await;
-    auth_oauth::test(&mut params).await;
-    event_source::test(&mut params).await;
-    push_subscription::test(&mut params).await;
-    sieve_script::test(&mut params).await;
-    vacation_response::test(&mut params).await;
-    email_submission::test(&mut params).await;
-    websocket::test(&mut params).await;
-    quota::test(&mut params).await;
-    crypto::test(&mut params).await;
-    blob::test(&mut params).await;*/
-    permissions::test(&params).await;
-    purge::test(&mut params).await;
-    enterprise::test(&mut params).await;
+    server::webhooks::test(&mut params).await;
+
+    mail::get::test(&mut params).await;
+    mail::set::test(&mut params).await;
+    mail::parse::test(&mut params).await;
+    mail::query::test(&mut params, delete).await;
+    mail::search_snippet::test(&mut params).await;
+    mail::changes::test(&mut params).await;
+    mail::query_changes::test(&mut params).await;
+    mail::copy::test(&mut params).await;
+    mail::thread_get::test(&mut params).await;
+    mail::thread_merge::test(&mut params).await;
+    mail::mailbox::test(&mut params).await;
+    mail::delivery::test(&mut params).await;
+    mail::acl::test(&mut params).await;
+    mail::sieve_script::test(&mut params).await;
+    mail::vacation_response::test(&mut params).await;
+    mail::submission::test(&mut params).await;
+    mail::crypto::test(&mut params).await;
+    mail::antispam::test(&mut params).await;
+
+    core::event_source::test(&mut params).await;
+    core::websocket::test(&mut params).await;
+    core::push_subscription::test(&mut params).await;
+    core::blob::test(&mut params).await;
+
+    auth::limits::test(&mut params).await;
+    auth::oauth::test(&mut params).await;
+    auth::quota::test(&mut params).await;
+    auth::permissions::test(&params).await;
+
+    contacts::addressbook::test(&mut params).await;
+    contacts::contact::test(&mut params).await;
+    contacts::acl::test(&mut params).await;
+
+    files::node::test(&mut params).await;
+    files::acl::test(&mut params).await;
+
+    calendar::calendars::test(&mut params).await;
+    calendar::event::test(&mut params).await;
+    calendar::notification::test(&mut params).await;
+    calendar::alarm::test(&mut params).await;
+
+    calendar::identity::test(&mut params).await;
+    calendar::acl::test(&mut params).await;
+
+    principal::get::test(&mut params).await;
+    principal::availability::test(&mut params).await;
+
+    server::purge::test(&mut params).await;
+    server::enterprise::test(&mut params).await;
+
+    assert_is_empty(&params.server).await;
 
     if delete {
         params.temp_dir.delete();
@@ -126,12 +138,7 @@ async fn jmap_tests() {
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 pub async fn jmap_metric_tests() {
-    let params = init_jmap_tests(
-        &std::env::var("STORE")
-            .expect("Missing store type. Try running `STORE=<store_type> cargo test`"),
-        false,
-    )
-    .await;
+    let params = init_jmap_tests(false).await;
 
     insert_test_metrics(params.server.core.clone()).await;
 }
@@ -139,43 +146,98 @@ pub async fn jmap_metric_tests() {
 #[allow(dead_code)]
 pub struct JMAPTest {
     server: Server,
-    client: Client,
+    accounts: AHashMap<&'static str, Account>,
     temp_dir: TempDir,
     webhook: Arc<MockWebhookEndpoint>,
     shutdown_tx: watch::Sender<bool>,
 }
 
+pub struct Account {
+    name: &'static str,
+    secret: &'static str,
+    emails: &'static [&'static str],
+    id: Id,
+    id_string: String,
+    client: Client,
+}
+
+impl JMAPTest {
+    pub fn account(&self, name: &str) -> &Account {
+        self.accounts.get(name).unwrap()
+    }
+
+    pub async fn assert_is_empty(&self) {
+        assert_is_empty(&self.server).await;
+    }
+}
+
+impl Account {
+    pub fn id(&self) -> &Id {
+        &self.id
+    }
+
+    pub fn id_string(&self) -> &str {
+        &self.id_string
+    }
+
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+    pub fn secret(&self) -> &'static str {
+        self.secret
+    }
+
+    pub fn emails(&self) -> &'static [&'static str] {
+        self.emails
+    }
+
+    pub async fn client_owned(&self) -> Client {
+        Client::new()
+            .credentials(Credentials::basic(self.name(), self.secret()))
+            .timeout(Duration::from_secs(3600))
+            .accept_invalid_certs(true)
+            .follow_redirects(["127.0.0.1"])
+            .connect("https://127.0.0.1:8899")
+            .await
+            .unwrap()
+    }
+}
+
 pub async fn wait_for_index(server: &Server) {
+    let mut count = 0;
     loop {
-        let mut has_index_tasks = false;
+        let mut has_index_tasks = None;
         server
             .core
             .storage
             .data
             .iterate(
                 IterateParams::new(
-                    ValueKey::<ValueClass> {
-                        account_id: 0,
-                        collection: 0,
-                        document_id: 0,
-                        class: ValueClass::TaskQueue(TaskQueueClass::IndexEmail {
-                            due: 0,
-                            hash: BlobHash::default(),
-                        }),
+                    AnyKey {
+                        subspace: SUBSPACE_TASK_QUEUE,
+                        key: vec![0u8],
                     },
-                    ValueKey::<ValueClass> {
-                        account_id: u32::MAX,
-                        collection: u8::MAX,
-                        document_id: u32::MAX,
-                        class: ValueClass::TaskQueue(TaskQueueClass::IndexEmail {
-                            due: u64::MAX,
-                            hash: BlobHash::default(),
-                        }),
+                    AnyKey {
+                        subspace: SUBSPACE_TASK_QUEUE,
+                        key: vec![u8::MAX; 16],
                     },
                 )
                 .ascending(),
-                |_, _| {
-                    has_index_tasks = true;
+                |key, value| {
+                    has_index_tasks = Some(
+                        Task::<TaskAction>::deserialize(key, value).unwrap_or_else(|_| Task {
+                            due: TaskEpoch::from_inner(
+                                key.deserialize_be_u64(key.len() - U64_LEN).unwrap(),
+                            ),
+                            account_id: key.deserialize_be_u32(U64_LEN).unwrap(),
+                            document_id: key.deserialize_be_u32(U64_LEN + U32_LEN + 1).unwrap(),
+                            action: TaskAction::SendImip,
+                        }),
+                    );
 
                     Ok(false)
                 },
@@ -183,7 +245,11 @@ pub async fn wait_for_index(server: &Server) {
             .await
             .unwrap();
 
-        if has_index_tasks {
+        if let Some(task) = has_index_tasks {
+            count += 1;
+            if count % 10 == 0 {
+                println!("Waiting for pending task {:?}...", task);
+            }
             tokio::time::sleep(Duration::from_millis(300)).await;
         } else {
             break;
@@ -191,82 +257,31 @@ pub async fn wait_for_index(server: &Server) {
     }
 }
 
-pub async fn assert_is_empty(server: Server) {
-    // Wait for pending FTS index tasks
-    wait_for_index(&server).await;
-
-    // Delete bayes model
-    server
-        .in_memory_store()
-        .key_delete_prefix(&[KV_BAYES_MODEL_GLOBAL])
-        .await
-        .unwrap();
-
-    // Purge accounts
-    emails_purge_tombstoned(&server).await;
+pub async fn assert_is_empty(server: &Server) {
+    // Wait for pending index tasks
+    wait_for_index(server).await;
 
     // Assert is empty
-    server
-        .core
-        .storage
-        .data
-        .assert_is_empty(server.core.storage.blob.clone())
-        .await;
+    store_assert_is_empty(server.store(), server.core.storage.blob.clone(), false).await;
+    search_store_destroy(server.search_store()).await;
 
-    // Clean cache
+    // Clean caches
+    for cache in [
+        &server.inner.cache.events,
+        &server.inner.cache.contacts,
+        &server.inner.cache.files,
+        &server.inner.cache.scheduling,
+    ] {
+        cache.clear();
+    }
     server.inner.cache.messages.clear();
 }
 
-pub async fn emails_purge_tombstoned(server: &Server) {
-    let mut account_ids = RoaringBitmap::new();
-    server
-        .core
-        .storage
-        .data
-        .iterate(
-            IterateParams::new(
-                AnyKey {
-                    subspace: SUBSPACE_PROPERTY,
-                    key: vec![0u8],
-                },
-                AnyKey {
-                    subspace: SUBSPACE_PROPERTY,
-                    key: vec![u8::MAX, u8::MAX, u8::MAX, u8::MAX],
-                },
-            )
-            .no_values(),
-            |key, _| {
-                account_ids.insert(key.deserialize_be_u32(0).unwrap());
-
-                Ok(true)
-            },
-        )
-        .await
-        .unwrap();
-
-    for account_id in account_ids {
-        let do_add = server.inner.cache.access_tokens.get(&account_id).is_none();
-
-        if do_add {
-            server
-                .inner
-                .cache
-                .access_tokens
-                .insert(account_id, Arc::new(AccessToken::from_id(account_id)));
-        }
-        server.emails_purge_tombstoned(account_id).await.unwrap();
-        if do_add {
-            server.inner.cache.access_tokens.remove(&account_id);
-        }
-    }
-}
-
-async fn init_jmap_tests(store_id: &str, delete_if_exists: bool) -> JMAPTest {
+async fn init_jmap_tests(delete_if_exists: bool) -> JMAPTest {
     // Load and parse config
     let temp_dir = TempDir::new("jmap_tests", delete_if_exists);
     let mut config = Config::new(
-        add_test_certs(SERVER)
-            .replace("{STORE}", store_id)
+        add_test_certs(&(build_store_config(&temp_dir.path.to_string_lossy()) + SERVER))
             .replace("{TMP}", &temp_dir.path.display().to_string())
             .replace(
                 "{LEVEL}",
@@ -303,6 +318,7 @@ async fn init_jmap_tests(store_id: &str, delete_if_exists: bool) -> JMAPTest {
     let data = Data::parse(&mut config);
     let cache = Caches::parse(&mut config);
     let store = core.storage.data.clone();
+    let search_store = core.storage.fts.clone();
     let (ipc, mut ipc_rxs) = build_ipc(false);
     let inner = Arc::new(Inner {
         shared_core: core.into_shared(),
@@ -310,6 +326,11 @@ async fn init_jmap_tests(store_id: &str, delete_if_exists: bool) -> JMAPTest {
         ipc,
         cache,
     });
+
+    if delete_if_exists {
+        store_destroy(&store).await;
+        search_store_destroy(&search_store).await;
+    }
 
     // Parse acceptors
     servers.parse_tcp_acceptors(&mut config, inner.clone());
@@ -358,82 +379,720 @@ async fn init_jmap_tests(store_id: &str, delete_if_exists: bool) -> JMAPTest {
         };
     });
 
-    if delete_if_exists {
-        store.destroy().await;
+    // Create tables
+    let server = inner.build_server();
+    let mut accounts = AHashMap::new();
+
+    for (name, secret, description, emails) in [
+        ("admin", "secret", "Superuser", &[][..]),
+        (
+            "jdoe@example.com",
+            "12345",
+            "John Doe",
+            &["jdoe@example.com", "john.doe@example.com"][..],
+        ),
+        (
+            "jane.smith@example.com",
+            "abcde",
+            "Jane Smith",
+            &["jane.smith@example.com"],
+        ),
+        (
+            "bill@example.com",
+            "098765",
+            "Bill Foobar",
+            &["bill@example.com"],
+        ),
+        (
+            "robert@example.com",
+            "aabbcc",
+            "Robert Foobar",
+            &["robert@example.com"][..],
+        ),
+    ] {
+        let id: Id = server
+            .store()
+            .create_test_user(name, secret, description, emails)
+            .await
+            .into();
+        let id_string = id.to_string();
+
+        let mut client = Client::new()
+            .credentials(Credentials::basic(name, secret))
+            .timeout(Duration::from_secs(3600))
+            .accept_invalid_certs(true)
+            .follow_redirects(["127.0.0.1"])
+            .connect("https://127.0.0.1:8899")
+            .await
+            .unwrap();
+        client.set_default_account_id(id_string.clone());
+
+        accounts.insert(
+            name,
+            Account {
+                name,
+                secret,
+                emails,
+                id,
+                id_string,
+                client,
+            },
+        );
     }
 
-    // Create tables
-    inner
-        .shared_core
-        .load()
-        .storage
-        .data
-        .create_test_user("admin", "secret", "Superuser", &[])
-        .await;
+    for (name, description, emails) in
+        [("sales@example.com", "Sales Group", &["sales@example.com"])]
+    {
+        let id: Id = server
+            .store()
+            .create_test_group(name, description, emails)
+            .await
+            .into();
+        let id_string = id.to_string();
 
-    // Create client
-    let mut client = Client::new()
-        .credentials(Credentials::basic("admin", "secret"))
-        .timeout(Duration::from_secs(3600))
-        .accept_invalid_certs(true)
-        .follow_redirects(["127.0.0.1"])
-        .connect("https://127.0.0.1:8899")
-        .await
-        .unwrap();
-    client.set_default_account_id(Id::new(1));
+        let mut client = Client::new()
+            .credentials(Credentials::basic("admin", "secret"))
+            .timeout(Duration::from_secs(3600))
+            .accept_invalid_certs(true)
+            .follow_redirects(["127.0.0.1"])
+            .connect("https://127.0.0.1:8899")
+            .await
+            .unwrap();
+        client.set_default_account_id(id_string.clone());
+
+        accounts.insert(
+            name,
+            Account {
+                name,
+                secret: "",
+                emails,
+                id,
+                id_string,
+                client,
+            },
+        );
+    }
 
     JMAPTest {
-        server: inner.build_server(),
+        server,
         temp_dir,
-        client,
+        accounts,
         shutdown_tx,
         webhook: spawn_mock_webhook_endpoint(),
     }
 }
 
-pub async fn jmap_raw_request(body: impl AsRef<str>, username: &str, secret: &str) -> String {
-    let mut headers = header::HeaderMap::new();
+pub struct JmapResponse(pub Value);
 
-    headers.insert(
-        header::AUTHORIZATION,
-        header::HeaderValue::from_str(&format!(
-            "Basic {}",
-            general_purpose::STANDARD.encode(format!("{}:{}", username, secret))
-        ))
-        .unwrap(),
-    );
+impl Account {
+    pub async fn jmap_get(
+        &self,
+        object: impl Display,
+        properties: impl IntoIterator<Item = impl Display>,
+        ids: impl IntoIterator<Item = impl Display>,
+    ) -> JmapResponse {
+        self.jmap_get_account(self, object, properties, ids).await
+    }
 
-    const BODY_TEMPLATE: &str = r#"{
-        "using": [ "urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail", "urn:ietf:params:jmap:quota" ],
-        "methodCalls": $$
-      }"#;
+    pub async fn jmap_get_account(
+        &self,
+        account: &Account,
+        object: impl Display,
+        properties: impl IntoIterator<Item = impl Display>,
+        ids: impl IntoIterator<Item = impl Display>,
+    ) -> JmapResponse {
+        let ids = ids
+            .into_iter()
+            .map(|id| Value::String(id.to_string()))
+            .collect::<Vec<Value>>();
+        self.jmap_method_calls(json!([[
+            format!("{object}/get"),
+            {
+                "accountId": account.id_string(),
+                "properties": properties
+                .into_iter()
+                .map(|p| Value::String(p.to_string()))
+                .collect::<Vec<_>>(),
+                "ids": if !ids.is_empty() { Some(ids) } else { None }
+            },
+            "0"
+        ]]))
+        .await
+    }
 
-    String::from_utf8(
-        reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .timeout(Duration::from_millis(1000))
-            .default_headers(headers)
-            .build()
-            .unwrap()
-            .post("https://127.0.0.1:8899/jmap")
-            .body(BODY_TEMPLATE.replace("$$", body.as_ref()))
-            .send()
+    pub async fn jmap_query(
+        &self,
+        object: impl Display,
+        filter: impl IntoIterator<Item = (impl Display, impl Into<Value>)>,
+        sort_by: impl IntoIterator<Item = impl Display>,
+        arguments: impl IntoIterator<Item = (impl Display, impl Into<Value>)>,
+    ) -> JmapResponse {
+        let filter = filter
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.into()))
+            .collect::<serde_json::Map<_, _>>();
+        let sort_by = sort_by
+            .into_iter()
+            .map(|id| {
+                json! ({
+                    "property": id.to_string()
+                })
+            })
+            .collect::<Vec<Value>>();
+        let arguments = [
+            ("filter".to_string(), Value::Object(filter)),
+            ("sort".to_string(), Value::Array(sort_by)),
+        ]
+        .into_iter()
+        .chain(
+            arguments
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.into())),
+        )
+        .collect::<serde_json::Map<_, _>>();
+
+        self.jmap_method_calls(json!([[format!("{object}/query"), arguments, "0"]]))
             .await
-            .unwrap()
-            .bytes()
+    }
+
+    pub async fn jmap_create(
+        &self,
+        object: impl Display,
+        items: impl IntoIterator<Item = Value>,
+        arguments: impl IntoIterator<Item = (impl Display, impl Into<Value>)>,
+    ) -> JmapResponse {
+        self.jmap_create_account(self, object, items, arguments)
             .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap()
+    }
+
+    pub async fn jmap_create_account(
+        &self,
+        account: &Account,
+        object: impl Display,
+        items: impl IntoIterator<Item = Value>,
+        arguments: impl IntoIterator<Item = (impl Display, impl Into<Value>)>,
+    ) -> JmapResponse {
+        let create = items
+            .into_iter()
+            .enumerate()
+            .map(|(i, item)| (format!("i{i}"), item))
+            .collect::<serde_json::Map<_, _>>();
+        let arguments = [
+            (
+                "accountId".to_string(),
+                Value::String(account.id_string().to_string()),
+            ),
+            ("create".to_string(), Value::Object(create)),
+        ]
+        .into_iter()
+        .chain(
+            arguments
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.into())),
+        )
+        .collect::<serde_json::Map<_, _>>();
+
+        self.jmap_method_calls(json!([[format!("{object}/set"), arguments, "0"]]))
+            .await
+    }
+
+    pub async fn jmap_update(
+        &self,
+        object: impl Display,
+        items: impl IntoIterator<Item = (impl Display, Value)>,
+        arguments: impl IntoIterator<Item = (impl Display, impl Into<Value>)>,
+    ) -> JmapResponse {
+        self.jmap_update_account(self, object, items, arguments)
+            .await
+    }
+
+    pub async fn jmap_update_account(
+        &self,
+        account: &Account,
+        object: impl Display,
+        items: impl IntoIterator<Item = (impl Display, Value)>,
+        arguments: impl IntoIterator<Item = (impl Display, impl Into<Value>)>,
+    ) -> JmapResponse {
+        let update = items
+            .into_iter()
+            .map(|(i, item)| (i.to_string(), item))
+            .collect::<serde_json::Map<_, _>>();
+        let arguments = [
+            (
+                "accountId".to_string(),
+                Value::String(account.id_string().to_string()),
+            ),
+            ("update".to_string(), Value::Object(update)),
+        ]
+        .into_iter()
+        .chain(
+            arguments
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.into())),
+        )
+        .collect::<serde_json::Map<_, _>>();
+
+        self.jmap_method_calls(json!([[format!("{object}/set"), arguments, "0"]]))
+            .await
+    }
+
+    pub async fn jmap_destroy(
+        &self,
+        object: impl Display,
+        items: impl IntoIterator<Item = impl Display>,
+        arguments: impl IntoIterator<Item = (impl Display, impl Into<Value>)>,
+    ) -> JmapResponse {
+        self.jmap_destroy_account(self, object, items, arguments)
+            .await
+    }
+
+    pub async fn jmap_destroy_account(
+        &self,
+        account: &Account,
+        object: impl Display,
+        items: impl IntoIterator<Item = impl Display>,
+        arguments: impl IntoIterator<Item = (impl Display, impl Into<Value>)>,
+    ) -> JmapResponse {
+        let destroy = items
+            .into_iter()
+            .map(|id| Value::String(id.to_string()))
+            .collect::<Vec<_>>();
+        let arguments = [
+            (
+                "accountId".to_string(),
+                Value::String(account.id_string().to_string()),
+            ),
+            ("destroy".to_string(), Value::Array(destroy)),
+        ]
+        .into_iter()
+        .chain(
+            arguments
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.into())),
+        )
+        .collect::<serde_json::Map<_, _>>();
+
+        self.jmap_method_calls(json!([[format!("{object}/set"), arguments, "0"]]))
+            .await
+    }
+
+    pub async fn jmap_copy(
+        &self,
+        from_account: &Account,
+        to_account: &Account,
+        object: impl Display,
+        items: impl IntoIterator<Item = (impl Display, Value)>,
+        on_success_destroy: bool,
+    ) -> JmapResponse {
+        self.jmap_method_calls(json!([[
+            format!("{object}/copy"),
+            {
+                "fromAccountId": from_account.id_string(),
+                "accountId": to_account.id_string(),
+                "onSuccessDestroyOriginal": on_success_destroy,
+                "create": items
+                        .into_iter()
+                        .map(|(i, item)| (i.to_string(), item)).collect::<serde_json::Map<_, _>>()
+            },
+            "0"
+        ]]))
+        .await
+    }
+
+    pub async fn jmap_changes(&self, object: impl Display, state: impl Display) -> JmapResponse {
+        self.jmap_method_calls(json!([[
+            format!("{object}/changes"),
+            {
+                "sinceState": state.to_string()
+            },
+            "0"
+        ]]))
+        .await
+    }
+
+    pub async fn jmap_method_call(&self, method_name: &str, body: Value) -> JmapResponse {
+        self.jmap_method_calls(json!([[method_name, body, "0"]]))
+            .await
+    }
+
+    pub async fn jmap_method_calls(&self, calls: Value) -> JmapResponse {
+        let mut headers = header::HeaderMap::new();
+
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_str(&format!(
+                "Basic {}",
+                general_purpose::STANDARD.encode(format!("{}:{}", self.name(), self.secret()))
+            ))
+            .unwrap(),
+        );
+
+        let body = json!({
+          "using": [ "urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail", "urn:ietf:params:jmap:quota" ],
+          "methodCalls": calls
+        });
+
+        JmapResponse(
+            serde_json::from_slice(
+                &reqwest::Client::builder()
+                    .danger_accept_invalid_certs(true)
+                    .timeout(Duration::from_millis(1000))
+                    .default_headers(headers)
+                    .build()
+                    .unwrap()
+                    .post("https://127.0.0.1:8899/jmap")
+                    .body(body.to_string())
+                    .send()
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    pub async fn jmap_session_object(&self) -> JmapResponse {
+        let mut headers = header::HeaderMap::new();
+
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_str(&format!(
+                "Basic {}",
+                general_purpose::STANDARD.encode(format!("{}:{}", self.name(), self.secret()))
+            ))
+            .unwrap(),
+        );
+
+        JmapResponse(
+            serde_json::from_slice(
+                &reqwest::Client::builder()
+                    .danger_accept_invalid_certs(true)
+                    .timeout(Duration::from_millis(1000))
+                    .default_headers(headers)
+                    .build()
+                    .unwrap()
+                    .get("https://127.0.0.1:8899/jmap/session")
+                    .send()
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    pub async fn destroy_all_addressbooks(&self) {
+        self.jmap_method_calls(json!([[
+            "AddressBook/get",
+            {
+              "ids" : (),
+              "properties" : [
+                "id"
+              ]
+            },
+            "R1"
+          ],
+          [
+            "AddressBook/set",
+            {
+              "#destroy" : {
+                    "resultOf": "R1",
+                    "name": "AddressBook/get",
+                    "path": "/list/*/id"
+                },
+              "onDestroyRemoveContents" : true
+            },
+            "R2"
+          ]
+        ]))
+        .await;
+    }
+
+    pub async fn destroy_all_calendars(&self) {
+        self.jmap_method_calls(json!([[
+            "Calendar/get",
+            {
+              "ids" : (),
+              "properties" : [
+                "id"
+              ]
+            },
+            "R1"
+          ],
+          [
+            "Calendar/set",
+            {
+              "#destroy" : {
+                    "resultOf": "R1",
+                    "name": "Calendar/get",
+                    "path": "/list/*/id"
+                },
+              "onDestroyRemoveEvents" : true
+            },
+            "R2"
+          ]
+        ]))
+        .await;
+    }
+
+    pub async fn destroy_all_event_notifications(&self) {
+        self.jmap_method_calls(json!([[
+            "CalendarEventNotification/get",
+            {
+              "ids" : (),
+              "properties" : [
+                "id"
+              ]
+            },
+            "R1"
+          ],
+          [
+            "CalendarEventNotification/set",
+            {
+              "#destroy" : {
+                    "resultOf": "R1",
+                    "name": "CalendarEventNotification/get",
+                    "path": "/list/*/id"
+                }
+            },
+            "R2"
+          ]
+        ]))
+        .await;
+    }
 }
 
-pub async fn jmap_json_request(
-    body: impl AsRef<str>,
-    username: &str,
-    secret: &str,
-) -> serde_json::Value {
-    serde_json::from_str(&jmap_raw_request(body, username, secret).await).unwrap()
+impl JmapResponse {
+    pub fn created(&self, item_idx: u32) -> &Value {
+        self.0
+            .pointer(&format!("/methodResponses/0/1/created/i{item_idx}"))
+            .unwrap_or_else(|| panic!("Missing created item {item_idx}: {self:?}"))
+    }
+
+    pub fn not_created(&self, item_idx: u32) -> &Value {
+        self.0
+            .pointer(&format!("/methodResponses/0/1/notCreated/i{item_idx}"))
+            .unwrap_or_else(|| panic!("Missing not created item {item_idx}: {self:?}"))
+    }
+
+    pub fn updated(&self, id: &str) -> &Value {
+        self.0
+            .pointer(&format!("/methodResponses/0/1/updated/{id}"))
+            .unwrap_or_else(|| panic!("Missing updated item {id}: {self:?}"))
+    }
+
+    pub fn not_updated(&self, id: &str) -> &Value {
+        self.0
+            .pointer(&format!("/methodResponses/0/1/notUpdated/{id}"))
+            .unwrap_or_else(|| panic!("Missing not updated item {id}: {self:?}"))
+    }
+
+    pub fn copied(&self, id: &str) -> &Value {
+        self.0
+            .pointer(&format!("/methodResponses/0/1/created/{id}"))
+            .unwrap_or_else(|| panic!("Missing updated item {id}: {self:?}"))
+    }
+
+    pub fn method_response(&self) -> &Value {
+        self.0
+            .pointer("/methodResponses/0/1")
+            .unwrap_or_else(|| panic!("Missing method response in response: {self:?}"))
+    }
+
+    pub fn list_array(&self) -> &Value {
+        self.0
+            .pointer("/methodResponses/0/1/list")
+            .unwrap_or_else(|| panic!("Missing list in response: {self:?}"))
+    }
+
+    pub fn list(&self) -> &[Value] {
+        self.0
+            .pointer("/methodResponses/0/1/list")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("Missing list in response: {self:?}"))
+    }
+
+    pub fn not_found(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .pointer("/methodResponses/0/1/notFound")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("Missing notFound in response: {self:?}"))
+            .iter()
+            .map(|v| v.as_str().unwrap())
+    }
+
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .pointer("/methodResponses/0/1/ids")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("Missing ids in response: {self:?}"))
+            .iter()
+            .map(|v| v.as_str().unwrap())
+    }
+
+    pub fn destroyed(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .pointer("/methodResponses/0/1/destroyed")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("Missing destroyed in response: {self:?}"))
+            .iter()
+            .map(|v| v.as_str().unwrap())
+    }
+
+    pub fn not_destroyed(&self, id: &str) -> &Value {
+        self.0
+            .pointer(&format!("/methodResponses/0/1/notDestroyed/{id}"))
+            .unwrap_or_else(|| panic!("Missing not destroyed item {id}: {self:?}"))
+    }
+
+    pub fn state(&self) -> &str {
+        self.0
+            .pointer("/methodResponses/0/1/state")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("Missing state in response: {self:?}"))
+    }
+
+    pub fn new_state(&self) -> &str {
+        self.0
+            .pointer("/methodResponses/0/1/newState")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("Missing new state in response: {self:?}"))
+    }
+
+    pub fn changes(&self) -> impl Iterator<Item = ChangeType<'_>> {
+        self.changes_by_type("created")
+            .map(ChangeType::Created)
+            .chain(self.changes_by_type("updated").map(ChangeType::Updated))
+            .chain(self.changes_by_type("destroyed").map(ChangeType::Destroyed))
+    }
+
+    fn changes_by_type(&self, typ: &str) -> impl Iterator<Item = &str> {
+        self.0
+            .pointer(&format!("/methodResponses/0/1/{typ}"))
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("Missing {typ} changes in response: {self:?}"))
+            .iter()
+            .map(|v| v.as_str().unwrap())
+    }
+
+    pub fn pointer(&self, pointer: &str) -> Option<&Value> {
+        self.0.pointer(pointer)
+    }
+
+    pub fn into_inner(self) -> Value {
+        self.0
+    }
+}
+
+pub trait JmapUtils {
+    fn id(&self) -> &str {
+        self.text_field("id")
+    }
+
+    fn blob_id(&self) -> &str {
+        self.text_field("blobId")
+    }
+
+    fn typ(&self) -> &str {
+        self.text_field("type")
+    }
+
+    fn description(&self) -> &str {
+        self.text_field("description")
+    }
+
+    fn with_property(self, field: impl Display, value: impl Into<Value>) -> Self;
+
+    fn text_field(&self, field: &str) -> &str;
+
+    fn assert_is_equal(&self, other: Value);
+}
+
+impl JmapUtils for Value {
+    fn text_field(&self, field: &str) -> &str {
+        self.pointer(&format!("/{field}"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("Missing {field} in object: {self:?}"))
+    }
+    fn assert_is_equal(&self, expected: Value) {
+        if self != &expected {
+            panic!(
+                "Values are not equal:\ngot: {}\nexpected: {}",
+                serde_json::to_string_pretty(self).unwrap(),
+                serde_json::to_string_pretty(&expected).unwrap()
+            );
+        }
+    }
+    fn with_property(mut self, field: impl Display, value: impl Into<Value>) -> Self {
+        if let Value::Object(map) = &mut self {
+            map.insert(field.to_string(), value.into());
+        } else {
+            panic!("Not an object: {self:?}");
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ChangeType<'x> {
+    Created(&'x str),
+    Updated(&'x str),
+    Destroyed(&'x str),
+}
+
+impl<'x> ChangeType<'x> {
+    pub fn as_created(&self) -> &str {
+        match self {
+            ChangeType::Created(id) => id,
+            _ => panic!("Not a created change: {self:?}"),
+        }
+    }
+
+    pub fn as_updated(&self) -> &str {
+        match self {
+            ChangeType::Updated(id) => id,
+            _ => panic!("Not an updated change: {self:?}"),
+        }
+    }
+
+    pub fn as_destroyed(&self) -> &str {
+        match self {
+            ChangeType::Destroyed(id) => id,
+            _ => panic!("Not a destroyed change: {self:?}"),
+        }
+    }
+}
+
+impl Display for JmapResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl Debug for JmapResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        serde_json::to_string_pretty(&self.0)
+            .map_err(|_| std::fmt::Error)
+            .and_then(|s| std::fmt::Display::fmt(&s, f))
+    }
+}
+
+pub trait IntoJmapSet {
+    fn into_jmap_set(self) -> Value;
+}
+
+impl<T: IntoIterator<Item = impl Display>> IntoJmapSet for T {
+    fn into_jmap_set(self) -> Value {
+        Value::Object(
+            self.into_iter()
+                .map(|id| (id.to_string(), Value::Bool(true)))
+                .collect::<serde_json::Map<String, Value>>(),
+        )
+    }
 }
 
 pub fn find_values(string: &str, name: &str) -> Vec<String> {
@@ -490,17 +1149,6 @@ pub fn replace_blob_ids(string: String) -> String {
     } else {
         string
     }
-}
-
-pub async fn test_account_login(login: &str, secret: &str) -> Client {
-    Client::new()
-        .credentials(Credentials::basic(login, secret))
-        .timeout(Duration::from_secs(5))
-        .accept_invalid_certs(true)
-        .follow_redirects(["127.0.0.1"])
-        .connect("https://127.0.0.1:8899")
-        .await
-        .unwrap()
 }
 
 #[derive(Deserialize)]
@@ -774,7 +1422,6 @@ reject-non-fqdn = false
 [session.rcpt]
 relay = [ { if = "!is_empty(authenticated_as)", then = true }, 
           { else = false } ]
-directory = "'{STORE}'"
 
 [session.rcpt.errors]
 total = 5
@@ -782,7 +1429,6 @@ wait = "1ms"
 
 [session.auth]
 mechanisms = "[plain, login, oauthbearer]"
-directory = "'{STORE}'"
 
 [session.data]
 spam-filter = "recipients[0] != 'robert@example.com'"
@@ -820,51 +1466,9 @@ allow-invalid-certs = true
 future-release = [ { if = "!is_empty(authenticated_as)", then = "99999999d"},
                    { else = false } ]
 
-[store."sqlite"]
-type = "sqlite"
-path = "{TMP}/sqlite.db"
-
-[store."rocksdb"]
-type = "rocksdb"
-path = "{TMP}/rocks.db"
-
-[store."foundationdb"]
-type = "foundationdb"
-
-[store."postgresql"]
-type = "postgresql"
-host = "localhost"
-port = 5432
-database = "stalwart"
-user = "postgres"
-password = "mysecretpassword"
-
-[store."mysql"]
-type = "mysql"
-host = "localhost"
-port = 3307
-database = "stalwart"
-user = "root"
-password = "password"
-
-[store."elastic"]
-type = "elasticsearch"
-url = "https://localhost:9200"
-user = "elastic"
-password = "changeme"
-tls.allow-invalid-certs = true
-disable = true
-
 [certificate.default]
 cert = "%{file:{CERT}}%"
 private-key = "%{file:{PK}}%"
-
-[storage]
-data = "{STORE}"
-fts = "{STORE}"
-blob = "{STORE}"
-lookup = "{STORE}"
-directory = "{STORE}"
 
 [jmap.protocol.get]
 max-objects = 100000
@@ -916,10 +1520,6 @@ emails = "SELECT address FROM emails WHERE name = ? AND type != 'list' ORDER BY 
 verify = "SELECT address FROM emails WHERE address LIKE '%' || ? || '%' AND type = 'primary' ORDER BY address LIMIT 5"
 expand = "SELECT p.address FROM emails AS p JOIN emails AS l ON p.name = l.name WHERE p.type = 'primary' AND l.address = ? AND l.type = 'list' ORDER BY p.address LIMIT 50"
 domains = "SELECT 1 FROM emails WHERE address LIKE '%@' || ? LIMIT 1"
-
-[directory."{STORE}"]
-type = "internal"
-store = "{STORE}"
 
 [imap.auth]
 allow-plain-text = true
@@ -988,11 +1588,21 @@ vrfy = true
 [spam-filter]
 enable = true
 
+[spam-filter.list]
+scores = {"GTUBE_TEST" = "1000.0"}
+
+[sharing]
+allow-directory-query = true
+
+[calendar.alarms]
+minimum-interval = "1s"
+
 [tracer.console]
 type = "console"
 level = "{LEVEL}"
 multiline = false
 ansi = true
+#disabled-events = ["network.*", "telemetry.webhook-error"]
 disabled-events = ["network.*", "telemetry.webhook-error", "http.request-body"]
 
 [webhook."test"]

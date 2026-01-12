@@ -6,12 +6,13 @@
 
 use common::{
     Inner, KV_LOCK_HOUSEKEEPER, LONG_1D_SLUMBER, Server,
-    config::telemetry::OtelMetrics,
+    config::{spamfilter, telemetry::OtelMetrics},
     core::BuildServer,
     ipc::{BroadcastEvent, HousekeeperEvent, PurgeType},
 };
 use email::message::delete::EmailDeletion;
 use smtp::reporting::SmtpReporting;
+use spam_filter::modules::classifier::SpamClassifier;
 use std::{
     collections::BinaryHeap,
     future::Future,
@@ -55,6 +56,7 @@ enum ActionClass {
     #[cfg(feature = "enterprise")]
     RenewLicense,
     // SPDX-SnippetEnd
+    TrainSpamClassifier,
 }
 
 #[derive(Default)]
@@ -78,9 +80,10 @@ pub fn spawn_housekeeper(inner: Arc<Inner>, mut rx: mpsc::Receiver<HousekeeperEv
         let mut queue = Queue::default();
         {
             let server = inner.build_server();
+            let roles = &server.core.network.roles;
 
             // Account purge
-            if server.core.network.roles.purge_accounts {
+            if roles.purge_accounts.is_enabled_or_sharded() {
                 queue.schedule(
                     Instant::now() + server.core.jmap.account_purge_frequency.time_to_next(),
                     ActionClass::Account,
@@ -88,7 +91,7 @@ pub fn spawn_housekeeper(inner: Arc<Inner>, mut rx: mpsc::Receiver<HousekeeperEv
             }
 
             // Store purges
-            if server.core.network.roles.purge_stores {
+            if roles.purge_stores.is_enabled_or_sharded() {
                 for (idx, schedule) in server.core.storage.purge_schedules.iter().enumerate() {
                     queue.schedule(
                         Instant::now() + schedule.cron.time_to_next(),
@@ -97,8 +100,33 @@ pub fn spawn_housekeeper(inner: Arc<Inner>, mut rx: mpsc::Receiver<HousekeeperEv
                 }
             }
 
+            // Spam classifier training
+            if roles.spam_training.is_enabled_or_sharded()
+                && let Some(train_frequency) = server
+                    .core
+                    .spam
+                    .classifier
+                    .as_ref()
+                    .and_then(|c| c.train_frequency)
+            {
+                let next_train = match server.inner.data.spam_classifier.load().as_ref() {
+                    spamfilter::SpamClassifier::FhClassifier {
+                        last_trained_at, ..
+                    }
+                    | spamfilter::SpamClassifier::CcfhClassifier {
+                        last_trained_at, ..
+                    } => now().saturating_sub(*last_trained_at).min(train_frequency),
+                    spamfilter::SpamClassifier::Disabled => train_frequency,
+                };
+
+                queue.schedule(
+                    Instant::now() + Duration::from_secs(next_train),
+                    ActionClass::TrainSpamClassifier,
+                );
+            }
+
             // OTEL Push Metrics
-            if server.core.network.roles.push_metrics
+            if roles.push_metrics.is_enabled_or_sharded()
                 && let Some(otel) = &server.core.metrics.otel
             {
                 OtelMetrics::enable_errors();
@@ -109,8 +137,8 @@ pub fn spawn_housekeeper(inner: Arc<Inner>, mut rx: mpsc::Receiver<HousekeeperEv
             queue.schedule(Instant::now(), ActionClass::CalculateMetrics);
 
             // Add all ACME renewals to heap
-            if server.core.network.roles.renew_acme {
-                for provider in server.core.acme.providers.values() {
+            for provider in server.core.acme.providers.values() {
+                if roles.renew_acme.is_enabled_for_hash(&provider.id) {
                     match server.init_acme(provider).await {
                         Ok(renew_at) => {
                             queue.schedule(
@@ -265,14 +293,20 @@ pub fn spawn_housekeeper(inner: Arc<Inner>, mut rx: mpsc::Receiver<HousekeeperEv
                             });
                         }
                         HousekeeperEvent::Exit => {
-                            trc::event!(Housekeeper(trc::HousekeeperEvent::Stop));
+                            trc::event!(
+                                Housekeeper(trc::HousekeeperEvent::Stop),
+                                Reason = "Shutdown"
+                            );
 
                             return;
                         }
                     }
                 }
                 Ok(None) => {
-                    trc::event!(Housekeeper(trc::HousekeeperEvent::Stop));
+                    trc::event!(
+                        Housekeeper(trc::HousekeeperEvent::Stop),
+                        Reason = "Channel closed"
+                    );
                     return;
                 }
                 Err(_) => {
@@ -343,7 +377,15 @@ pub fn spawn_housekeeper(inner: Arc<Inner>, mut rx: mpsc::Receiver<HousekeeperEv
                                     ActionClass::Account,
                                 );
                                 tokio::spawn(async move {
-                                    server.purge(PurgeType::Account(None), 0).await;
+                                    server
+                                        .purge(
+                                            PurgeType::Account {
+                                                account_id: None,
+                                                use_roles: true,
+                                            },
+                                            0,
+                                        )
+                                        .await;
                                 });
                             }
                             ActionClass::Store(idx) => {
@@ -423,7 +465,7 @@ pub fn spawn_housekeeper(inner: Arc<Inner>, mut rx: mpsc::Receiver<HousekeeperEv
                                 // Calculate expensive metrics every 5 minutes
                                 queue.schedule(
                                     Instant::now() + Duration::from_secs(5 * 60),
-                                    ActionClass::OtelMetrics,
+                                    ActionClass::CalculateMetrics,
                                 );
 
                                 let update_other_metrics = if Instant::now() >= next_metric_update {
@@ -436,7 +478,13 @@ pub fn spawn_housekeeper(inner: Arc<Inner>, mut rx: mpsc::Receiver<HousekeeperEv
 
                                 let server = server.clone();
                                 tokio::spawn(async move {
-                                    if server.core.network.roles.calculate_metrics {
+                                    if server
+                                        .core
+                                        .network
+                                        .roles
+                                        .calculate_metrics
+                                        .is_enabled_or_sharded()
+                                    {
                                         // SPDX-SnippetBegin
                                         // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
                                         // SPDX-License-Identifier: LicenseRef-SEL
@@ -516,6 +564,41 @@ pub fn spawn_housekeeper(inner: Arc<Inner>, mut rx: mpsc::Receiver<HousekeeperEv
                                         }
                                     }
                                 });
+                            }
+                            ActionClass::TrainSpamClassifier => {
+                                if server
+                                    .core
+                                    .network
+                                    .roles
+                                    .spam_training
+                                    .is_enabled_or_sharded()
+                                    && let Some(train_frequency) = server
+                                        .core
+                                        .spam
+                                        .classifier
+                                        .as_ref()
+                                        .and_then(|c| c.train_frequency)
+                                {
+                                    trc::event!(
+                                        Housekeeper(trc::HousekeeperEvent::Run),
+                                        Type = "spam_classifier_train"
+                                    );
+
+                                    // Schedule next training
+                                    queue.schedule(
+                                        Instant::now() + Duration::from_secs(train_frequency),
+                                        ActionClass::TrainSpamClassifier,
+                                    );
+
+                                    let server = server.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(err) = server.spam_train(false).await {
+                                            trc::error!(
+                                                err.details("Failed to train spam classifier")
+                                            );
+                                        }
+                                    });
+                                }
                             }
 
                             // SPDX-SnippetBegin
@@ -665,7 +748,7 @@ impl Purge for Server {
                     .into(),
             ),
             PurgeType::Lookup { .. } => ("in-memory-prefix", None),
-            PurgeType::Account(_) => ("account", None),
+            PurgeType::Account { .. } => ("account", None),
         };
         if let Some(lock_name) = &lock_name {
             match self
@@ -720,7 +803,9 @@ impl Purge for Server {
                 // SPDX-License-Identifier: LicenseRef-SEL
                 #[cfg(feature = "enterprise")]
                 if let Some(trace_retention) = trace_retention
-                    && let Err(err) = store.purge_spans(trace_retention).await
+                    && let Err(err) = store
+                        .purge_spans(trace_retention, self.search_store().into())
+                        .await
                 {
                     trc::error!(err.details("Failed to purge tracing spans"));
                 }
@@ -750,11 +835,14 @@ impl Purge for Server {
                     trc::error!(err.details("Failed to purge in-memory store"));
                 }
             }
-            PurgeType::Account(account_id) => {
+            PurgeType::Account {
+                account_id,
+                use_roles,
+            } => {
                 if let Some(account_id) = account_id {
                     self.purge_account(account_id).await;
                 } else {
-                    self.purge_accounts().await;
+                    self.purge_accounts(use_roles).await;
                 }
             }
         }

@@ -197,6 +197,8 @@ impl TaskQueueEvent {
             TaskQueueEvent::TaskLocked => "Task is locked by another process",
             TaskQueueEvent::BlobNotFound => "Blob not found for task",
             TaskQueueEvent::MetadataNotFound => "Metadata not found for task",
+            TaskQueueEvent::TaskIgnored => "Task ignored based on current server roles",
+            TaskQueueEvent::TaskFailed => "Task failed during processing",
         }
     }
 
@@ -206,6 +208,8 @@ impl TaskQueueEvent {
             TaskQueueEvent::TaskLocked => "The task id is locked by another process",
             TaskQueueEvent::BlobNotFound => "The requested blob was not found for task",
             TaskQueueEvent::MetadataNotFound => "The metadata was not found for task",
+            TaskQueueEvent::TaskIgnored => "The task was ignored based on the current server roles",
+            TaskQueueEvent::TaskFailed => "The task failed during processing",
         }
     }
 }
@@ -1033,29 +1037,35 @@ impl SpamEvent {
         match self {
             SpamEvent::Pyzor => "Pyzor success",
             SpamEvent::PyzorError => "Pyzor error",
-            SpamEvent::Train => "Training spam filter",
-            SpamEvent::TrainBalance => "Spam filter model balance verify",
-            SpamEvent::TrainError => "Error training spam filter",
             SpamEvent::Classify => "Classifying message for spam",
-            SpamEvent::ClassifyError => "Not enough training data for spam filter",
             SpamEvent::Dnsbl => "DNSBL query",
             SpamEvent::DnsblError => "Error querying DNSBL",
-            SpamEvent::TrainAccount => "Training spam filter for account",
+            SpamEvent::TrainStarted => "Spam classifier training started",
+            SpamEvent::TrainCompleted => "Spam classifier training completed",
+            SpamEvent::TrainSampleAdded => "New training sample added",
+            SpamEvent::TrainSampleNotFound => "Training sample not found",
+            SpamEvent::ModelLoaded => "Spam classifier model loaded",
+            SpamEvent::ModelNotReady => "Spam classifier model not ready",
+            SpamEvent::ModelNotFound => "Spam classifier model not found",
         }
     }
 
     pub fn explain(&self) -> &'static str {
         match self {
             SpamEvent::PyzorError => "An error occurred with Pyzor",
-            SpamEvent::Train => "The spam filter is being trained with the message",
-            SpamEvent::TrainBalance => "The spam filter training data is verified for balance",
-            SpamEvent::TrainError => "An error occurred while training the spam filter",
             SpamEvent::Classify => "The message is being classified for spam",
-            SpamEvent::ClassifyError => "There is not enough training data for the spam filter",
             SpamEvent::Pyzor => "Pyzor query successful",
             SpamEvent::Dnsbl => "The DNSBL query was successful",
             SpamEvent::DnsblError => "An error occurred while querying the DNSBL",
-            SpamEvent::TrainAccount => "The spam filter has been trained for the account",
+            SpamEvent::TrainStarted => "SGD logistic regression training has started",
+            SpamEvent::TrainCompleted => "SGD logistic regression training has completed",
+            SpamEvent::TrainSampleAdded => "A new training sample has been added",
+            SpamEvent::TrainSampleNotFound => "A training sample was not found",
+            SpamEvent::ModelLoaded => "The spam classifier model has been loaded",
+            SpamEvent::ModelNotReady => {
+                "The spam classifier model has not been trained with enough data"
+            }
+            SpamEvent::ModelNotFound => "The spam classifier model has not been trained yet",
         }
     }
 }
@@ -1293,7 +1303,7 @@ impl PurgeEvent {
             PurgeEvent::Error => "Purge error",
             PurgeEvent::InProgress => "Active purge in progress",
             PurgeEvent::AutoExpunge => "Auto-expunge executed",
-            PurgeEvent::TombstoneCleanup => "Tombstone cleanup executed",
+            PurgeEvent::BlobCleanup => "Blob storage cleanup completed",
         }
     }
 
@@ -1305,7 +1315,7 @@ impl PurgeEvent {
             PurgeEvent::Error => "An error occurred with the purge",
             PurgeEvent::InProgress => "An active purge is in progress",
             PurgeEvent::AutoExpunge => "Auto-expunge has been executed",
-            PurgeEvent::TombstoneCleanup => "Tombstone cleanup has been executed",
+            PurgeEvent::BlobCleanup => "Blob storage cleanup has completed",
         }
     }
 }
@@ -1581,6 +1591,7 @@ impl StoreEvent {
             StoreEvent::CacheHit => "Cache hit",
             StoreEvent::CacheStale => "Cache is stale",
             StoreEvent::CacheUpdate => "Cache update",
+            StoreEvent::MeilisearchError => "Meilisearch error",
         }
     }
 
@@ -1622,6 +1633,7 @@ impl StoreEvent {
             StoreEvent::CacheHit => "Cache entry found for the account, no update needed",
             StoreEvent::CacheStale => "Cache is too old, rebuilding",
             StoreEvent::CacheUpdate => "Cache updated with latest database changes",
+            StoreEvent::MeilisearchError => "A Meilisearch error occurred",
         }
     }
 }
