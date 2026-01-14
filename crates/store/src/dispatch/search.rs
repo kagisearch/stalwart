@@ -21,13 +21,10 @@ impl SearchStore {
     pub async fn query_account(&self, query: SearchQuery) -> trc::Result<Vec<u32>> {
         // Pre-filter by mask
         match query.mask.len().cmp(&1) {
-            Ordering::Equal => {
-                return Ok(vec![query.mask.min().unwrap()]);
-            }
             Ordering::Less => {
                 return Ok(vec![]);
             }
-            Ordering::Greater => {}
+            Ordering::Equal | Ordering::Greater => {}
         }
 
         // If the store does not support FTS, use the internal FTS store
