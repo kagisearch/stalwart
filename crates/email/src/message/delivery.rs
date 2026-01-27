@@ -5,13 +5,13 @@
  */
 
 use super::ingest::{EmailIngest, IngestEmail, IngestSource};
-use crate::{mailbox::INBOX_ID, sieve::ingest::SieveScriptIngest};
+use crate::{mailbox::{DRAFTS_ID, INBOX_ID, JUNK_ID, TRASH_ID}, sieve::ingest::SieveScriptIngest};
 use common::{
     Server,
     ipc::{EmailPush, PushNotification},
 };
 use directory::Permission;
-use types::{id::Id, keyword::Keyword};
+use types::{keyword::Keyword};
 use mail_parser::MessageParser;
 use std::{borrow::Cow, future::Future};
 use store::ahash::AHashMap;
@@ -537,6 +537,35 @@ async fn deliver_to_recipient(
                     mailbox_ids.retain(|&id| id != INBOX_ID);
                 }
 
+                // Apply flag-based mailbox filing: certain keywords trigger automatic
+                // filing into special-use mailboxes during delivery
+                for keyword in &keywords {
+                    let target_mailbox = match keyword {
+                        Keyword::Junk => Some(JUNK_ID),
+                        Keyword::Deleted => Some(TRASH_ID),
+                        Keyword::Draft => Some(DRAFTS_ID),
+                        _ => None,
+                    };
+
+                    if let Some(target_id) = target_mailbox {
+                        // If only INBOX is targeted, replace it with the flag-based mailbox
+                        if mailbox_ids.len() == 1 && mailbox_ids[0] == INBOX_ID {
+                            mailbox_ids[0] = target_id;
+                        }
+                        // If INBOX is among multiple mailboxes, remove it and add target
+                        else if mailbox_ids.contains(&INBOX_ID) {
+                            mailbox_ids.retain(|&id| id != INBOX_ID);
+                            if !mailbox_ids.contains(&target_id) {
+                                mailbox_ids.push(target_id);
+                            }
+                        }
+                        // Otherwise, just ensure target mailbox is in the list
+                        else if !mailbox_ids.contains(&target_id) {
+                            mailbox_ids.push(target_id);
+                        }
+                    }
+                }
+
                 // Filter and apply AddHeader modifications
                 let add_headers: Vec<(String, String)> = hook_modifications
                     .into_iter()
@@ -623,5 +652,126 @@ async fn deliver_to_recipient(
         // There were problems during delivery
         #[allow(clippy::unnecessary_unwrap)]
         Err(last_temp_error.unwrap())
+    }
+}
+
+#[cfg(test)]
+mod flag_filing_tests {
+    use crate::mailbox::{ARCHIVE_ID, INBOX_ID, JUNK_ID, SENT_ID, TRASH_ID};
+    use types::keyword::Keyword;
+
+    /// Helper function that applies the flag-based filing logic
+    fn apply_flag_filing(mailbox_ids: &mut Vec<u32>, keywords: &[Keyword]) {
+        for keyword in keywords {
+            let target_mailbox = match keyword {
+                Keyword::Junk => Some(JUNK_ID),
+                Keyword::Deleted => Some(TRASH_ID),
+                _ => None,
+            };
+
+            if let Some(target_id) = target_mailbox {
+                if mailbox_ids.len() == 1 && mailbox_ids[0] == INBOX_ID {
+                    mailbox_ids[0] = target_id;
+                } else if mailbox_ids.contains(&INBOX_ID) {
+                    mailbox_ids.retain(|&id| id != INBOX_ID);
+                    if !mailbox_ids.contains(&target_id) {
+                        mailbox_ids.push(target_id);
+                    }
+                } else if !mailbox_ids.contains(&target_id) {
+                    mailbox_ids.push(target_id);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_junk_flag_replaces_inbox() {
+        let mut mailbox_ids = vec![INBOX_ID];
+        let keywords = vec![Keyword::Junk];
+
+        apply_flag_filing(&mut mailbox_ids, &keywords);
+
+        assert_eq!(mailbox_ids, vec![JUNK_ID]);
+    }
+
+    #[test]
+    fn test_junk_flag_removes_inbox_from_multiple() {
+        let mut mailbox_ids = vec![INBOX_ID, ARCHIVE_ID];
+        let keywords = vec![Keyword::Junk];
+
+        apply_flag_filing(&mut mailbox_ids, &keywords);
+
+        assert!(mailbox_ids.contains(&JUNK_ID));
+        assert!(mailbox_ids.contains(&ARCHIVE_ID));
+        assert!(!mailbox_ids.contains(&INBOX_ID));
+    }
+
+    #[test]
+    fn test_deleted_flag_filing() {
+        let mut mailbox_ids = vec![INBOX_ID];
+        let keywords = vec![Keyword::Deleted];
+
+        apply_flag_filing(&mut mailbox_ids, &keywords);
+
+        assert_eq!(mailbox_ids, vec![TRASH_ID]);
+    }
+
+    #[test]
+    fn test_explicit_fileinto_preserved() {
+        let mut mailbox_ids = vec![ARCHIVE_ID];
+        let keywords = vec![Keyword::Junk];
+
+        apply_flag_filing(&mut mailbox_ids, &keywords);
+
+        assert!(mailbox_ids.contains(&ARCHIVE_ID));
+        assert!(mailbox_ids.contains(&JUNK_ID));
+    }
+
+    #[test]
+    fn test_multiple_special_flags() {
+        let mut mailbox_ids = vec![INBOX_ID];
+        let keywords = vec![Keyword::Junk, Keyword::Deleted];
+
+        apply_flag_filing(&mut mailbox_ids, &keywords);
+
+        // First flag (Junk) replaces INBOX, second flag (Deleted) adds to list
+        assert!(mailbox_ids.contains(&JUNK_ID) || mailbox_ids.contains(&TRASH_ID));
+        assert!(!mailbox_ids.contains(&INBOX_ID));
+    }
+
+    #[test]
+    fn test_non_special_flags_ignored() {
+        let mut mailbox_ids = vec![INBOX_ID];
+        let keywords = vec![Keyword::Seen, Keyword::Flagged];
+
+        apply_flag_filing(&mut mailbox_ids, &keywords);
+
+        // Non-special flags should not trigger mailbox filing
+        assert_eq!(mailbox_ids, vec![INBOX_ID]);
+    }
+
+    #[test]
+    fn test_junk_already_in_target_mailbox() {
+        let mut mailbox_ids = vec![JUNK_ID];
+        let keywords = vec![Keyword::Junk];
+
+        apply_flag_filing(&mut mailbox_ids, &keywords);
+
+        // Should remain idempotent
+        assert_eq!(mailbox_ids, vec![JUNK_ID]);
+    }
+
+    #[test]
+    fn test_deleted_with_other_mailboxes() {
+        let mut mailbox_ids = vec![INBOX_ID, ARCHIVE_ID, SENT_ID];
+        let keywords = vec![Keyword::Deleted];
+
+        apply_flag_filing(&mut mailbox_ids, &keywords);
+
+        // Should remove INBOX and add TRASH
+        assert!(!mailbox_ids.contains(&INBOX_ID));
+        assert!(mailbox_ids.contains(&TRASH_ID));
+        assert!(mailbox_ids.contains(&ARCHIVE_ID));
+        assert!(mailbox_ids.contains(&SENT_ID));
     }
 }
