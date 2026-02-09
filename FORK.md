@@ -26,6 +26,10 @@ git branch --set-upstream-to remotes/origin/main
 git remote add upstream https://github.com/kagisearch/stalwart
 ```
 
+### Contributing
+
+When making a change we want to contribute to the upstream, commit your change against the merge base (find it with `git merge-base main upstream/main`), then open PRs against this fork and the upstream. Avoid rebasing after this. (In theory, this aligns the commit hashes and makes merge conflicts a little easier when [updating](#updating)).
+
 ### Updating
 
 Upgrade to a specific, released version of stalwart only.
