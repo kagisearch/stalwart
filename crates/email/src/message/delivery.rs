@@ -56,6 +56,156 @@ fn apply_add_header_modifications(
     new_message
 }
 
+// Replace headers in a raw RFC 5322 message using index-based targeting
+fn apply_replace_header_modifications(
+    replace_headers: &[(u32, String, String)],
+    original_raw: &[u8],
+    session_id: u64,
+) -> Option<Vec<u8>> {
+    // Find the header/body boundary
+    let body_start = original_raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| pos + 4)
+        .unwrap_or(original_raw.len());
+
+    let headers_section = &original_raw[..body_start.saturating_sub(2)];
+    let body_section = &original_raw[body_start..];
+
+    // Parse headers into mutable list of (name, value) pairs
+    let mut headers: Vec<(Cow<[u8]>, Cow<[u8]>)> = Vec::new();
+    let mut current_name: Option<Vec<u8>> = None;
+    let mut current_value: Vec<u8> = Vec::new();
+
+    for line in headers_section.split(|&b| b == b'\n') {
+        let line = if line.ends_with(b"\r") {
+            &line[..line.len() - 1]
+        } else {
+            line
+        };
+
+        if line.is_empty() {
+            continue;
+        }
+
+        // Check if this is a continuation line (starts with whitespace)
+        if line.first().is_some_and(|&c| c == b' ' || c == b'\t') {
+            if current_name.is_some() {
+                current_value.extend_from_slice(b"\r\n");
+                current_value.extend_from_slice(line);
+            }
+        } else {
+            // Save previous header if exists
+            if let Some(name) = current_name.take() {
+                headers.push((Cow::Owned(name), Cow::Owned(current_value.clone())));
+                current_value.clear();
+            }
+
+            // Parse new header
+            if let Some(colon_pos) = line.iter().position(|&b| b == b':') {
+                current_name = Some(line[..colon_pos].to_vec());
+                let value_start = colon_pos + 1;
+                if value_start < line.len() {
+                    let value_bytes = &line[value_start..];
+                    // Skip leading space if present
+                    let value_bytes = if value_bytes.first() == Some(&b' ') {
+                        &value_bytes[1..]
+                    } else {
+                        value_bytes
+                    };
+                    current_value.extend_from_slice(value_bytes);
+                }
+            }
+        }
+    }
+
+    // Save last header
+    if let Some(name) = current_name {
+        headers.push((Cow::Owned(name), Cow::Owned(current_value)));
+    }
+
+    let mut had_modifications = false;
+
+    // Apply each replace operation
+    for (target_index, target_name, new_value) in replace_headers {
+        let mut occurrence_count = 0u32;
+        let mut found = false;
+
+        headers.retain_mut(|(name, value)| {
+            if name
+                .iter()
+                .zip(target_name.as_bytes())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+                && name.len() == target_name.len()
+            {
+                occurrence_count += 1;
+                if occurrence_count == *target_index {
+                    found = true;
+                    if new_value.is_empty() {
+                        // Delete header
+                        had_modifications = true;
+                        return false;
+                    } else {
+                        // Replace value with RFC 8187 encoding
+                        let mut encoded_value = Vec::new();
+                        for byte in new_value.bytes() {
+                            match byte {
+                                b'\r' => encoded_value.extend_from_slice(b"%0D"),
+                                b'\n' => encoded_value.extend_from_slice(b"%0A"),
+                                _ => encoded_value.push(byte),
+                            }
+                        }
+                        *value = Cow::Owned(encoded_value);
+                        had_modifications = true;
+                    }
+                }
+            }
+            true
+        });
+
+        if !found {
+            trc::event!(
+                MessageIngest(trc::MessageIngestEvent::Error),
+                Details = format!(
+                    "ReplaceHeader: header '{}' occurrence {} not found",
+                    target_name, target_index
+                ),
+                SpanId = session_id
+            );
+        }
+    }
+
+    if !had_modifications {
+        return None;
+    }
+
+    // Rebuild message
+    let estimated_size = headers.iter().map(|(n, v)| n.len() + v.len() + 4).sum::<usize>()
+        + body_section.len()
+        + 4;
+    let mut new_message = Vec::with_capacity(estimated_size);
+
+    for (name, value) in headers {
+        new_message.extend_from_slice(&name);
+        // Check if value has leading whitespace (header folding)
+        if value.first().is_some_and(|&c| c == b' ' || c == b'\t') {
+            new_message.extend_from_slice(b":");
+        } else {
+            new_message.extend_from_slice(b": ");
+        }
+        new_message.extend_from_slice(&value);
+        // Check if value already ends with newline
+        if value.last().is_none_or(|&c| c != b'\n') {
+            new_message.extend_from_slice(b"\r\n");
+        }
+    }
+
+    new_message.extend_from_slice(b"\r\n");
+    new_message.extend_from_slice(body_section);
+
+    Some(new_message)
+}
+
 #[derive(Debug)]
 pub struct IngestMessage {
     pub sender_address: String,
@@ -175,6 +325,214 @@ mod tests {
         // Ensure the message remains parseable
         let headers = parse_headers(&out);
         assert!(headers.iter().any(|(n, _)| n == "X-CRLF"));
+    }
+}
+
+#[cfg(test)]
+mod replace_header_tests {
+    use super::apply_replace_header_modifications;
+    use mail_parser::MessageParser;
+
+    fn parse_headers(raw: &[u8]) -> Vec<(String, String)> {
+        let msg = MessageParser::new().parse(raw).expect("parse message");
+        msg.root_part()
+            .headers()
+            .iter()
+            .map(|h| {
+                let value = match h.value() {
+                    mail_parser::HeaderValue::Text(t) => t.to_string(),
+                    mail_parser::HeaderValue::TextList(list) => {
+                        list.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(", ")
+                    }
+                    mail_parser::HeaderValue::Address(addr_list) => {
+                        addr_list.iter()
+                            .filter_map(|addr| addr.address.as_ref().map(|a| a.as_ref().to_string()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                    _ => h.value().as_text().unwrap_or_default().to_string(),
+                };
+                (h.name().to_string(), value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_replace_single_header() {
+        let base = b"Subject: Old Subject\r\nFrom: sender@example.com\r\n\r\nBody";
+        let result = apply_replace_header_modifications(
+            &[(1, "Subject".to_string(), "New Subject".to_string())],
+            base,
+            12345,
+        );
+
+        assert!(result.is_some());
+        let modified = result.unwrap();
+        let headers = parse_headers(&modified);
+
+        assert!(headers.iter().any(|(n, v)| n == "Subject" && v == "New Subject"));
+        assert!(headers.iter().any(|(n, v)| n == "From" && v == "sender@example.com"));
+    }
+
+    #[test]
+    fn test_replace_by_index_second_occurrence() {
+        let base = b"Received: from server1\r\nReceived: from server2\r\nReceived: from server3\r\n\r\nBody";
+        let result = apply_replace_header_modifications(
+            &[(2, "Received".to_string(), "from modified-server2".to_string())],
+            base,
+            12345,
+        );
+
+        assert!(result.is_some());
+        let modified = result.unwrap();
+        let s = String::from_utf8_lossy(&modified);
+
+        // Verify the second occurrence was modified
+        let received_count = s.matches("Received:").count();
+        assert_eq!(received_count, 3);
+        assert!(s.contains("from server1"));
+        assert!(s.contains("from modified-server2"));
+        assert!(s.contains("from server3"));
+        assert!(!s.contains("from server2"));
+    }
+
+    #[test]
+    fn test_replace_with_empty_deletes() {
+        let base = b"Subject: Test\r\nX-Custom: value\r\nFrom: sender@example.com\r\n\r\nBody";
+        let result = apply_replace_header_modifications(
+            &[(1, "X-Custom".to_string(), "".to_string())],
+            base,
+            12345,
+        );
+
+        assert!(result.is_some());
+        let modified = result.unwrap();
+        let headers = parse_headers(&modified);
+
+        assert!(!headers.iter().any(|(n, _)| n == "X-Custom"));
+        assert!(headers.iter().any(|(n, _)| n == "Subject"));
+        assert!(headers.iter().any(|(n, _)| n == "From"));
+    }
+
+    #[test]
+    fn test_replace_nonexistent_returns_none() {
+        let base = b"Subject: Test\r\n\r\nBody";
+        let result = apply_replace_header_modifications(
+            &[(1, "X-NonExistent".to_string(), "value".to_string())],
+            base,
+            12345,
+        );
+
+        // Should return None since no modifications were made
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_replace_encodes_newlines_rfc8187() {
+        let base = b"Subject: Old\r\n\r\nBody";
+
+        // Test LF encoding
+        let ops_lf = vec![(1, "Subject".to_string(), "before\nafter".to_string())];
+        let modified_lf = apply_replace_header_modifications(&ops_lf, base, 12345).unwrap();
+        assert!(String::from_utf8_lossy(&modified_lf).contains("Subject: before%0Aafter"));
+
+        // Test CR encoding
+        let ops_cr = vec![(1, "Subject".to_string(), "before\rafter".to_string())];
+        let modified_cr = apply_replace_header_modifications(&ops_cr, base, 12345).unwrap();
+        assert!(String::from_utf8_lossy(&modified_cr).contains("Subject: before%0Dafter"));
+
+        // Test CRLF encoding
+        let ops_crlf = vec![(1, "Subject".to_string(), "before\r\nafter".to_string())];
+        let modified_crlf = apply_replace_header_modifications(&ops_crlf, base, 12345).unwrap();
+        assert!(String::from_utf8_lossy(&modified_crlf).contains("Subject: before%0D%0Aafter"));
+    }
+
+    #[test]
+    fn test_replace_preserves_body() {
+        let base = b"Subject: Test\r\n\r\nThis is the body\r\nwith multiple lines";
+        let result = apply_replace_header_modifications(
+            &[(1, "Subject".to_string(), "New".to_string())],
+            base,
+            12345,
+        );
+
+        assert!(result.is_some());
+        let modified = result.unwrap();
+        let s = String::from_utf8_lossy(&modified);
+        assert!(s.contains("This is the body\r\nwith multiple lines"));
+    }
+
+    #[test]
+    fn test_replace_case_insensitive() {
+        let base = b"subject: Test\r\n\r\nBody";
+        let result = apply_replace_header_modifications(
+            &[(1, "Subject".to_string(), "New".to_string())],
+            base,
+            12345,
+        );
+
+        assert!(result.is_some());
+        let modified = result.unwrap();
+        let headers = parse_headers(&modified);
+        assert!(headers.iter().any(|(n, v)| n == "Subject" && v == "New"));
+    }
+
+    #[test]
+    fn test_replace_index_out_of_bounds() {
+        let base = b"Subject: Test\r\n\r\nBody";
+        // Try to replace the 2nd occurrence when only 1 exists
+        let result = apply_replace_header_modifications(
+            &[(2, "Subject".to_string(), "New".to_string())],
+            base,
+            12345,
+        );
+
+        // Should return None - no modifications made
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_replace_multiple_operations() {
+        let base = b"Subject: Old\r\nFrom: old@example.com\r\nX-Delete: value\r\n\r\nBody";
+        let result = apply_replace_header_modifications(
+            &[
+                (1, "Subject".to_string(), "New Subject".to_string()),
+                (1, "From".to_string(), "new@example.com".to_string()),
+                (1, "X-Delete".to_string(), "".to_string()),
+            ],
+            base,
+            12345,
+        );
+
+        assert!(result.is_some());
+        let modified = result.unwrap();
+        let headers = parse_headers(&modified);
+
+        assert!(headers.iter().any(|(n, v)| n == "Subject" && v == "New Subject"));
+        assert!(headers.iter().any(|(n, v)| n == "From" && v == "new@example.com"));
+        assert!(!headers.iter().any(|(n, _)| n == "X-Delete"));
+    }
+
+    #[test]
+    fn test_replace_preserves_header_order() {
+        let base = b"From: sender\r\nTo: recipient\r\nSubject: Test\r\n\r\nBody";
+        let result = apply_replace_header_modifications(
+            &[(1, "Subject".to_string(), "New".to_string())],
+            base,
+            12345,
+        );
+
+        assert!(result.is_some());
+        let modified = result.unwrap();
+        let s = String::from_utf8_lossy(&modified);
+
+        // Check that From comes before To, and To comes before Subject
+        let from_pos = s.find("From:").unwrap();
+        let to_pos = s.find("To:").unwrap();
+        let subject_pos = s.find("Subject:").unwrap();
+
+        assert!(from_pos < to_pos);
+        assert!(to_pos < subject_pos);
     }
 }
 
@@ -566,21 +924,42 @@ async fn deliver_to_recipient(
                     }
                 }
 
-                // Filter and apply AddHeader modifications
-                let add_headers: Vec<(String, String)> = hook_modifications
-                    .into_iter()
-                    .filter_map(|m| match m {
-                        HookModification::AddHeader { name, value } => Some((name, value)),
-                    })
-                    .collect();
+                // Separate modifications by type
+                let mut add_headers: Vec<(String, String)> = Vec::new();
+                let mut replace_headers: Vec<(u32, String, String)> = Vec::new();
 
+                for m in hook_modifications {
+                    match m {
+                        HookModification::AddHeader { name, value } => {
+                            add_headers.push((name, value));
+                        }
+                        HookModification::ReplaceHeader { index, name, value } => {
+                            replace_headers.push((index, name, value));
+                        }
+                    }
+                }
+
+                // Apply AddHeader modifications first
+                let mut current_raw = &output_message.raw[..];
                 if !add_headers.is_empty() {
                     owned_new_raw = Some(apply_add_header_modifications(
                         &add_headers,
-                        &output_message.raw,
+                        current_raw,
                     ));
+                    current_raw = owned_new_raw.as_deref().unwrap();
+                }
 
-                    // Try to re-parse the modified message; rollback on failure
+                // Apply ReplaceHeader modifications
+                if !replace_headers.is_empty() {
+                    if let Some(modified) =
+                        apply_replace_header_modifications(&replace_headers, current_raw, session_id)
+                    {
+                        owned_new_raw = Some(modified);
+                    }
+                }
+
+                // Try to re-parse the modified message; rollback on failure
+                if owned_new_raw.is_some() {
                     let parse_ok = if let Some(ref bytes) = owned_new_raw {
                         if let Some(new_parsed) = MessageParser::new().parse(bytes) {
                             parsed_for_ingest = new_parsed;
@@ -595,7 +974,7 @@ async fn deliver_to_recipient(
                     if !parse_ok {
                         trc::event!(
                             MessageIngest(trc::MessageIngestEvent::Error),
-                            Details = "Failed to parse message after AddHeader modifications.",
+                            Details = "Failed to parse message after header modifications.",
                             SpanId = session_id
                         );
                         use_modified = false;

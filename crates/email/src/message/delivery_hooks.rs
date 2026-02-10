@@ -223,6 +223,13 @@ pub async fn try_delivery_hook(
                         Modification::AddHeader { name, value } => {
                             modifications_out.push(ModificationOut::AddHeader { name, value });
                         }
+                        Modification::ReplaceHeader { index, name, value } => {
+                            modifications_out.push(ModificationOut::ReplaceHeader {
+                                index,
+                                name,
+                                value,
+                            });
+                        }
                     }
                 }
 

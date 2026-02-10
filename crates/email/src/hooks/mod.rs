@@ -80,10 +80,21 @@ pub enum Modification {
     },
     #[serde(rename = "addHeader")]
     AddHeader { name: String, value: String },
+    #[serde(rename = "replaceHeader")]
+    ReplaceHeader {
+        index: u32,
+        name: String,
+        value: String,
+    },
 }
 
 pub enum ModificationOut {
     AddHeader { name: String, value: String },
+    ReplaceHeader {
+        index: u32,
+        name: String,
+        value: String,
+    },
 }
 
 impl Request {
