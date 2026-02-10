@@ -120,6 +120,8 @@ impl HttpEvent {
             HttpEvent::XForwardedMissing => "X-Forwarded-For header is missing",
             HttpEvent::ConnectionStart => "HTTP connection started",
             HttpEvent::ConnectionEnd => "HTTP connection ended",
+            HttpEvent::RequestStart => "HTTP request started",
+            HttpEvent::RequestEnd => "HTTP request ended",
         }
     }
 
@@ -132,6 +134,8 @@ impl HttpEvent {
             HttpEvent::XForwardedMissing => "The X-Forwarded-For header is missing",
             HttpEvent::ConnectionStart => "An HTTP connection was started",
             HttpEvent::ConnectionEnd => "An HTTP connection was ended",
+            HttpEvent::RequestStart => "An HTTP request was started",
+            HttpEvent::RequestEnd => "An HTTP request was ended",
         }
     }
 }
