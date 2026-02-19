@@ -72,6 +72,8 @@ const MANAGE_SIEVE_CONN_START: usize =
 const MANAGE_SIEVE_CONN_END: usize = EventType::ManageSieve(ManageSieveEvent::ConnectionEnd).id();
 const EV_ATTEMPT_START: usize = EventType::Delivery(DeliveryEvent::AttemptStart).id();
 const EV_ATTEMPT_END: usize = EventType::Delivery(DeliveryEvent::AttemptEnd).id();
+const HTTP_REQUEST_START: usize = EventType::Http(HttpEvent::RequestStart).id();
+const HTTP_REQUEST_END: usize = EventType::Http(HttpEvent::RequestEnd).id();
 
 const STALE_SPAN_CHECK_WATERMARK: usize = 8000;
 const SPAN_MAX_HOLD: u64 = 60 * 60 * 24; // 1 day
@@ -134,7 +136,8 @@ impl Collector {
                                 | POP3_CONN_START
                                 | SMTP_CONN_START
                                 | MANAGE_SIEVE_CONN_START
-                                | EV_ATTEMPT_START => {
+                                | EV_ATTEMPT_START
+                                | HTTP_REQUEST_START => {
                                     let event = Arc::new(event);
                                     self.active_spans.insert(
                                         event.span_id().unwrap_or_else(|| {
@@ -157,7 +160,8 @@ impl Collector {
                                 | POP3_CONN_END
                                 | SMTP_CONN_END
                                 | MANAGE_SIEVE_CONN_END
-                                | EV_ATTEMPT_END => {
+                                | EV_ATTEMPT_END
+                                | HTTP_REQUEST_END => {
                                     if let Some(span) = self
                                         .active_spans
                                         .remove(&event.span_id().expect("Missing span ID"))
