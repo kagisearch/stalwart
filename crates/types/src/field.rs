@@ -42,6 +42,7 @@ pub enum EmailField {
     Metadata,
     Threading,
     DeletedAt,
+    ThreadingId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +121,7 @@ impl From<EmailField> for u8 {
             EmailField::Metadata => 71,
             EmailField::Threading => 90,
             EmailField::DeletedAt => 91,
+            EmailField::ThreadingId => 92,
             EmailField::Archive => ARCHIVE_FIELD,
         }
     }

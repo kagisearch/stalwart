@@ -64,10 +64,12 @@ impl ArchivedMessageMetadata {
 
     pub fn unindex(&self, batch: &mut BatchBuilder) {
         // Delete metadata
-        let thread_name = self
+        let root_part = self
             .contents
             .first()
-            .and_then(|c| c.parts.first())
+            .and_then(|c| c.parts.first());
+
+        let thread_name = root_part
             .and_then(|p| {
                 p.headers.iter().rev().find_map(|h| {
                     if let ArchivedMetadataHeaderName::Subject = &h.name {
@@ -94,6 +96,20 @@ impl ArchivedMessageMetadata {
                 hash: BlobHash::from(&self.blob_hash),
                 to: BlobLink::Document,
             });
+
+        // Clean up secondary ThreadingId index entries (one per own Message-ID).
+        if let Some(p) = root_part {
+            for h in p.headers.iter() {
+                if let ArchivedMetadataHeaderName::MessageId = &h.name {
+                    if let Some(id) = h.value.as_text() {
+                        batch.clear(ValueClass::IndexProperty(IndexPropertyClass::Hash {
+                            property: EmailField::ThreadingId.into(),
+                            hash: CheekyHash::new(id),
+                        }));
+                    }
+                }
+            }
+        }
     }
 }
 

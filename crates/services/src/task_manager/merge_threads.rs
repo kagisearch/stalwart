@@ -7,7 +7,7 @@
 use common::{Server, storage::index::ObjectIndexBuilder};
 use email::message::{
     ingest::{MergeThreadIds, ThreadMerge},
-    metadata::MessageData,
+    metadata::{ArchivedMetadataHeaderName, MessageData, MessageMetadata},
 };
 use std::time::Duration;
 use store::{
@@ -19,6 +19,7 @@ use store::{
         key::DeserializeBigEndian,
     },
 };
+use utils::cheeky_hash::CheekyHash;
 use trc::AddContext;
 use types::{
     collection::{Collection, SyncCollection},
@@ -176,6 +177,45 @@ async fn merge_threads(
                             }),
                             thread_index,
                         );
+
+                        // Update ThreadingId secondary index entries for this document
+                        if let Some(metadata_) = server
+                            .store()
+                            .get_value::<Archive<AlignedBytes>>(ValueKey::property(
+                                account_id,
+                                Collection::Email,
+                                document_id,
+                                EmailField::Metadata,
+                            ))
+                            .await
+                            .caused_by(trc::location!())?
+                        {
+                            let metadata = metadata_
+                                .to_unarchived::<MessageMetadata>()
+                                .caused_by(trc::location!())?;
+                            if let Some(root_part) = metadata
+                                .inner
+                                .contents
+                                .first()
+                                .and_then(|c| c.parts.first())
+                            {
+                                for h in root_part.headers.iter() {
+                                    if let ArchivedMetadataHeaderName::MessageId = &h.name {
+                                        if let Some(id) = h.value.as_text() {
+                                            batch.set(
+                                                ValueClass::IndexProperty(
+                                                    IndexPropertyClass::Hash {
+                                                        property: EmailField::ThreadingId.into(),
+                                                        hash: CheekyHash::new(id),
+                                                    },
+                                                ),
+                                                thread_id.to_be_bytes().to_vec(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
