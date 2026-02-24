@@ -110,13 +110,16 @@ impl EmailCopy for Server {
 
         // Obtain threadId
         let mut message_ids = Vec::new();
+        let mut own_message_ids = Vec::new();
         let mut subject = "";
         for header in &metadata.contents[0].parts[0].headers {
             match &header.name {
                 MetadataHeaderName::MessageId => {
                     header.value.visit_text(|id| {
                         if !id.is_empty() {
-                            message_ids.push(CheekyHash::new(id.as_bytes()));
+                            let hash = CheekyHash::new(id.as_bytes());
+                            own_message_ids.push(hash);
+                            message_ids.push(hash);
                         }
                     });
                 }
@@ -144,7 +147,7 @@ impl EmailCopy for Server {
 
         // Obtain threadId
         let thread_result = self
-            .find_thread_id(account_id, subject, &message_ids)
+            .find_thread_id(account_id, subject, &message_ids, &own_message_ids)
             .await
             .caused_by(trc::location!())?;
 
@@ -202,15 +205,29 @@ impl EmailCopy for Server {
                     hash: thread_result.thread_hash,
                 }),
                 ThreadInfo::serialize(thread_id, &message_ids),
-            )
-            .set(
-                ValueClass::TaskQueue(TaskQueueClass::UpdateIndex {
-                    index: SearchIndex::Email,
-                    due: TaskEpoch::now(),
-                    is_insert: true,
-                }),
-                vec![],
             );
+
+        for msg_id in &own_message_ids {
+            batch
+                .with_collection(Collection::Email)
+                .with_document(document_id)
+                .set(
+                    ValueClass::IndexProperty(IndexPropertyClass::Hash {
+                        property: EmailField::ThreadingId.into(),
+                        hash: *msg_id,
+                    }),
+                    thread_id.to_be_bytes().to_vec(),
+                );
+        }
+
+        batch.set(
+            ValueClass::TaskQueue(TaskQueueClass::UpdateIndex {
+                index: SearchIndex::Email,
+                due: TaskEpoch::now(),
+                is_insert: true,
+            }),
+            vec![],
+        );
 
         // Merge threads if necessary
         if let Some(merge_threads) = MergeThreadIds::new(thread_result).serialize() {

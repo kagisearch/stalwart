@@ -94,6 +94,7 @@ pub trait EmailIngest: Sync + Send {
         account_id: u32,
         thread_name: &str,
         message_ids: &[CheekyHash],
+        own_message_ids: &[CheekyHash],
     ) -> impl Future<Output = trc::Result<ThreadResult>> + Send;
     fn assign_email_ids(
         &self,
@@ -150,6 +151,7 @@ impl EmailIngest for Server {
         // Obtain message references and thread name
         let mut message_id = None;
         let mut message_ids = Vec::new();
+        let mut own_message_ids = Vec::new();
         let thread_result = {
             let mut subject = "";
             for header in message.root_part().headers().iter().rev() {
@@ -159,7 +161,9 @@ impl EmailIngest for Server {
                             if message_id.is_none() {
                                 message_id = id.to_string().into();
                             }
-                            message_ids.push(CheekyHash::new(id.as_bytes()));
+                            let hash = CheekyHash::new(id.as_bytes());
+                            own_message_ids.push(hash);
+                            message_ids.push(hash);
                         }
                     }),
                     HeaderName::InReplyTo
@@ -187,7 +191,7 @@ impl EmailIngest for Server {
             message_ids.sort_unstable();
             message_ids.dedup();
 
-            self.find_thread_id(account_id, subject, &message_ids)
+            self.find_thread_id(account_id, subject, &message_ids, &own_message_ids)
                 .await?
         };
 
@@ -620,7 +624,23 @@ impl EmailIngest for Server {
                     hash: thread_result.thread_hash,
                 }),
                 ThreadInfo::serialize(thread_id, &message_ids),
-            )
+            );
+
+        // Secondary index: map each own Message-ID to thread_id
+        // (allows future replies to find this thread without requiring a subject match).
+        for msg_id in &own_message_ids {
+            batch
+                .with_collection(Collection::Email)
+                .with_document(document_id)
+                .set(
+                    ValueClass::IndexProperty(IndexPropertyClass::Hash {
+                        property: EmailField::ThreadingId.into(),
+                        hash: *msg_id,
+                    }),
+                    thread_id.to_be_bytes().to_vec(),
+                );
+        }
+        batch
             .set(
                 ValueClass::TaskQueue(TaskQueueClass::UpdateIndex {
                     index: SearchIndex::Email,
@@ -718,6 +738,7 @@ impl EmailIngest for Server {
         account_id: u32,
         thread_name: &str,
         message_ids: &[CheekyHash],
+        own_message_ids: &[CheekyHash],
     ) -> trc::Result<ThreadResult> {
         let mut result = ThreadResult {
             thread_id: None,
@@ -734,61 +755,104 @@ impl EmailIngest for Server {
             return Ok(result);
         }
 
-        // Find thread ids
-        let key_len = IndexKeyPrefix::len() + result.thread_hash.len() + U32_LEN;
-        let document_id_pos = key_len - U32_LEN;
         let mut thread_merge = ThreadMerge::new();
-        self.store()
-            .iterate(
-                IterateParams::new(
-                    ValueKey {
-                        account_id,
-                        collection: Collection::Email.into(),
-                        document_id: 0,
-                        class: ValueClass::IndexProperty(IndexPropertyClass::Hash {
-                            property: EmailField::Threading.into(),
-                            hash: result.thread_hash,
-                        }),
-                    },
-                    ValueKey {
-                        account_id,
-                        collection: Collection::Email.into(),
-                        document_id: u32::MAX,
-                        class: ValueClass::IndexProperty(IndexPropertyClass::Hash {
-                            property: EmailField::Threading.into(),
-                            hash: result.thread_hash,
-                        }),
+
+        // Phase 1: look up by referenced message IDs, without requiring a
+        // subject match. For each ID in the incoming message that is not its
+        // own Message-ID (i.e. came from In-Reply-To or References), check the
+        // ThreadingId index.
+        for ref_id in message_ids.iter().filter(|id| !own_message_ids.contains(id)) {
+            self.store()
+                .iterate(
+                    IterateParams::new(
+                        ValueKey {
+                            account_id,
+                            collection: Collection::Email.into(),
+                            document_id: 0,
+                            class: ValueClass::IndexProperty(IndexPropertyClass::Hash {
+                                property: EmailField::ThreadingId.into(),
+                                hash: *ref_id,
+                            }),
+                        },
+                        ValueKey {
+                            account_id,
+                            collection: Collection::Email.into(),
+                            document_id: u32::MAX,
+                            class: ValueClass::IndexProperty(IndexPropertyClass::Hash {
+                                property: EmailField::ThreadingId.into(),
+                                hash: *ref_id,
+                            }),
+                        },
+                    )
+                    .ascending(),
+                    |_key, value| {
+                        let thread_id = value.deserialize_be_u32(0)?;
+                        thread_merge.add(thread_id, 0);
+                        Ok(false) // stop after first hit for this ref_id
                     },
                 )
-                .ascending(),
-                |key, value| {
-                    if key.len() == key_len {
-                        // Find matching references
-                        let references = value.get(U32_LEN..).unwrap_or_default();
+                .await
+                .caused_by(trc::location!())?;
+        }
 
-                        if has_message_id(message_ids, references) {
-                            let document_id = key.deserialize_be_u32(document_id_pos)?;
-                            let thread_id = value.deserialize_be_u32(0)?;
+        // Phase 2: if no thread found via message IDs, fall back to the
+        // subject-keyed scan to group root-level messages with the same subject.
+        if thread_merge.num_thread_ids() == 0 {
+            let key_len = IndexKeyPrefix::len() + result.thread_hash.len() + U32_LEN;
+            let document_id_pos = key_len - U32_LEN;
+            self.store()
+                .iterate(
+                    IterateParams::new(
+                        ValueKey {
+                            account_id,
+                            collection: Collection::Email.into(),
+                            document_id: 0,
+                            class: ValueClass::IndexProperty(IndexPropertyClass::Hash {
+                                property: EmailField::Threading.into(),
+                                hash: result.thread_hash,
+                            }),
+                        },
+                        ValueKey {
+                            account_id,
+                            collection: Collection::Email.into(),
+                            document_id: u32::MAX,
+                            class: ValueClass::IndexProperty(IndexPropertyClass::Hash {
+                                property: EmailField::Threading.into(),
+                                hash: result.thread_hash,
+                            }),
+                        },
+                    )
+                    .ascending(),
+                    |key, value| {
+                        if key.len() == key_len {
+                            // Find matching references
+                            let references = value.get(U32_LEN..).unwrap_or_default();
 
-                            if message_ids.len() == 1
-                                || (message_ids.len() == references.len() / CheekyHash::HASH_SIZE
-                                    && references
-                                        .chunks_exact(CheekyHash::HASH_SIZE)
-                                        .zip(message_ids.iter())
-                                        .all(|(a, b)| a == b.as_raw_bytes()))
-                            {
-                                result.duplicate_ids.push(document_id);
+                            if has_message_id(message_ids, references) {
+                                let document_id = key.deserialize_be_u32(document_id_pos)?;
+                                let thread_id = value.deserialize_be_u32(0)?;
+
+                                if message_ids.len() == 1
+                                    || (message_ids.len()
+                                        == references.len() / CheekyHash::HASH_SIZE
+                                        && references
+                                            .chunks_exact(CheekyHash::HASH_SIZE)
+                                            .zip(message_ids.iter())
+                                            .all(|(a, b)| a == b.as_raw_bytes()))
+                                {
+                                    result.duplicate_ids.push(document_id);
+                                }
+
+                                thread_merge.add(thread_id, document_id);
                             }
-
-                            thread_merge.add(thread_id, document_id);
                         }
-                    }
 
-                    Ok(true)
-                },
-            )
-            .await
-            .caused_by(trc::location!())?;
+                        Ok(true)
+                    },
+                )
+                .await
+                .caused_by(trc::location!())?;
+        }
 
         match thread_merge.num_thread_ids() {
             0 => Ok(result),
