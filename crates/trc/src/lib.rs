@@ -140,6 +140,9 @@ pub enum Key {
     Value,
     Version,
     QueueName,
+    TraceId,
+    TraceParentId,
+    TraceFlags,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -202,6 +205,8 @@ pub enum HttpEvent {
     RequestBody,
     ResponseBody,
     XForwardedMissing,
+    RequestStart,
+    RequestEnd,
 }
 
 #[event_type]
