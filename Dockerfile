@@ -5,7 +5,7 @@
 # Stalwart Dockerfile
 # Credits: https://github.com/33KK 
 
-FROM --platform=$BUILDPLATFORM docker.io/lukemathwalker/cargo-chef:latest-rust-slim-trixie AS chef
+FROM --platform=$BUILDPLATFORM docker.io/lukemathwalker/cargo-chef:latest-rust-1.92.0-slim-trixie AS chef
 WORKDIR /build
 
 FROM --platform=$BUILDPLATFORM chef AS planner
