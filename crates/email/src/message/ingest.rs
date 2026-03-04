@@ -319,6 +319,15 @@ impl EmailIngest for Server {
                         }
                     }
 
+                    // Honor $Junk/$NotJunk flags set by delivery hooks or sieve
+                    if is_spam && params.keywords.contains(&Keyword::NotJunk) {
+                        is_spam = false;
+                        overridden = Some("notjunk-keyword");
+                    } else if !is_spam && params.keywords.contains(&Keyword::Junk) {
+                        is_spam = true;
+                        overridden = Some("junk-keyword");
+                    }
+
                     // Add Spam-Status header
                     const HEADER: &str = "X-Spam-Status";
                     let offset_field = extra_headers.len();
