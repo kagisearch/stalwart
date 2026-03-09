@@ -903,6 +903,8 @@ impl EventType {
             EventType::Spam(SpamEvent::TrainStarted) => 588,
             EventType::Spam(SpamEvent::ModelLoaded) => 589,
             EventType::Store(StoreEvent::MeilisearchError) => 590,
+            EventType::Http(HttpEvent::RequestStart) => 591,
+            EventType::Http(HttpEvent::RequestEnd) => 592,
         }
     }
 
@@ -1544,6 +1546,8 @@ impl EventType {
             588 => Some(EventType::Spam(SpamEvent::TrainStarted)),
             589 => Some(EventType::Spam(SpamEvent::ModelLoaded)),
             590 => Some(EventType::Store(StoreEvent::MeilisearchError)),
+            591 => Some(EventType::Http(HttpEvent::RequestStart)),
+            592 => Some(EventType::Http(HttpEvent::RequestEnd)),
             _ => None,
         }
     }
@@ -1618,6 +1622,9 @@ impl Key {
             Key::Value => 63,
             Key::Version => 64,
             Key::QueueName => 65,
+            Key::TraceId => 66,
+            Key::TraceParentId => 67,
+            Key::TraceFlags => 68,
         }
     }
 
@@ -1689,6 +1696,9 @@ impl Key {
             63 => Some(Key::Value),
             64 => Some(Key::Version),
             65 => Some(Key::QueueName),
+            66 => Some(Key::TraceId),
+            67 => Some(Key::TraceParentId),
+            68 => Some(Key::TraceFlags),
             _ => None,
         }
     }

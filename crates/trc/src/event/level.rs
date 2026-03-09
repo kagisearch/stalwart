@@ -354,7 +354,10 @@ impl EventType {
                 | SpamEvent::ModelNotFound => Level::Info,
             },
             EventType::Http(event) => match event {
-                HttpEvent::ConnectionStart | HttpEvent::ConnectionEnd => Level::Debug,
+                HttpEvent::ConnectionStart
+                | HttpEvent::ConnectionEnd
+                | HttpEvent::RequestStart
+                | HttpEvent::RequestEnd => Level::Debug,
                 HttpEvent::XForwardedMissing => Level::Warn,
                 HttpEvent::Error | HttpEvent::RequestUrl => Level::Debug,
                 HttpEvent::RequestBody | HttpEvent::ResponseBody => Level::Trace,
