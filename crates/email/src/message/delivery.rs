@@ -858,10 +858,11 @@ async fn deliver_to_recipient(
         let mut owned_new_raw: Option<Vec<u8>> = None;
         let mut use_modified = false;
         let mut parsed_for_ingest = parsed_output_message.clone();
+        let mut hook_preview_text: Option<String> = None;
         match try_delivery_hook(server, uid, &sender, &rcpt.address, &parsed_output_message).await
         {
             Ok(result) => {
-                let (hook_mailboxes, hook_flags, skip_inbox, hook_modifications) = match result {
+                let (hook_mailboxes, hook_flags, skip_inbox, hook_modifications, preview_text) = match result {
                     Some(v) => v,
                     None => {
                         // Discard without error
@@ -923,6 +924,8 @@ async fn deliver_to_recipient(
                         }
                     }
                 }
+
+                hook_preview_text = preview_text;
 
                 // Separate modifications by type
                 let mut add_headers: Vec<(String, String)> = Vec::new();
@@ -1012,6 +1015,7 @@ async fn deliver_to_recipient(
                     is_spam: rcpt.is_spam,
                 },
                 session_id,
+                preview_text: hook_preview_text,
             })
             .await
         {

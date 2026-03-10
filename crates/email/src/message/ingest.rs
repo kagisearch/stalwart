@@ -66,6 +66,7 @@ pub struct IngestEmail<'x> {
     pub received_at: Option<u64>,
     pub source: IngestSource<'x>,
     pub session_id: u64,
+    pub preview_text: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -625,6 +626,7 @@ impl EmailIngest for Server {
                 blob_hash.clone(),
                 data,
                 params.received_at.unwrap_or_else(now),
+                params.preview_text,
             )
             .caused_by(trc::location!())?
             .set(

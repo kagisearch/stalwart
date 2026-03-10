@@ -50,6 +50,8 @@ pub struct Response {
     pub skip_inbox: bool,
     #[serde(default)]
     pub flags: Vec<String>,
+    #[serde(default)]
+    pub preview_text: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]

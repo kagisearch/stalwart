@@ -107,5 +107,6 @@ pub(super) trait IndexMessage {
         blob_hash: BlobHash,
         data: MessageData,
         received_at: u64,
+        preview_override: Option<String>,
     ) -> trc::Result<&mut Self>;
 }

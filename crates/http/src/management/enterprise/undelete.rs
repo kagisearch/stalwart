@@ -281,6 +281,7 @@ impl UndeleteApi for Server {
                                             received_at: request.time.into(),
                                             source: IngestSource::Restore,
                                             session_id: session.session_id,
+                                            preview_text: None,
                                         })
                                         .await
                                     {
