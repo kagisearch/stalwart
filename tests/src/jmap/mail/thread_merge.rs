@@ -241,6 +241,7 @@ async fn test_multi_thread(params: &mut JMAPTest) {
                             is_spam: false,
                         },
                         session_id: 0,
+                        preview_text: None,
                     })
                     .await
                 {

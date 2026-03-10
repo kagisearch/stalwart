@@ -114,6 +114,7 @@ impl<T: SessionStream> SessionData<T> {
                         train_classifier: true,
                     },
                     session_id: self.session_id,
+                    preview_text: None,
                 })
                 .await
             {

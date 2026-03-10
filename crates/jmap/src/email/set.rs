@@ -766,6 +766,7 @@ impl EmailSet for Server {
                         train_classifier: true,
                     },
                     session_id: session.session_id,
+                    preview_text: None,
                 })
                 .await
             {

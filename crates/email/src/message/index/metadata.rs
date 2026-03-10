@@ -12,6 +12,8 @@ use crate::message::{
         MessageMetadataPart, build_metadata_contents,
     },
 };
+use std::borrow::Cow;
+
 use common::storage::index::ObjectIndexBuilder;
 use mail_parser::{
     PartType,
@@ -123,15 +125,20 @@ impl IndexMessage for BatchBuilder {
         blob_hash: BlobHash,
         data: MessageData,
         received_at: u64,
+        preview_override: Option<String>,
     ) -> trc::Result<&mut Self> {
         let mut has_attachments = false;
-        let mut preview = None;
-        let preview_part_id = message
-            .text_body
-            .first()
-            .or_else(|| message.html_body.first())
-            .copied()
-            .unwrap_or(u32::MAX);
+        let mut preview = preview_override.map(|t| Cow::Owned(t.replace('\r', "")));
+        let preview_part_id = if preview.is_none() {
+            message
+                .text_body
+                .first()
+                .or_else(|| message.html_body.first())
+                .copied()
+                .unwrap_or(u32::MAX)
+        } else {
+            u32::MAX
+        };
 
         for (part_id, part) in message.parts.iter().take(MAX_MESSAGE_PARTS).enumerate() {
             let part_id = part_id as u32;

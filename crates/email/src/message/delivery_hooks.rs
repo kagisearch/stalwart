@@ -49,8 +49,9 @@ pub async fn try_delivery_hook(
     sender: &str,
     recipient: &str,
     parsed_message: &mail_parser::Message<'_>,
-) -> trc::Result<Option<(HashSet<u32>, HashSet<String>, bool, Vec<ModificationOut>)>> {
-    let default_response = Some((HashSet::new(), HashSet::new(), false, Vec::new()));
+) -> trc::Result<Option<(HashSet<u32>, HashSet<String>, bool, Vec<ModificationOut>, Option<String>)>>
+{
+    let default_response = Some((HashSet::new(), HashSet::new(), false, Vec::new(), None));
 
     let envelope = hooks::Envelope {
         from: hooks::Address {
@@ -140,6 +141,7 @@ pub async fn try_delivery_hook(
     let mut flags = HashSet::new();
     let mut skip_inbox = false;
     let mut modifications_out: Vec<ModificationOut> = Vec::new();
+    let mut preview_text: Option<String> = None;
     let mut should_tempfail = false;
     let mut should_permfail = false;
 
@@ -154,6 +156,10 @@ pub async fn try_delivery_hook(
             Ok(response) => {
                 if response.skip_inbox {
                     skip_inbox = true;
+                }
+
+                if preview_text.is_none() {
+                    preview_text = response.preview_text;
                 }
 
                 for flag in response.flags {
@@ -318,5 +324,5 @@ pub async fn try_delivery_hook(
         );
     }
 
-    Ok(Some((mailbox_ids, flags, skip_inbox, modifications_out)))
+    Ok(Some((mailbox_ids, flags, skip_inbox, modifications_out, preview_text)))
 }

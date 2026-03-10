@@ -161,6 +161,7 @@ impl EmailImport for Server {
                     keywords: email.keywords,
                     received_at: email.received_at.map(|r| r.into()),
                     session_id: session.session_id,
+                    preview_text: None,
                 })
                 .await
             {
