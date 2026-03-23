@@ -178,6 +178,10 @@ impl UTCDate {
 
 impl Display for UTCDate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.is_valid() {
+            return write!(f, "1970-01-01T00:00:00Z");
+        }
+
         if self.tz_hour != 0 || self.tz_minute != 0 {
             write!(
                 f,
@@ -241,6 +245,33 @@ impl From<u64> for UTCDate {
 mod tests {
     use crate::types::date::UTCDate;
     use std::str::FromStr;
+
+    #[test]
+    fn invalid_dates_display_as_epoch() {
+        // Year > 4 digits (from https://github.com/stalwartlabs/mail-parser/pull/130)
+        let date = UTCDate {
+            year: 30579,
+            month: 12,
+            day: 6,
+            hour: 15,
+            minute: 30,
+            second: 8,
+            ..Default::default()
+        };
+        assert_eq!(date.to_string(), "1970-01-01T00:00:00Z");
+
+        // Invalid month (from https://github.com/stalwartlabs/mail-parser/pull/130)
+        let date = UTCDate {
+            year: 1911,
+            month: 219,
+            day: 3,
+            hour: 19,
+            minute: 46,
+            second: 0,
+            ..Default::default()
+        };
+        assert_eq!(date.to_string(), "1970-01-01T00:00:00Z");
+    }
 
     #[test]
     fn parse_jmap_date() {

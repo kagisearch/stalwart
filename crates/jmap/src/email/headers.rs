@@ -497,7 +497,7 @@ pub(crate) fn unwrap_date(value: Value<'_, EmailProperty, EmailValue>) -> Option
 }
 
 fn from_mail_datetime(date: DateTime) -> Value<'static, EmailProperty, EmailValue> {
-    Value::Element(EmailValue::Date(UTCDate {
+    let utc_date = UTCDate {
         year: date.year,
         month: date.month,
         day: date.day,
@@ -507,6 +507,11 @@ fn from_mail_datetime(date: DateTime) -> Value<'static, EmailProperty, EmailValu
         tz_before_gmt: date.tz_before_gmt,
         tz_hour: date.tz_hour,
         tz_minute: date.tz_minute,
+    };
+    Value::Element(EmailValue::Date(if utc_date.is_valid() {
+        utc_date
+    } else {
+        UTCDate::default()
     }))
 }
 
