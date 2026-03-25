@@ -250,6 +250,7 @@ impl EventType {
                 | EventType::ManageSieve(ManageSieveEvent::ConnectionStart)
                 | EventType::Pop3(Pop3Event::ConnectionStart)
                 | EventType::Http(HttpEvent::ConnectionStart)
+                | EventType::Http(HttpEvent::RequestStart)
                 | EventType::Delivery(DeliveryEvent::AttemptStart)
         )
     }
@@ -263,6 +264,7 @@ impl EventType {
                 | EventType::ManageSieve(ManageSieveEvent::ConnectionEnd)
                 | EventType::Pop3(Pop3Event::ConnectionEnd)
                 | EventType::Http(HttpEvent::ConnectionEnd)
+                | EventType::Http(HttpEvent::RequestEnd)
                 | EventType::Delivery(DeliveryEvent::AttemptEnd)
         )
     }
