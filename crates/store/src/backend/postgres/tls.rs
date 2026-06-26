@@ -15,8 +15,8 @@ use std::{
     task::{Context, Poll},
 };
 
+use aws_lc_rs::digest;
 use futures::future::{FutureExt, TryFutureExt};
-use ring::digest;
 use rustls::ClientConfig;
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};

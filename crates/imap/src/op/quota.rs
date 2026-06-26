@@ -10,15 +10,12 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::time::Instant;
-
 use crate::{
     core::{Session, SessionData},
     op::ImapContext,
     spawn_op,
 };
-use common::listener::SessionStream;
-use directory::Permission;
+use common::network::SessionStream;
 use imap_proto::{
     Command, ResponseCode, StatusResponse,
     protocol::{
@@ -28,6 +25,8 @@ use imap_proto::{
     },
     receiver::Request,
 };
+use registry::schema::enums::Permission;
+use std::time::Instant;
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_get_quota(&mut self, request: Request<Command>) -> trc::Result<()> {
@@ -101,14 +100,14 @@ impl<T: SessionStream> SessionData<T> {
             })?;
 
         // Obtain access token for mailbox
-        let access_token = self
+        let account = self
             .server
-            .get_access_token(account_id)
+            .account(account_id)
             .await
             .imap_ctx(&arguments.tag, trc::location!())?;
         let used_quota = self
             .server
-            .get_used_quota(account_id)
+            .get_used_quota_account(account_id)
             .await
             .imap_ctx(&arguments.tag, trc::location!())?;
 
@@ -118,7 +117,7 @@ impl<T: SessionStream> SessionData<T> {
             Id = arguments.name.clone(),
             Details = vec![
                 trc::Value::from(used_quota),
-                trc::Value::from(access_token.quota)
+                trc::Value::from(account.disk_quota())
             ],
             Elapsed = op_start.elapsed()
         );
@@ -128,11 +127,15 @@ impl<T: SessionStream> SessionData<T> {
             quota_root_items: vec![],
             quota_items: vec![QuotaItem {
                 name: arguments.name,
-                resources: vec![QuotaResource {
-                    resource: QuotaResourceName::Storage,
-                    total: access_token.quota,
-                    used: used_quota as u64,
-                }],
+                resources: if account.disk_quota() > 0 {
+                    vec![QuotaResource {
+                        resource: QuotaResourceName::Storage,
+                        total: account.disk_quota(),
+                        used: used_quota as u64,
+                    }]
+                } else {
+                    vec![]
+                },
             }],
         };
 
@@ -161,14 +164,14 @@ impl<T: SessionStream> SessionData<T> {
         };
 
         // Obtain access token for mailbox
-        let access_token = self
+        let account = self
             .server
-            .get_access_token(account_id)
+            .account(account_id)
             .await
             .imap_ctx(&arguments.tag, trc::location!())?;
         let used_quota = self
             .server
-            .get_used_quota(account_id)
+            .get_used_quota_account(account_id)
             .await
             .imap_ctx(&arguments.tag, trc::location!())?;
 
@@ -178,7 +181,7 @@ impl<T: SessionStream> SessionData<T> {
             MailboxName = arguments.name.clone(),
             Details = vec![
                 trc::Value::from(used_quota),
-                trc::Value::from(access_token.quota)
+                trc::Value::from(account.disk_quota())
             ],
             Elapsed = op_start.elapsed()
         );
@@ -188,11 +191,15 @@ impl<T: SessionStream> SessionData<T> {
             quota_root_items: vec![arguments.name, format!("#{account_id}")],
             quota_items: vec![QuotaItem {
                 name: format!("#{account_id}"),
-                resources: vec![QuotaResource {
-                    resource: QuotaResourceName::Storage,
-                    total: access_token.quota,
-                    used: used_quota as u64,
-                }],
+                resources: if account.disk_quota() > 0 {
+                    vec![QuotaResource {
+                        resource: QuotaResourceName::Storage,
+                        total: account.disk_quota(),
+                        used: used_quota as u64,
+                    }]
+                } else {
+                    vec![]
+                },
             }],
         };
 

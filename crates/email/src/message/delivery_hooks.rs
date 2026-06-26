@@ -28,7 +28,10 @@ use crate::{
 pub struct DeliveryResolver;
 
 impl ResolveVariable for DeliveryResolver {
-    fn resolve_variable(&self, _variable: u32) -> common::expr::Variable<'_> {
+    fn resolve_variable(
+        &self,
+        _variable: registry::schema::enums::ExpressionVariable,
+    ) -> common::expr::Variable<'_> {
         // Delivery hooks don't use session variables, so return empty
         common::expr::Variable::default()
     }
@@ -53,6 +56,14 @@ pub async fn try_delivery_hook(
 {
     let default_response = Some((HashSet::new(), HashSet::new(), false, Vec::new(), None));
 
+    // Delivery-hook configuration is deferred to EMAIL-811 (the v0.16 registry
+    // object type that backs these hooks is not defined yet), so this list is
+    // empty until then. Bail out before doing any work to keep the path dormant.
+    let delivery_hooks = &server.core.smtp.session.delivery_hooks;
+    if delivery_hooks.is_empty() {
+        return Ok(default_response);
+    }
+
     let envelope = hooks::Envelope {
         from: hooks::Address {
             address: sender.to_string(),
@@ -67,28 +78,14 @@ pub async fn try_delivery_hook(
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
-    let principal = match server
-        .directory()
-        .query(directory::QueryParams::id(user_id))
-        .await
-    {
-        Ok(principal) => match principal {
-            Some(principal) => principal,
-            None => {
-                return Err(
-                    trc::EventType::MessageIngest(trc::MessageIngestEvent::Error).ctx(
-                        trc::Key::Reason,
-                        "User principal not found for delivery hook",
-                    ),
-                );
-            }
-        },
-        Err(err) => return Err(err),
-    };
+    // TODO(EMAIL-811): resolve the account's primary email by id via the v0.16
+    // registry when delivery hooks are wired back up. The v0.15 lookup
+    // (directory().query(QueryParams::id(..))) was removed in v0.16.
+    let principal_name = Id::from(user_id).as_string();
 
     let request = hooks::Request::new(
         Id::from(user_id).as_string(),
-        principal.name,
+        principal_name,
     )
     .with_envelope(envelope)
     .with_message(hooks::Message {
@@ -97,14 +94,6 @@ pub async fn try_delivery_hook(
         contents: String::from_utf8_lossy(&parsed_message.raw_message).into_owned(),
         size: parsed_message.raw_message.len(),
     });
-
-    // Get configured delivery hooks
-    let delivery_hooks = &server.core.smtp.session.delivery_hooks;
-
-    // If no hooks configured, return default to continue normal flow
-    if delivery_hooks.is_empty() {
-        return Ok(default_response);
-    }
 
     // Filter enabled hooks
     let resolver = DeliveryResolver;

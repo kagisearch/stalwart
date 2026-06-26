@@ -5,21 +5,22 @@
  */
 
 use crate::{
-    outbound::client::BoxResponse,
+    outbound::{client::BoxResponse, error::ClientError},
     queue::{Error, ErrorDetails, HostResponse, Status, UnexpectedResponse},
 };
 use common::config::{
     server::ServerProtocol,
-    smtp::queue::{MxConfig, RelayConfig},
+    smtp::queue::{HostOrIp, MxConfig, RelayConfig},
 };
+use directory::Credentials;
 use mail_auth::IpLookupStrategy;
-use mail_send::Credentials;
 use smtp_proto::{Response, Severity};
-use std::borrow::Cow;
+use std::{borrow::Cow, net::IpAddr};
 
 pub mod client;
 pub mod dane;
 pub mod delivery;
+pub mod error;
 pub mod local;
 pub mod lookup;
 pub mod mta_sts;
@@ -41,22 +42,22 @@ pub(super) enum DeliveryResult {
 }
 
 impl Status<HostResponse<Box<str>>, ErrorDetails> {
-    pub fn from_smtp_error(hostname: &str, command: &str, err: mail_send::Error) -> Self {
+    pub fn from_smtp_error(hostname: &str, command: &str, err: ClientError) -> Self {
         match err {
-            mail_send::Error::Io(_)
-            | mail_send::Error::Tls(_)
-            | mail_send::Error::Base64(_)
-            | mail_send::Error::UnparseableReply
-            | mail_send::Error::AuthenticationFailed(_)
-            | mail_send::Error::MissingCredentials
-            | mail_send::Error::MissingMailFrom
-            | mail_send::Error::MissingRcptTo
-            | mail_send::Error::Timeout => Status::TemporaryFailure(ErrorDetails {
+            ClientError::Io(_)
+            | ClientError::Tls(_)
+            | ClientError::Base64(_)
+            | ClientError::UnparseableReply
+            | ClientError::AuthenticationFailed(_)
+            | ClientError::MissingCredentials
+            | ClientError::MissingMailFrom
+            | ClientError::MissingRcptTo
+            | ClientError::Timeout => Status::TemporaryFailure(ErrorDetails {
                 entity: hostname.into(),
                 details: Error::ConnectionError(err.to_string().into_boxed_str()),
             }),
 
-            mail_send::Error::UnexpectedReply(response) => {
+            ClientError::UnexpectedReply(response) => {
                 if response.severity() == Severity::PermanentNegativeCompletion {
                     Status::PermanentFailure(ErrorDetails {
                         entity: hostname.into(),
@@ -76,10 +77,10 @@ impl Status<HostResponse<Box<str>>, ErrorDetails> {
                 }
             }
 
-            mail_send::Error::Auth(_)
-            | mail_send::Error::UnsupportedAuthMechanism
-            | mail_send::Error::InvalidTLSName
-            | mail_send::Error::MissingStartTls => Status::PermanentFailure(ErrorDetails {
+            ClientError::InvalidChallenge
+            | ClientError::UnsupportedAuthMechanism
+            | ClientError::InvalidTLSName
+            | ClientError::MissingStartTls => Status::PermanentFailure(ErrorDetails {
                 entity: hostname.into(),
                 details: Error::ConnectionError(err.to_string().into_boxed_str()),
             }),
@@ -114,21 +115,21 @@ impl Status<HostResponse<Box<str>>, ErrorDetails> {
         }
     }
 
-    pub fn from_tls_error(hostname: &str, err: mail_send::Error) -> Self {
+    pub fn from_tls_error(hostname: &str, err: ClientError) -> Self {
         match err {
-            mail_send::Error::InvalidTLSName => Status::PermanentFailure(ErrorDetails {
+            ClientError::InvalidTLSName => Status::PermanentFailure(ErrorDetails {
                 entity: hostname.into(),
                 details: Error::TlsError("Invalid hostname".into()),
             }),
-            mail_send::Error::Timeout => Status::TemporaryFailure(ErrorDetails {
+            ClientError::Timeout => Status::TemporaryFailure(ErrorDetails {
                 entity: hostname.into(),
                 details: Error::TlsError("TLS handshake timed out".into()),
             }),
-            mail_send::Error::Tls(err) => Status::TemporaryFailure(ErrorDetails {
+            ClientError::Tls(err) => Status::TemporaryFailure(ErrorDetails {
                 entity: hostname.into(),
                 details: Error::TlsError(format!("Handshake failed: {err}").into_boxed_str()),
             }),
-            mail_send::Error::Io(err) => Status::TemporaryFailure(ErrorDetails {
+            ClientError::Io(err) => Status::TemporaryFailure(ErrorDetails {
                 entity: hostname.into(),
                 details: Error::TlsError(format!("I/O error: {err}").into_boxed_str()),
             }),
@@ -246,21 +247,27 @@ impl NextHop<'_> {
                     host
                 }
             }
-            NextHop::Relay(host) => host.address.as_str(),
+            NextHop::Relay(host) => match &host.address {
+                HostOrIp::Host(host) => host.as_ref(),
+                HostOrIp::Ip(ip) => ip.ip_str.as_ref(),
+            },
         }
     }
 
     #[inline(always)]
-    pub fn fqdn_hostname(&self) -> Cow<'_, str> {
+    pub fn fqdn_hostname(&self) -> HostOrIp<Cow<'_, str>, IpAddr> {
         match self {
             NextHop::MX { host, .. } => {
                 if !host.ends_with('.') {
-                    format!("{host}.").into()
+                    HostOrIp::Host(format!("{host}.").into())
                 } else {
-                    (*host).into()
+                    HostOrIp::Host((*host).into())
                 }
             }
-            NextHop::Relay(host) => host.address.as_str().into(),
+            NextHop::Relay(host) => match &host.address {
+                HostOrIp::Host(host) => HostOrIp::Host(host.as_ref().into()),
+                HostOrIp::Ip(ip) => HostOrIp::Ip(ip.ip),
+            },
         }
     }
 
@@ -292,7 +299,7 @@ impl NextHop<'_> {
     }
 
     #[inline(always)]
-    fn credentials(&self) -> Option<&Credentials<String>> {
+    fn credentials(&self) -> Option<&Credentials> {
         match self {
             NextHop::MX { .. } => None,
             NextHop::Relay(host) => host.auth.as_ref(),

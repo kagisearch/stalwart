@@ -63,6 +63,9 @@ impl RunScript for Server {
             .with_envelope_list(params.envelope)
             .with_user_address(&params.from_addr)
             .with_user_full_name(&params.from_name);
+        if let Some(spam_status) = params.spam_status {
+            instance.set_spam_status(spam_status);
+        }
         let mut input = Input::script("__script", script);
         let mut messages: Vec<Vec<u8>> = Vec::new();
         let session_id = params.session_id;
@@ -98,7 +101,7 @@ impl RunScript for Server {
                     } => {
                         input = false.into();
                         'outer: for list in lists {
-                            if let Some(store) = self.core.storage.lookups.get(&list) {
+                            if let Some(store) = self.get_lookup_store(&list) {
                                 for value in &values {
                                     if let Ok(true) = store
                                         .key_exists(if !matches!(match_as, MatchAs::Lowercase) {
@@ -161,11 +164,11 @@ impl RunScript for Server {
                         let mut message = self.new_message(params.return_path.as_str(), session_id);
                         match recipient {
                             Recipient::Address(rcpt) => {
-                                message.add_recipient(rcpt, self).await;
+                                message.expand_and_add_recipient(rcpt, self).await;
                             }
                             Recipient::Group(rcpt_list) => {
                                 for rcpt in rcpt_list {
-                                    message.add_recipient(rcpt, self).await;
+                                    message.expand_and_add_recipient(rcpt, self).await;
                                 }
                             }
                             Recipient::List(list) => {
@@ -274,32 +277,45 @@ impl RunScript for Server {
                             instance.message().raw_message().into()
                         };
                         if let Some(raw_message) = raw_message.filter(|m| !m.is_empty()) {
-                            let headers = if !params.sign.is_empty() {
-                                let mut headers = Vec::new();
+                            let headers = if let Some(sign_domain) = &params.sign_domain {
+                                match self.dkim_signers(sign_domain).await {
+                                    Ok(Some(signers)) => {
+                                        let mut headers = Vec::new();
 
-                                for dkim in &params.sign {
-                                    if let Some(dkim) = self.get_dkim_signer(dkim, session_id) {
-                                        match dkim.sign(raw_message) {
-                                            Ok(signature) => {
-                                                signature.write_header(&mut headers);
-                                            }
-                                            Err(err) => {
-                                                trc::error!(
-                                                    trc::Error::from(err)
-                                                        .span_id(session_id)
-                                                        .caused_by(trc::location!())
-                                                        .details("DKIM sign failed")
-                                                );
+                                        for signer in signers.as_ref() {
+                                            match signer.sign(raw_message) {
+                                                Ok(signature) => {
+                                                    signature.write_header(&mut headers);
+                                                }
+                                                Err(err) => {
+                                                    trc::error!(
+                                                        trc::Error::from(err)
+                                                            .span_id(session_id)
+                                                            .caused_by(trc::location!())
+                                                            .details("DKIM sign failed")
+                                                    );
+                                                }
                                             }
                                         }
+
+                                        if is_forward {
+                                            headers.extend_from_slice(
+                                                params.headers.unwrap_or_default(),
+                                            );
+                                        }
+
+                                        Some(Cow::Owned(headers))
+                                    }
+                                    Ok(None) => None,
+                                    Err(err) => {
+                                        trc::error!(
+                                            err.details("Failed to obtain DKIM signers")
+                                                .caused_by(trc::location!())
+                                        );
+
+                                        None
                                     }
                                 }
-
-                                if is_forward {
-                                    headers.extend_from_slice(params.headers.unwrap_or_default());
-                                }
-
-                                Some(Cow::Owned(headers))
                             } else if is_forward {
                                 params.headers.map(Cow::Borrowed)
                             } else {

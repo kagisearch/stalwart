@@ -63,14 +63,14 @@ impl Store {
     pub async fn changes(
         &self,
         account_id: u32,
-        collection: LogCollection,
+        collection_: LogCollection,
         query: Query,
     ) -> trc::Result<Changes> {
         let is_share_log = matches!(
-            collection,
+            collection_,
             LogCollection::Sync(SyncCollection::ShareNotification)
         );
-        let collection = u8::from(collection);
+        let collection = u8::from(collection_);
 
         let (is_inclusive, from_change_id, to_change_id) = match query {
             Query::All => (true, 0, u64::MAX),
@@ -120,21 +120,15 @@ impl Store {
                     } else {
                         changelog.changes.push(Change::InsertItem(change_id));
                     }
+                } else {
+                    changelog.from_change_id = change_id;
+                    changelog.to_change_id = change_id;
                 }
                 Ok(true)
             },
         )
         .await
         .caused_by(trc::location!())?;
-
-        if changelog.changes.is_empty() {
-            changelog.from_change_id = from_change_id;
-            changelog.to_change_id = if to_change_id != u64::MAX {
-                to_change_id
-            } else {
-                from_change_id
-            };
-        }
 
         Ok(changelog)
     }

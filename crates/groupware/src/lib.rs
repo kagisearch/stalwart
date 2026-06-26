@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+#![warn(clippy::large_futures)]
+
 use calcard::common::timezone::Tz;
 use common::DavResources;
 use percent_encoding::{AsciiSet, CONTROLS};

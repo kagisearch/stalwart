@@ -4,8 +4,6 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use trc::AddContext;
-
 use crate::{
     SearchStore, Store,
     search::{
@@ -16,15 +14,13 @@ use crate::{
     write::SearchIndex,
 };
 use std::cmp::Ordering;
+use trc::AddContext;
 
 impl SearchStore {
     pub async fn query_account(&self, query: SearchQuery) -> trc::Result<Vec<u32>> {
         // Pre-filter by mask
-        match query.mask.len().cmp(&1) {
-            Ordering::Less => {
-                return Ok(vec![]);
-            }
-            Ordering::Equal | Ordering::Greater => {}
+        if query.mask.is_empty() {
+            return Ok(vec![]);
         }
 
         // If the store does not support FTS, use the internal FTS store
@@ -169,7 +165,7 @@ impl SearchStore {
                             }
                         }
                         // Add any remaining results not yet in the index
-                        ordered_results.extend(results.into_iter());
+                        ordered_results.extend(results);
 
                         if local.is_empty() {
                             return Ok(ordered_results);
@@ -345,6 +341,32 @@ impl SearchStore {
 
     pub fn is_meilisearch(&self) -> bool {
         matches!(self, SearchStore::MeiliSearch(_))
+    }
+
+    pub async fn create_indexes(&self) -> trc::Result<()> {
+        match self {
+            SearchStore::Store(store) => match store {
+                #[cfg(feature = "postgres")]
+                Store::PostgreSQL(store) => store.create_search_tables().await,
+                #[cfg(feature = "mysql")]
+                Store::MySQL(store) => store.create_search_tables().await,
+                // SPDX-SnippetBegin
+                // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                // SPDX-License-Identifier: LicenseRef-SEL
+                #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+                Store::SQLReadReplica(store) => match store.primary_store() {
+                    #[cfg(feature = "postgres")]
+                    Store::PostgreSQL(primary) => primary.create_search_tables().await,
+                    #[cfg(feature = "mysql")]
+                    Store::MySQL(primary) => primary.create_search_tables().await,
+                    _ => Ok(()),
+                },
+                // SPDX-SnippetEnd
+                _ => Ok(()),
+            },
+            SearchStore::ElasticSearch(store) => store.create_indexes().await,
+            SearchStore::MeiliSearch(store) => store.create_indexes().await,
+        }
     }
 }
 

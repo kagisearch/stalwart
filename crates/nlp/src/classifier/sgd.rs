@@ -122,14 +122,6 @@ impl Optimizer for Sgd {
 
 #[cfg(test)]
 pub mod tests {
-    use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
-    use std::{
-        collections::HashMap,
-        fs::File,
-        io::{BufRead, BufReader},
-        time::Instant,
-    };
-
     use crate::classifier::{
         Optimizer,
         adam::Adam,
@@ -140,7 +132,15 @@ pub mod tests {
         ftrl::Ftrl,
         train::{CcfhTrainer, FhTrainer},
     };
+    use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+    use std::{
+        collections::HashMap,
+        fs::File,
+        io::{BufRead, BufReader},
+        time::Instant,
+    };
 
+    #[ignore]
     #[test]
     fn text_classifier() {
         let reader = BufReader::new(

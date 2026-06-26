@@ -13,9 +13,8 @@ use crate::{
 use common::{
     Server, auth::AccessToken, scripts::plugins::PluginContext,
 };
-use directory::QueryParams;
 use mail_parser::MessageParser;
-use sieve::{Envelope, Event, Input, Mailbox, Recipient, Sieve};
+use sieve::{Envelope, Event, Input, Mailbox, Recipient, Sieve, SpamStatus};
 use std::{borrow::Cow, sync::Arc};
 use std::{future::Future, str::FromStr};
 use store::{
@@ -35,7 +34,6 @@ use types::{
     keyword::Keyword,
     special_use::SpecialUse,
 };
-use utils::config::utils::ParseValue;
 
 struct SieveMessage<'x> {
     pub raw_message: Cow<'x, [u8]>,
@@ -122,7 +120,7 @@ impl SieveScriptIngest for Server {
             })?;
 
         // Obtain mailboxIds
-        let account_id = access_token.primary_id;
+        let account_id = access_token.account_id();
         let mut cache = self
             .get_cached_messages(account_id)
             .await
@@ -148,25 +146,26 @@ impl SieveScriptIngest for Server {
             .filter_parsed(message.clone());
 
         // Set account name and email
-        let mail_from = self
-            .core
-            .storage
-            .directory
-            .query(QueryParams::id(account_id).with_return_member_of(false))
-            .await
-            .caused_by(trc::location!())?
-            .and_then(|p| {
-                instance.set_user_full_name(p.description().unwrap_or_else(|| p.name()));
-                p.into_primary_email()
-            });
-
-        // Set account address
-        let mail_from = mail_from.unwrap_or_else(|| envelope_to.address.as_str().into());
+        let account_info = self.account(account_id).await.caused_by(trc::location!())?;
+        let mail_from = account_info.name().to_string();
+        instance.set_user_full_name(
+            account_info
+                .description()
+                .unwrap_or_else(|| account_info.name()),
+        );
         instance.set_user_address(&mail_from);
 
         // Set envelope
         instance.set_envelope(Envelope::From, envelope_from);
         instance.set_envelope(Envelope::To, envelope_to.address.as_str());
+        if let Some(orcpt) = &envelope_to.orcpt {
+            instance.set_envelope(Envelope::Orcpt, orcpt.as_str());
+        }
+        instance.set_spam_status(if envelope_to.is_spam {
+            SpamStatus::Spam
+        } else {
+            SpamStatus::Ham
+        });
 
         let mut input = Input::script(
             active_script.script_name.to_string(),
@@ -175,6 +174,7 @@ impl SieveScriptIngest for Server {
 
         let mut do_discard = false;
         let mut do_deliver = false;
+        let mut do_redirect = false;
 
         let mut reject_reason = None;
         let mut messages: Vec<SieveMessage> = vec![SieveMessage {
@@ -214,20 +214,15 @@ impl SieveScriptIngest for Server {
                     } => {
                         if !mailboxes.is_empty() {
                             let mut special_use_ids = Vec::with_capacity(special_use.len());
-                            for role in special_use {
-                                special_use_ids.push(if role.eq_ignore_ascii_case("inbox") {
-                                    INBOX_ID
-                                } else if role.eq_ignore_ascii_case("trash") {
-                                    TRASH_ID
-                                } else {
-                                    let mut mailbox_id = u32::MAX;
-                                    if let Ok(role) = SpecialUse::parse_value(&role)
-                                        && let Some(m) = cache.mailbox_by_role(&role)
-                                    {
-                                        mailbox_id = m.document_id;
-                                    }
-
-                                    mailbox_id
+                            for role in special_use.iter().map(|v| SpecialUse::parse(v)) {
+                                special_use_ids.push(match role {
+                                    Some(SpecialUse::Inbox) => INBOX_ID,
+                                    Some(SpecialUse::Trash) => TRASH_ID,
+                                    Some(role) => cache
+                                        .mailbox_by_role(&role)
+                                        .map(|m| m.document_id)
+                                        .unwrap_or(u32::MAX),
+                                    None => u32::MAX,
                                 });
                             }
 
@@ -260,14 +255,11 @@ impl SieveScriptIngest for Server {
                         } else if !special_use.is_empty() {
                             let mut result = true;
 
-                            for role in special_use {
-                                if !role.eq_ignore_ascii_case("inbox")
-                                    && !role.eq_ignore_ascii_case("trash")
-                                {
-                                    let role = SpecialUse::parse_value(&role);
-                                    if role.is_err()
-                                        || cache.mailbox_by_role(&role.unwrap()).is_none()
-                                    {
+                            for role in special_use.iter().map(|v| SpecialUse::parse(v)) {
+                                match role {
+                                    Some(SpecialUse::Inbox | SpecialUse::Trash) => {}
+                                    Some(other) if cache.mailbox_by_role(&other).is_some() => {}
+                                    _ => {
                                         result = false;
                                         break;
                                     }
@@ -289,10 +281,9 @@ impl SieveScriptIngest for Server {
                         } else {
                             let exists = self
                                 .in_memory_store()
-                                .key_get::<()>(id_hash.key())
+                                .key_exists(id_hash.key())
                                 .await
-                                .caused_by(trc::location!())?
-                                .is_some();
+                                .caused_by(trc::location!())?;
 
                             if !exists || last {
                                 self.in_memory_store()
@@ -350,17 +341,22 @@ impl SieveScriptIngest for Server {
                         }
 
                         // Find mailbox by role
-                        if let Some(special_use) = special_use
-                            && target_id == u32::MAX
+                        if target_id == u32::MAX
+                            && let Some(special_use) =
+                                special_use.as_deref().and_then(SpecialUse::parse)
                         {
-                            if special_use.eq_ignore_ascii_case("inbox") {
-                                target_id = INBOX_ID;
-                            } else if special_use.eq_ignore_ascii_case("trash") {
-                                target_id = TRASH_ID;
-                            } else if let Ok(role) = SpecialUse::parse_value(&special_use)
-                                && let Some(item) = cache.mailbox_by_role(&role)
-                            {
-                                target_id = item.document_id;
+                            match special_use {
+                                SpecialUse::Inbox => {
+                                    target_id = INBOX_ID;
+                                }
+                                SpecialUse::Trash => {
+                                    target_id = TRASH_ID;
+                                }
+                                role => {
+                                    if let Some(item) = cache.mailbox_by_role(&role) {
+                                        target_id = item.document_id;
+                                    }
+                                }
                             }
                         }
 
@@ -421,7 +417,7 @@ impl SieveScriptIngest for Server {
                                 }
                             };
 
-                            if message.raw_message.len() <= self.core.jmap.mail_max_size {
+                            if message.raw_message.len() <= self.core.email.mail_max_size {
                                 trc::event!(
                                     Sieve(SieveEvent::SendMessage),
                                     From = mail_from.clone(),
@@ -438,6 +434,7 @@ impl SieveScriptIngest for Server {
                                     recipients,
                                     message: message.raw_message.to_vec(),
                                 });
+                                do_redirect = true;
                             } else {
                                 trc::event!(
                                     Sieve(SieveEvent::MessageTooLarge),
@@ -447,7 +444,7 @@ impl SieveScriptIngest for Server {
                                         .map(|r| trc::Value::String(r.as_str().into()))
                                         .collect::<Vec<_>>(),
                                     Size = message.raw_message.len(),
-                                    Limit = self.core.jmap.mail_max_size,
+                                    Limit = self.core.email.mail_max_size,
                                     SpanId = session_id,
                                 );
                             }
@@ -513,7 +510,7 @@ impl SieveScriptIngest for Server {
         }
 
         // Fail-safe, no discard and no keep seen, assume that something went wrong and file anyway.
-        if !do_deliver && !do_discard {
+        if !do_deliver && !do_discard && !do_redirect {
             messages[0].file_into.push(INBOX_ID);
         }
 
@@ -589,7 +586,7 @@ impl SieveScriptIngest for Server {
                 account_id,
                 Collection::SieveScript,
                 SieveField::Name,
-                name.as_bytes(),
+                name.to_lowercase().as_bytes(),
             )
             .await
             .caused_by(trc::location!())?

@@ -6,30 +6,30 @@
 
 use common::{
     Server,
-    config::smtp::resolver::{Tlsa, TlsaEntry},
+    config::smtp::resolver::{Tlsa, TlsaEntry, TlsaMatching},
 };
 use mail_auth::{
-    common::resolver::IntoFqdn,
-    hickory_resolver::{
-        Name,
-        proto::rr::rdata::tlsa::{CertUsage, Matching, Selector},
+    common::resolver::ToFqdn,
+    hickory_resolver::proto::rr::{
+        Name, RData,
+        rdata::tlsa::{CertUsage, Matching, Selector},
     },
 };
 use std::{future::Future, sync::Arc};
 
 pub trait TlsaLookup: Sync + Send {
-    fn tlsa_lookup<'x>(
+    fn tlsa_lookup(
         &self,
-        key: impl IntoFqdn<'x> + Sync + Send,
+        key: impl ToFqdn + Sync + Send,
     ) -> impl Future<Output = mail_auth::Result<Option<Arc<Tlsa>>>> + Send;
 }
 
 impl TlsaLookup for Server {
-    async fn tlsa_lookup<'x>(
+    async fn tlsa_lookup(
         &self,
-        key: impl IntoFqdn<'x> + Sync + Send,
+        key: impl ToFqdn + Sync + Send,
     ) -> mail_auth::Result<Option<Arc<Tlsa>>> {
-        let key = key.into_fqdn();
+        let key = key.to_fqdn();
         if let Some(value) = self.inner.cache.dns_tlsa.get(key.as_ref()) {
             return Ok(Some(value));
         }
@@ -53,12 +53,23 @@ impl TlsaLookup for Server {
         let mut has_intermediates = false;
         let mut found_insecure = false;
 
-        for record in tlsa_lookup.as_lookup().record_iter() {
-            if let Some(tlsa) = record.data().as_tlsa() {
-                if record.proof().is_secure() {
-                    let is_end_entity = match tlsa.cert_usage() {
+        for record in tlsa_lookup.answers() {
+            if let RData::TLSA(tlsa) = &record.data {
+                if record.proof.is_secure() {
+                    let is_end_entity = match tlsa.cert_usage {
                         CertUsage::DaneEe => true,
                         CertUsage::DaneTa => false,
+                        _ => continue,
+                    };
+                    let matching = match tlsa.matching {
+                        Matching::Raw => TlsaMatching::Full,
+                        Matching::Sha256 => TlsaMatching::Sha256,
+                        Matching::Sha512 => TlsaMatching::Sha512,
+                        _ => continue,
+                    };
+                    let is_spki = match tlsa.selector {
+                        Selector::Spki => true,
+                        Selector::Full => false,
                         _ => continue,
                     };
                     if is_end_entity {
@@ -68,17 +79,9 @@ impl TlsaLookup for Server {
                     }
                     entries.push(TlsaEntry {
                         is_end_entity,
-                        is_sha256: match tlsa.matching() {
-                            Matching::Sha256 => true,
-                            Matching::Sha512 => false,
-                            _ => continue,
-                        },
-                        is_spki: match tlsa.selector() {
-                            Selector::Spki => true,
-                            Selector::Full => false,
-                            _ => continue,
-                        },
-                        data: tlsa.cert_data().to_vec(),
+                        is_spki,
+                        matching,
+                        data: tlsa.cert_data.clone(),
                     });
                 } else {
                     found_insecure = true;
@@ -94,7 +97,7 @@ impl TlsaLookup for Server {
             });
 
             self.inner.cache.dns_tlsa.insert_with_expiry(
-                key.into_owned(),
+                key,
                 tlsa.clone(),
                 tlsa_lookup.valid_until(),
             );
@@ -104,4 +107,10 @@ impl TlsaLookup for Server {
             Ok(None)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnssecStatus {
+    Secure,
+    Insecure,
 }

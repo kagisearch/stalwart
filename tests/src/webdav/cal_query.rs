@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::WebDavTest;
+use crate::utils::server::TestServer;
+
 use ahash::AHashSet;
 use calcard::{common::timezone::Tz, icalendar::ICalendar};
 use groupware::{
@@ -15,10 +16,13 @@ use hyper::StatusCode;
 use store::write::serialize::rkyv_unarchive;
 use types::TimeRange;
 
-pub async fn test(test: &WebDavTest) {
+pub async fn test(test: &TestServer) {
     println!("Running REPORT calendar-query & free-busy-query tests...");
-    let client = test.client("john");
-    let cal_path = format!("{}/john/default/", DavResourceName::Cal.base_path());
+    let client = test.account("john@example.com").webdav_client();
+    let cal_path = format!(
+        "{}/john%40example.com/default/",
+        DavResourceName::Cal.base_path()
+    );
 
     #[allow(clippy::never_loop)]
     for (num, ics) in [
@@ -324,7 +328,7 @@ fn roundtrip_expansion(ics: &str, ignore_errors: bool) {
 
 fn rfc_file_name(num: usize) -> String {
     format!(
-        "{}/john/default/abcd{num}.ics",
+        "{}/john%40example.com/default/abcd{num}.ics",
         DavResourceName::Cal.base_path()
     )
 }

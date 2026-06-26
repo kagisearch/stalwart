@@ -7,8 +7,8 @@
 use super::{Event, http::http_request};
 use crate::state_manager::PushRegistration;
 use common::{
-    IPC_CHANNEL_BUFFER, Inner, LONG_1Y_SLUMBER, Server,
-    core::BuildServer,
+    BuildServer, IPC_CHANNEL_BUFFER, Inner, LONG_1Y_SLUMBER, Server,
+    auth::BuildAccessToken,
     ipc::{PushEvent, PushNotification},
 };
 use email::push::PushSubscriptions;
@@ -30,8 +30,6 @@ pub fn spawn_push_manager(inner: Arc<Inner>) -> mpsc::Sender<Event> {
     let (push_tx_, mut push_rx) = mpsc::channel::<Event>(IPC_CHANNEL_BUFFER);
     let push_tx = push_tx_.clone();
 
-    tokio::spawn(async move {});
-
     tokio::spawn(async move {
         let mut push_servers: AHashMap<Id, PushRegistration> = AHashMap::default();
         let mut account_push_ids: AHashMap<u32, AHashSet<Id>> = AHashMap::default();
@@ -44,85 +42,84 @@ pub fn spawn_push_manager(inner: Arc<Inner>) -> mpsc::Sender<Event> {
         {
             let server = inner.build_server();
 
-            match server
-                .document_ids(
-                    u32::MAX,
-                    Collection::Principal,
-                    PrincipalField::PushSubscriptions,
-                )
-                .await
-            {
-                Ok(account_ids) => {
-                    for account_id in account_ids {
-                        if server
-                            .core
-                            .network
-                            .roles
-                            .push_notifications
-                            .is_enabled_for_integer(account_id)
-                        {
-                            // Load push subscriptions for account
-                            let (subscriptions, member_account_ids) =
-                                match load_push_subscriptions(&server, account_id).await {
-                                    Ok(subscriptions) => subscriptions,
-                                    Err(err) => {
-                                        trc::error!(err.caused_by(trc::location!()));
-                                        continue;
-                                    }
-                                };
-                            let current_time = now();
-                            for subscription in subscriptions
-                                .subscriptions
-                                .into_iter()
-                                .filter(|s| s.verified && s.expires > current_time)
+            if server.core.network.roles.push_notifications {
+                match server
+                    .document_ids(
+                        u32::MAX,
+                        Collection::Principal,
+                        PrincipalField::PushSubscriptions,
+                    )
+                    .await
+                {
+                    Ok(account_ids) => {
+                        for account_id in account_ids {
+                            if server.core.jmap.push_total_shards <= 1
+                                || account_id % server.core.jmap.push_total_shards
+                                    == server.registry().cluster_push_shard()
                             {
-                                let id = Id::from_parts(subscription.id, account_id);
-                                let subscription = Arc::new(subscription);
+                                // Load push subscriptions for account
+                                let (subscriptions, member_account_ids) =
+                                    match load_push_subscriptions(&server, account_id).await {
+                                        Ok(subscriptions) => subscriptions,
+                                        Err(err) => {
+                                            trc::error!(err.caused_by(trc::location!()));
+                                            continue;
+                                        }
+                                    };
+                                let current_time = now();
+                                for subscription in subscriptions
+                                    .subscriptions
+                                    .into_iter()
+                                    .filter(|s| s.verified && s.expires > current_time)
+                                {
+                                    let id = Id::from_parts(subscription.id, account_id);
+                                    let subscription = Arc::new(subscription);
 
-                                for account_id in &member_account_ids {
-                                    account_push_ids.entry(*account_id).or_default().insert(id);
+                                    for account_id in &member_account_ids {
+                                        account_push_ids.entry(*account_id).or_default().insert(id);
+                                    }
+                                    push_servers.insert(
+                                        id,
+                                        PushRegistration {
+                                            member_account_ids: member_account_ids.clone(),
+                                            num_attempts: 0,
+                                            last_request: Instant::now()
+                                                - (server.core.jmap.push_throttle
+                                                    + Duration::from_millis(1)),
+                                            notifications: Vec::new(),
+                                            server: subscription.clone(),
+                                            in_flight: false,
+                                        },
+                                    );
                                 }
-                                push_servers.insert(
-                                    id,
-                                    PushRegistration {
-                                        member_account_ids: member_account_ids.clone(),
-                                        num_attempts: 0,
-                                        last_request: Instant::now()
-                                            - (server.core.jmap.push_throttle
-                                                + Duration::from_millis(1)),
-                                        notifications: Vec::new(),
-                                        server: subscription.clone(),
-                                        in_flight: false,
-                                    },
-                                );
                             }
                         }
                     }
+                    Err(err) => {
+                        trc::error!(err.caused_by(trc::location!()));
+                    }
                 }
-                Err(err) => {
-                    trc::error!(err.caused_by(trc::location!()));
-                }
-            }
 
-            // Subscribe to push events
-            if !account_push_ids.is_empty()
-                && server
-                    .inner
-                    .ipc
-                    .push_tx
-                    .clone()
-                    .send(PushEvent::PushServerRegister {
-                        activate: account_push_ids.keys().copied().collect(),
-                        expired: vec![],
-                    })
-                    .await
-                    .is_err()
-            {
-                trc::event!(
-                    Server(ServerEvent::ThreadError),
-                    Details = "Error sending state change.",
-                    CausedBy = trc::location!()
-                );
+                // Subscribe to push events
+                if !account_push_ids.is_empty()
+                    && server
+                        .inner
+                        .ipc
+                        .push_tx
+                        .clone()
+                        .send(PushEvent::PushServerRegister {
+                            activate: account_push_ids.keys().copied().collect(),
+                            expired: vec![],
+                        })
+                        .await
+                        .is_err()
+                {
+                    trc::event!(
+                        Server(ServerEvent::ThreadError),
+                        Details = "Error sending state change.",
+                        CausedBy = trc::location!()
+                    );
+                }
             }
         }
 
@@ -142,12 +139,9 @@ pub fn spawn_push_manager(inner: Arc<Inner>) -> mpsc::Sender<Event> {
             match event_or_timeout {
                 Ok(Some(event)) => match event {
                     Event::Update { account_id } => {
-                        if !server
-                            .core
-                            .network
-                            .roles
-                            .push_notifications
-                            .is_enabled_for_integer(account_id)
+                        if server.core.jmap.push_total_shards > 1
+                            && account_id % server.core.jmap.push_total_shards
+                                != server.registry().cluster_push_shard()
                         {
                             continue;
                         }
@@ -482,9 +476,10 @@ async fn load_push_subscriptions(
     account_id: u32,
 ) -> trc::Result<(PushSubscriptions, Vec<u32>)> {
     let member_of = server
-        .get_access_token(account_id)
+        .access_token(account_id)
         .await
         .caused_by(trc::location!())?
+        .build()
         .member_ids()
         .collect::<Vec<_>>();
 

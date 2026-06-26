@@ -4,8 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::api::auth::JmapAuthorization;
+use crate::{api::auth::JmapAuthorization, changes::state::JmapCacheState};
 use common::{Server, auth::AccessToken};
+use email::cache::{MessageCacheFetch, email::MessageCacheAccess, mailbox::MailboxCacheAccess};
+use groupware::cache::GroupwareCache;
 use jmap_proto::{
     method::changes::{ChangesRequest, ChangesResponse},
     object::{JmapObject, NullObject, mailbox::MailboxProperty},
@@ -14,8 +16,15 @@ use jmap_proto::{
     types::state::State,
 };
 use std::future::Future;
-use store::query::log::{Change, Query};
-use types::collection::{Collection, SyncCollection};
+use store::{
+    query::log::{Change, Query},
+    roaring::RoaringBitmap,
+};
+use trc::AddContext;
+use types::{
+    acl::Acl,
+    collection::{Collection, SyncCollection},
+};
 
 pub trait ChangesLookup: Sync + Send {
     fn changes(
@@ -109,7 +118,7 @@ impl ChangesLookup for Server {
                 .max_changes
                 .filter(|n| *n != 0)
                 .unwrap_or(usize::MAX),
-            self.core.jmap.changes_max_results.unwrap_or(usize::MAX),
+            self.core.jmap.changes_max_results,
         );
         let mut response: ChangesResponse<NullObject> = ChangesResponse {
             account_id: request.account_id,
@@ -122,6 +131,73 @@ impl ChangesLookup for Server {
             updated_properties: None,
         };
         let account_id = request.account_id.document_id();
+
+        let allowed_ids: Option<RoaringBitmap> = if access_token.is_member(account_id) {
+            None
+        } else {
+            Some(match object {
+                MethodObject::Email => self
+                    .get_cached_messages(account_id)
+                    .await?
+                    .shared_messages(access_token, Acl::ReadItems),
+                MethodObject::Mailbox => self
+                    .get_cached_messages(account_id)
+                    .await?
+                    .shared_mailboxes(access_token, Acl::Read),
+                MethodObject::Thread => {
+                    let cache = self.get_cached_messages(account_id).await?;
+                    let shared = cache.shared_messages(access_token, Acl::ReadItems);
+                    let mut threads = RoaringBitmap::new();
+                    for item in &cache.emails.items {
+                        if shared.contains(item.document_id) {
+                            threads.insert(item.thread_id);
+                        }
+                    }
+                    threads
+                }
+                MethodObject::AddressBook => self
+                    .fetch_dav_resources(
+                        access_token.account_id(),
+                        account_id,
+                        SyncCollection::AddressBook,
+                    )
+                    .await?
+                    .shared_containers(access_token, [Acl::Read, Acl::ReadItems], true),
+                MethodObject::ContactCard => self
+                    .fetch_dav_resources(
+                        access_token.account_id(),
+                        account_id,
+                        SyncCollection::AddressBook,
+                    )
+                    .await?
+                    .shared_items(access_token, [Acl::ReadItems], true),
+                MethodObject::Calendar => self
+                    .fetch_dav_resources(
+                        access_token.account_id(),
+                        account_id,
+                        SyncCollection::Calendar,
+                    )
+                    .await?
+                    .shared_containers(access_token, [Acl::Read, Acl::ReadItems], true),
+                MethodObject::CalendarEvent => self
+                    .fetch_dav_resources(
+                        access_token.account_id(),
+                        account_id,
+                        SyncCollection::Calendar,
+                    )
+                    .await?
+                    .shared_items(access_token, [Acl::ReadItems], true),
+                MethodObject::FileNode => self
+                    .fetch_dav_resources(
+                        access_token.account_id(),
+                        account_id,
+                        SyncCollection::FileNode,
+                    )
+                    .await?
+                    .shared_documents(access_token, [Acl::Read, Acl::ReadItems], true),
+                _ => RoaringBitmap::new(),
+            })
+        };
 
         let (items_sent, changelog) = match &request.since_state {
             State::Initial => {
@@ -139,12 +215,41 @@ impl ChangesLookup for Server {
 
                 (0, changelog)
             }
-            State::Exact(change_id) => (
-                0,
-                self.store()
-                    .changes(account_id, collection.into(), Query::Since(*change_id))
-                    .await?,
-            ),
+            State::Exact(change_id) => {
+                let last_state = match collection {
+                    SyncCollection::Calendar | SyncCollection::AddressBook => self
+                        .fetch_dav_resources(access_token.account_id(), account_id, collection)
+                        .await
+                        .caused_by(trc::location!())?
+                        .get_state(is_container)
+                        .into(),
+                    SyncCollection::Email => self
+                        .get_cached_messages(account_id)
+                        .await?
+                        .get_state(is_container)
+                        .into(),
+                    _ => None,
+                };
+
+                if let Some(last_state) = last_state {
+                    response.new_state = last_state;
+
+                    if response.new_state == State::Exact(*change_id) {
+                        return Ok(IntermediateChangesResponse {
+                            response,
+                            object,
+                            only_container_changes: false,
+                        });
+                    }
+                }
+
+                (
+                    0,
+                    self.store()
+                        .changes(account_id, collection.into(), Query::Since(*change_id))
+                        .await?,
+                )
+            }
             State::Intermediate(intermediate_state) => {
                 let changelog = self
                     .store()
@@ -175,10 +280,16 @@ impl ChangesLookup for Server {
             }
         };
 
-        if changelog.is_truncated && request.since_state != State::Initial {
-            return Err(trc::JmapEvent::CannotCalculateChanges
-                .into_err()
-                .details("Changelog has been truncated"));
+        if (changelog.is_truncated || changelog.from_change_id == 0)
+            && request.since_state != State::Initial
+        {
+            return Err(trc::JmapEvent::CannotCalculateChanges.into_err().details(
+                if changelog.is_truncated {
+                    "Change log is truncated"
+                } else {
+                    "Since state is invalid"
+                },
+            ));
         }
 
         let mut changes = changelog
@@ -187,6 +298,16 @@ impl ChangesLookup for Server {
             .filter(|change| {
                 (is_container && change.is_container_change())
                     || (!is_container && change.is_item_change())
+            })
+            .filter(|change| {
+                allowed_ids.as_ref().is_none_or(|allowed| {
+                    let id = if is_container {
+                        change.container_id()
+                    } else {
+                        change.item_id()
+                    };
+                    id.is_some_and(|id| allowed.contains(id as u32))
+                })
             })
             .skip(items_sent)
             .peekable();
@@ -218,15 +339,15 @@ impl ChangesLookup for Server {
         .unwrap_or(changelog.to_change_id);
 
         response.has_more_changes = changes.peek().is_some();
-        response.new_state = if response.has_more_changes {
-            State::new_intermediate(
+        if response.has_more_changes {
+            response.new_state = State::new_intermediate(
                 changelog.from_change_id,
                 change_id,
                 items_sent + max_changes,
-            )
-        } else {
-            State::new_exact(change_id)
-        };
+            );
+        } else if response.new_state == State::Initial {
+            response.new_state = State::new_exact(change_id)
+        }
 
         Ok(IntermediateChangesResponse {
             only_container_changes: is_container && !response.updated.is_empty() && !items_changed,
@@ -291,13 +412,16 @@ impl IntermediateChangesResponse {
             | MethodObject::VacationResponse
             | MethodObject::SieveScript
             | MethodObject::Principal
-            | MethodObject::Quota => unreachable!(),
+            | MethodObject::Quota
+            | MethodObject::Registry(_) => unreachable!(),
         })
     }
 }
 
-fn transmute_response<T: JmapObject>(response: ChangesResponse<NullObject>) -> ChangesResponse<T> {
-    ChangesResponse {
+fn transmute_response<T: JmapObject>(
+    response: ChangesResponse<NullObject>,
+) -> Box<ChangesResponse<T>> {
+    Box::new(ChangesResponse {
         account_id: response.account_id,
         old_state: response.old_state,
         new_state: response.new_state,
@@ -306,5 +430,5 @@ fn transmute_response<T: JmapObject>(response: ChangesResponse<NullObject>) -> C
         updated: response.updated,
         destroyed: response.destroyed,
         updated_properties: None,
-    }
+    })
 }

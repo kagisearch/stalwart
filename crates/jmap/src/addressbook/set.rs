@@ -16,7 +16,7 @@ use jmap_proto::{
     error::set::SetError,
     method::set::{SetRequest, SetResponse},
     object::addressbook::{self, AddressBookProperty, AddressBookValue},
-    request::{IntoValid, reference::MaybeIdReference},
+    request::{MaybeInvalid, reference::MaybeIdReference},
     types::state::State,
 };
 use jmap_tools::{JsonPointerItem, Key, Value};
@@ -31,6 +31,7 @@ use types::{
     acl::Acl,
     collection::{Collection, SyncCollection},
     field::PrincipalField,
+    id::Id,
 };
 
 pub trait AddressBookSet: Sync + Send {
@@ -51,10 +52,14 @@ impl AddressBookSet for Server {
     ) -> trc::Result<SetResponse<addressbook::AddressBook>> {
         let account_id = request.account_id.document_id();
         let cache = self
-            .fetch_dav_resources(access_token, account_id, SyncCollection::AddressBook)
+            .fetch_dav_resources(
+                access_token.account_id(),
+                account_id,
+                SyncCollection::AddressBook,
+            )
             .await?;
         let mut response = SetResponse::from_request(&request, self.core.jmap.set_max_objects)?;
-        let will_destroy = request.unwrap_destroy().into_valid().collect::<Vec<_>>();
+        let will_destroy = response.collect_will_destroy(request.unwrap_destroy());
         let is_shared = access_token.is_shared(account_id);
         let mut set_default = None;
 
@@ -85,7 +90,7 @@ impl AddressBookSet for Server {
             };
 
             // Process changes
-            if let Err(err) = update_address_book(object, &mut address_book, account_id) {
+            if let Err(err) = update_address_book(None, object, &mut address_book, account_id) {
                 response.not_created.append(id, err);
                 continue 'create;
             }
@@ -97,7 +102,9 @@ impl AddressBookSet for Server {
                     continue 'create;
                 }
 
-                self.refresh_acls(&address_book.acls, None).await;
+                self.refresh_acls(&address_book.acls, None)
+                    .await
+                    .caused_by(trc::location!())?;
             }
 
             // Insert record
@@ -107,7 +114,12 @@ impl AddressBookSet for Server {
                 .await
                 .caused_by(trc::location!())?;
             address_book
-                .insert(access_token, account_id, document_id, &mut batch)
+                .insert(
+                    access_token.account_tenant_ids(),
+                    account_id,
+                    document_id,
+                    &mut batch,
+                )
                 .caused_by(trc::location!())?;
 
             if let Some(MaybeIdReference::Reference(id_ref)) =
@@ -121,7 +133,14 @@ impl AddressBookSet for Server {
         }
 
         // Process updates
-        'update: for (id, object) in request.unwrap_update().into_valid() {
+        'update: for (id, object) in request.unwrap_update() {
+            let id = match id {
+                MaybeInvalid::Value(id) => id,
+                invalid => {
+                    response.not_updated.append(invalid, SetError::not_found());
+                    continue 'update;
+                }
+            };
             // Make sure id won't be destroyed
             if will_destroy.contains(&id) {
                 response.not_updated.append(id, SetError::will_destroy());
@@ -153,7 +172,7 @@ impl AddressBookSet for Server {
 
             // Apply changes
             let has_acl_changes =
-                match update_address_book(object, &mut new_address_book, account_id) {
+                match update_address_book(Some(id), object, &mut new_address_book, account_id) {
                     Ok(has_acl_changes_) => has_acl_changes_,
                     Err(err) => {
                         response.not_updated.append(id, err);
@@ -182,13 +201,14 @@ impl AddressBookSet for Server {
                     &new_address_book.acls,
                     address_book.inner.acls.as_slice(),
                 )
-                .await;
+                .await
+                .caused_by(trc::location!())?;
             }
 
             // Update record
             new_address_book
                 .update(
-                    access_token,
+                    access_token.account_tenant_ids(),
                     address_book,
                     account_id,
                     document_id,
@@ -273,8 +293,17 @@ impl AddressBookSet for Server {
                 destroy_parents.insert(document_id);
 
                 // Delete record
+                let delete_path = cache
+                    .container_resource_path_by_id(document_id)
+                    .map(|resource| cache.format_resource(resource));
                 DestroyArchive(address_book)
-                    .delete(access_token, account_id, document_id, None, &mut batch)
+                    .delete(
+                        access_token.account_tenant_ids(),
+                        account_id,
+                        document_id,
+                        delete_path,
+                        &mut batch,
+                    )
                     .caused_by(trc::location!())?;
 
                 if default_address_book_id == Some(document_id) {
@@ -308,7 +337,7 @@ impl AddressBookSet for Server {
                         {
                             // Card only belongs to address books being deleted, delete it
                             DestroyArchive(card).delete_all(
-                                access_token,
+                                access_token.account_tenant_ids(),
                                 account_id,
                                 document_id,
                                 &mut batch,
@@ -322,7 +351,7 @@ impl AddressBookSet for Server {
                                 .names
                                 .retain(|n| !destroy_parents.contains(&n.parent_id));
                             new_card.update(
-                                access_token,
+                                access_token.account_tenant_ids(),
                                 card,
                                 account_id,
                                 document_id,
@@ -377,6 +406,7 @@ impl AddressBookSet for Server {
 }
 
 fn update_address_book(
+    expected_id: Option<Id>,
     updates: Value<'_, AddressBookProperty, AddressBookValue>,
     address_book: &mut AddressBook,
     account_id: u32,
@@ -433,6 +463,13 @@ fn update_address_book(
                     value,
                 )?;
                 has_acl_changes = true;
+            }
+            (AddressBookProperty::Id, value) => {
+                if !expected_id.is_some_and(|expected| crate::matches_id(&value, expected)) {
+                    return Err(SetError::invalid_properties()
+                        .with_property(AddressBookProperty::Id)
+                        .with_description("The id property is immutable."));
+                }
             }
             (property, _) => {
                 return Err(SetError::invalid_properties()
