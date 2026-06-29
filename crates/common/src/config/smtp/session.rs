@@ -188,6 +188,7 @@ impl SessionConfig {
         let ext = bp.setting_infallible::<MtaExtensions>().await;
 
         let mut hooks = Vec::new();
+        let mut delivery_hooks = Vec::new();
 
         for hook in bp.list_infallible::<MtaHook>().await {
             let id = hook.id;
@@ -205,17 +206,35 @@ impl SessionConfig {
                 }
             };
 
-            hooks.push(MTAHook {
-                enable,
-                id,
-                url: hook.url,
-                timeout: hook.timeout.into_inner(),
-                headers,
-                tls_allow_invalid_certs: hook.allow_invalid_certs,
-                tempfail_on_error: hook.temp_fail_on_error,
-                run_on_stage: hook.stages.into_iter().map(Stage::from).collect(),
-                max_response_size: hook.max_response_size as usize,
-            });
+            // An `MtaHook` with no SMTP stages can never fire in the MTA pipeline
+            // (`run_on_stage` would be empty), so a stage-less hook is treated as a
+            // delivery hook: an HTTP webhook invoked during message delivery, before
+            // the user's Sieve script. This loop is the only consumer of `MtaHook`
+            // objects, so the two kinds stay cleanly separated.
+            if hook.stages.is_empty() {
+                delivery_hooks.push(DeliveryHook {
+                    enable,
+                    id: id.to_string(),
+                    url: hook.url,
+                    timeout: hook.timeout.into_inner(),
+                    headers,
+                    tls_allow_invalid_certs: hook.allow_invalid_certs,
+                    tempfail_on_error: hook.temp_fail_on_error,
+                    max_response_size: hook.max_response_size as usize,
+                });
+            } else {
+                hooks.push(MTAHook {
+                    enable,
+                    id,
+                    url: hook.url,
+                    timeout: hook.timeout.into_inner(),
+                    headers,
+                    tls_allow_invalid_certs: hook.allow_invalid_certs,
+                    tempfail_on_error: hook.temp_fail_on_error,
+                    run_on_stage: hook.stages.into_iter().map(Stage::from).collect(),
+                    max_response_size: hook.max_response_size as usize,
+                });
+            }
         }
 
         SessionConfig {
@@ -416,12 +435,7 @@ impl SessionConfig {
                 })
                 .collect(),
             hooks,
-            // TODO(EMAIL-810/EMAIL-811): delivery hooks were configured via the
-            // removed TOML config layer. Re-wire them to the v0.16 registry
-            // (a DeliveryHook object type, mirroring MtaHook) as part of the
-            // config migration. Runtime code in message/delivery_hooks.rs stays
-            // intact and is dormant while this list is empty.
-            delivery_hooks: Vec::new(),
+            delivery_hooks,
         }
     }
 }

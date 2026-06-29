@@ -11,12 +11,10 @@
 //! quarantine a message and apply modifications (fileInto, headers, preview
 //! text). The runtime lives in `email::message::delivery_hooks`.
 //!
-//! In `v0.15` these were parsed from the `session.delivery_hook.*` TOML keys.
-//! `v0.16` removed the TOML config layer entirely, so this list is currently
-//! populated empty in `SessionConfig::parse` and the runtime stays dormant.
-//! TODO(EMAIL-811): define a `DeliveryHook` registry object type (mirroring the
-//! `MtaHook` object) and build this struct from `bp.list_infallible`, the same
-//! way `MTAHook` is now built.
+//! Delivery hooks are stored as `MtaHook` registry objects that declare no SMTP
+//! stages — such a hook can never fire in the MTA pipeline, so
+//! `SessionConfig::parse` routes stage-less `MtaHook` objects into this list
+//! instead of the MTA hook list.
 
 use crate::expr::if_block::IfBlock;
 use hyper::HeaderMap;

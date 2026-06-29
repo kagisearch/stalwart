@@ -56,9 +56,7 @@ pub async fn try_delivery_hook(
 {
     let default_response = Some((HashSet::new(), HashSet::new(), false, Vec::new(), None));
 
-    // Delivery-hook configuration is deferred to EMAIL-811 (the v0.16 registry
-    // object type that backs these hooks is not defined yet), so this list is
-    // empty until then. Bail out before doing any work to keep the path dormant.
+    // No delivery hooks configured: nothing to do.
     let delivery_hooks = &server.core.smtp.session.delivery_hooks;
     if delivery_hooks.is_empty() {
         return Ok(default_response);
@@ -78,15 +76,16 @@ pub async fn try_delivery_hook(
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
-    // TODO(EMAIL-811): resolve the account's primary email by id via the v0.16
-    // registry when delivery hooks are wired back up. The v0.15 lookup
-    // (directory().query(QueryParams::id(..))) was removed in v0.16.
-    let principal_name = Id::from(user_id).as_string();
+    // Resolve the account's primary email for the hook payload, falling back to
+    // the account id if the lookup fails or the account has no addresses.
+    let principal_name = server
+        .account_info(user_id)
+        .await
+        .ok()
+        .and_then(|info| info.addresses().first().cloned())
+        .unwrap_or_else(|| Id::from(user_id).as_string());
 
-    let request = hooks::Request::new(
-        Id::from(user_id).as_string(),
-        principal_name,
-    )
+    let request = hooks::Request::new(Id::from(user_id).as_string(), principal_name)
     .with_envelope(envelope)
     .with_message(hooks::Message {
         headers,
