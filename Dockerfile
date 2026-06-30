@@ -1,11 +1,14 @@
 # FORK CHANGES:
 # trixie provides v19 of libclang-dev, not v16, https://packages.debian.org/trixie/libclang-dev
 # elastic is no longer a feature, and wasn't updated here https://github.com/stalwartlabs/stalwart/commit/472bddf733377018e9c8d0828358f91dc0602ffa#diff-b803fcb7f17ed9235f1e5cb1fcd2f5d3b2838429d4368ae4c57ce4436577f03fL314
+# the sqlite feature pulls libsqlite3-sys 0.38.1, whose build script uses the
+# cfg_select! macro (stable as of Rust 1.95), so the cargo-chef base is pinned to
+# 1.96 rather than 1.92.
 
 # Stalwart Dockerfile
 # Credits: https://github.com/33KK
 
-FROM --platform=$BUILDPLATFORM docker.io/lukemathwalker/cargo-chef:latest-rust-1.92.0-slim-trixie AS chef
+FROM --platform=$BUILDPLATFORM docker.io/lukemathwalker/cargo-chef:latest-rust-1.96.0-slim-trixie AS chef
 WORKDIR /build
 
 FROM --platform=$BUILDPLATFORM chef AS planner
