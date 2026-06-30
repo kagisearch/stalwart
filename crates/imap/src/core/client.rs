@@ -8,7 +8,7 @@ use std::{iter::Peekable, sync::Arc, vec::IntoIter};
 
 use common::{
     KV_RATE_LIMIT_IMAP,
-    listener::{SessionResult, SessionStream},
+    network::{SessionResult, SessionStream},
 };
 use imap_proto::{
     Command, ResponseType, StatusResponse,
@@ -175,12 +175,10 @@ impl<T: SessionStream> Session<T> {
                     .handle_namespace(request)
                     .await
                     .map(|_| SessionResult::Continue),
-                Command::Authenticate => self
-                    .handle_authenticate(request)
+                Command::Authenticate => Box::pin(self.handle_authenticate(request))
                     .await
                     .map(|_| SessionResult::Continue),
-                Command::Login => self
-                    .handle_login(request)
+                Command::Login => Box::pin(self.handle_login(request))
                     .await
                     .map(|_| SessionResult::Continue),
                 Command::Capability => self
@@ -247,6 +245,10 @@ impl<T: SessionStream> Session<T> {
                     .handle_id(request)
                     .await
                     .map(|_| SessionResult::Continue),
+                Command::GetJmapAccess => self
+                    .handle_jmap_access(request)
+                    .await
+                    .map(|_| SessionResult::Continue),
             };
 
             match result {
@@ -297,9 +299,7 @@ impl<T: SessionStream> Session<T> {
             && let Some(rate) = &self.server.core.imap.rate_requests
             && data
                 .server
-                .core
-                .storage
-                .lookup
+                .in_memory_store()
                 .is_rate_allowed(
                     KV_RATE_LIMIT_IMAP,
                     &data.account_id.to_be_bytes(),
@@ -379,7 +379,8 @@ impl<T: SessionStream> Session<T> {
             | Command::MyRights
             | Command::Unauthenticate
             | Command::GetQuota
-            | Command::GetQuotaRoot => {
+            | Command::GetQuotaRoot
+            | Command::GetJmapAccess => {
                 if let State::Authenticated { .. } | State::Selected { .. } = state {
                     Ok(request)
                 } else {

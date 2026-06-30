@@ -10,8 +10,7 @@ use crate::{
     spawn_op,
 };
 use ahash::AHashSet;
-use common::{listener::SessionStream, storage::index::ObjectIndexBuilder};
-use directory::Permission;
+use common::{network::SessionStream, storage::index::ObjectIndexBuilder};
 use email::{
     mailbox::TRASH_ID,
     message::{ingest::EmailIngest, metadata::MessageData},
@@ -25,6 +24,7 @@ use imap_proto::{
     },
     receiver::Request,
 };
+use registry::schema::enums::Permission;
 use std::{sync::Arc, time::Instant};
 use store::{
     ValueKey,

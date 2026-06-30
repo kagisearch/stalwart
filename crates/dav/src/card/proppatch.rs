@@ -80,7 +80,11 @@ impl CardPropPatchRequestHandler for Server {
         let uri = headers.uri;
         let account_id = resource_.account_id;
         let resources = self
-            .fetch_dav_resources(access_token, account_id, SyncCollection::AddressBook)
+            .fetch_dav_resources(
+                access_token.account_id(),
+                account_id,
+                SyncCollection::AddressBook,
+            )
             .await
             .caused_by(trc::location!())?;
         let resource = resource_
@@ -156,7 +160,7 @@ impl CardPropPatchRequestHandler for Server {
             // Remove properties
             if !request.set_first && !request.remove.is_empty() {
                 remove_addressbook_properties(
-                    access_token.primary_id,
+                    access_token.account_id(),
                     &mut new_book,
                     std::mem::take(&mut request.remove),
                     &mut items,
@@ -175,7 +179,7 @@ impl CardPropPatchRequestHandler for Server {
             // Remove properties
             if is_success && !request.remove.is_empty() {
                 remove_addressbook_properties(
-                    access_token.primary_id,
+                    access_token.account_id(),
                     &mut new_book,
                     request.remove,
                     &mut items,
@@ -184,7 +188,13 @@ impl CardPropPatchRequestHandler for Server {
 
             if is_success {
                 new_book
-                    .update(access_token, book, account_id, document_id, &mut batch)
+                    .update(
+                        access_token.account_tenant_ids(),
+                        book,
+                        account_id,
+                        document_id,
+                        &mut batch,
+                    )
                     .caused_by(trc::location!())?
                     .etag()
             } else {
@@ -218,7 +228,13 @@ impl CardPropPatchRequestHandler for Server {
 
             if is_success {
                 new_card
-                    .update(access_token, card, account_id, document_id, &mut batch)
+                    .update(
+                        access_token.account_tenant_ids(),
+                        card,
+                        account_id,
+                        document_id,
+                        &mut batch,
+                    )
                     .caused_by(trc::location!())?
                     .etag()
             } else {
@@ -257,7 +273,7 @@ impl CardPropPatchRequestHandler for Server {
             match (&property.property, property.value) {
                 (DavProperty::WebDav(WebDavProperty::DisplayName), DavValue::String(name)) => {
                     if name.len() <= self.core.groupware.live_property_size {
-                        address_book.preferences_mut(access_token.primary_id).name = name;
+                        address_book.preferences_mut(access_token.account_id()).name = name;
                         items.insert_ok(property.property);
                     } else {
                         items.insert_error_with_description(
@@ -273,7 +289,7 @@ impl CardPropPatchRequestHandler for Server {
                     DavValue::String(name),
                 ) => {
                     if name.len() <= self.core.groupware.live_property_size {
-                        address_book.preferences_mut(access_token.primary_id).description = Some(name);
+                        address_book.preferences_mut(access_token.account_id()).description = Some(name);
                         items.insert_ok(property.property);
                     } else {
                         items.insert_error_with_description(

@@ -9,8 +9,7 @@ use crate::{
     core::{ImapId, SavedSearch, SelectedMailbox, Session, SessionData},
     spawn_op,
 };
-use common::listener::SessionStream;
-use directory::Permission;
+use common::network::SessionStream;
 use email::cache::{MessageCacheFetch, email::MessageCacheAccess};
 use imap_proto::{
     Command, StatusResponse,
@@ -22,6 +21,7 @@ use imap_proto::{
 };
 use mail_parser::HeaderName;
 use nlp::language::Language;
+use registry::schema::enums::Permission;
 use std::{str::FromStr, sync::Arc, time::Instant};
 use store::{
     query::log::Query,
@@ -449,7 +449,7 @@ impl<T: SessionStream> SessionData<T> {
                     filters.push(SearchFilter::has_text_detect(
                         EmailSearchField::Body,
                         text,
-                        self.server.core.jmap.default_language,
+                        self.server.core.email.default_language,
                     ));
                 }
                 Filter::Cc(text) => {
@@ -468,39 +468,66 @@ impl<T: SessionStream> SessionData<T> {
                 }
                 Filter::Header(header, value) => {
                     if let Some(header) = HeaderName::parse(header) {
-                        let op = if matches!(
-                            header,
-                            HeaderName::MessageId
-                                | HeaderName::InReplyTo
-                                | HeaderName::References
-                                | HeaderName::ResentMessageId
-                        ) || value.is_empty()
-                        {
-                            SearchOperator::Equal
-                        } else {
-                            SearchOperator::Contains
-                        };
+                        match header {
+                            HeaderName::Subject => {
+                                filters.push(SearchFilter::has_text_detect(
+                                    EmailSearchField::Subject,
+                                    value,
+                                    self.server.core.email.default_language,
+                                ));
+                            }
+                            header @ (HeaderName::From
+                            | HeaderName::To
+                            | HeaderName::Cc
+                            | HeaderName::Bcc) => {
+                                filters.push(SearchFilter::has_text(
+                                    match header {
+                                        HeaderName::From => EmailSearchField::From,
+                                        HeaderName::To => EmailSearchField::To,
+                                        HeaderName::Cc => EmailSearchField::Cc,
+                                        HeaderName::Bcc => EmailSearchField::Bcc,
+                                        _ => unreachable!(),
+                                    },
+                                    value,
+                                    Language::None,
+                                ));
+                            }
+                            header => {
+                                let op = if matches!(
+                                    header,
+                                    HeaderName::MessageId
+                                        | HeaderName::InReplyTo
+                                        | HeaderName::References
+                                        | HeaderName::ResentMessageId
+                                ) || value.is_empty()
+                                {
+                                    SearchOperator::Equal
+                                } else {
+                                    SearchOperator::Contains
+                                };
 
-                        filters.push(SearchFilter::cond(
-                            EmailSearchField::Headers,
-                            op,
-                            SearchValue::KeyValues(
-                                VecMap::with_capacity(1)
-                                    .with_append(header.as_str().to_lowercase(), value),
-                            ),
-                        ));
+                                filters.push(SearchFilter::cond(
+                                    EmailSearchField::Headers,
+                                    op,
+                                    SearchValue::KeyValues(
+                                        VecMap::with_capacity(1)
+                                            .with_append(header.as_str().to_lowercase(), value),
+                                    ),
+                                ));
+                            }
+                        }
                     }
                 }
                 Filter::Subject(text) => {
                     filters.push(SearchFilter::has_text_detect(
                         EmailSearchField::Subject,
                         text,
-                        self.server.core.jmap.default_language,
+                        self.server.core.email.default_language,
                     ));
                 }
                 Filter::Text(text) => {
                     let (text, language) =
-                        Language::detect(text, self.server.core.jmap.default_language);
+                        Language::detect(text, self.server.core.email.default_language);
 
                     filters.push(SearchFilter::Or);
                     filters.push(SearchFilter::has_text(

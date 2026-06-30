@@ -11,9 +11,7 @@ use crate::{
     },
     write::SearchIndex,
 };
-use ahash::AHashSet;
 use deadpool_postgres::Pool;
-use nlp::language::Language;
 
 pub mod blob;
 pub mod lookup;
@@ -25,7 +23,6 @@ pub mod write;
 
 pub struct PostgresStore {
     pub(crate) conn_pool: Pool,
-    pub(crate) languages: AHashSet<Language>,
 }
 
 #[inline(always)]
@@ -45,7 +42,7 @@ fn into_error(err: tokio_postgres::error::Error) -> trc::Error {
 }
 
 #[inline(always)]
-fn into_pool_error(err: deadpool::managed::PoolError<tokio_postgres::Error>) -> trc::Error {
+fn into_pool_error(err: deadpool_postgres::PoolError) -> trc::Error {
     trc::StoreEvent::PostgresqlError.reason(err)
 }
 

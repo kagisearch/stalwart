@@ -367,7 +367,7 @@ impl From<&mail_auth::IprevOutput> for Error {
             Key::Details,
             value.ptr.as_ref().map(|s| {
                 s.iter()
-                    .map(|v| Value::String(v.into()))
+                    .map(|v| Value::String(v.as_ref().into()))
                     .collect::<Vec<_>>()
             }),
         )
@@ -428,7 +428,7 @@ impl FromStr for EventType {
     type Err = ();
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        EventType::try_parse(s).ok_or(())
+        EventType::parse(s).ok_or(())
     }
 }
 
@@ -436,6 +436,6 @@ impl FromStr for Key {
     type Err = ();
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        Key::try_parse(s).ok_or(())
+        Key::parse(s).ok_or(())
     }
 }
