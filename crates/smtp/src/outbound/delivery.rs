@@ -19,21 +19,23 @@ use crate::queue::dsn::SendDsn;
 use crate::queue::spool::SmtpSpool;
 use crate::queue::throttle::IsAllowed;
 use crate::queue::{
-    Error, FROM_REPORT, HostResponse, MessageWrapper, QueueEnvelope, QueuedMessage, Status,
+    Error, FROM_AUTHENTICATED, FROM_REPORT, FROM_SIEVE, HostResponse, MessageWrapper,
+    QueueEnvelope, QueuedMessage, RCPT_DSN_SENT, Status, UnexpectedResponse,
 };
 use crate::reporting::send::MtaReportSend;
 use crate::{queue::ErrorDetails, reporting::tls::TlsRptOptions};
 use ahash::AHashMap;
-use common::Server;
 use common::config::smtp::queue::RoutingStrategy;
 use common::config::{server::ServerProtocol, smtp::report::AggregateFrequency};
 use common::ipc::{PolicyType, QueueEvent, QueueEventStatus, TlsEvent};
+use common::{Server, auth::BuildAccessToken};
 use compact_str::ToCompactString;
 use mail_auth::{
     mta_sts::TlsRpt,
     report::tlsrpt::{FailureDetails, ResultType},
 };
-use smtp_proto::MAIL_REQUIRETLS;
+use registry::schema::enums::Permission;
+use smtp_proto::{MAIL_REQUIRETLS, Response};
 use std::sync::Arc;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -178,6 +180,14 @@ impl QueuedMessage {
                 return QueueEventStatus::Deferred;
             }
         }
+
+        let mut message = match message
+            .enforce_queued_email_send_permission(&server, self.due)
+            .await
+        {
+            Ok(message) => message,
+            Err(status) => return status,
+        };
 
         // Throttle sender
         for throttle in &server.core.smtp.queue.outbound_limiters.sender {
@@ -1374,6 +1384,155 @@ pub enum PendingDelivery {
 }
 
 impl MessageWrapper {
+    async fn enforce_queued_email_send_permission(
+        mut self,
+        server: &Server,
+        due: u64,
+    ) -> Result<Self, QueueEventStatus> {
+        let source = self.message.flags & (FROM_AUTHENTICATED | FROM_SIEVE);
+        if source == 0 || self.message.return_path.is_empty() {
+            return Ok(self);
+        }
+
+        let account_id = match server
+            .account_id_from_email(self.message.return_path.as_ref(), false)
+            .await
+        {
+            Ok(Some(account_id)) => account_id,
+            Ok(None) => return Ok(self),
+            Err(err) => {
+                trc::error!(
+                    err.details("Failed to resolve queued message sender.")
+                        .span_id(self.span_id)
+                        .caused_by(trc::location!())
+                );
+                self.defer_sender_permission_check(server).await;
+                self.save_changes(server, due.into()).await;
+                return Err(QueueEventStatus::Deferred);
+            }
+        };
+
+        match server.access_token(account_id).await {
+            Ok(access_token) => {
+                if access_token.build().has_permission(Permission::EmailSend) {
+                    return Ok(self);
+                }
+
+                trc::event!(
+                    Security(trc::SecurityEvent::Unauthorized),
+                    AccountId = account_id,
+                    SpanId = self.span_id,
+                    QueueId = self.queue_id,
+                    From = self.message.return_path.to_string(),
+                    Details = "emailSend",
+                    Reason = "Blocked queued outbound message",
+                );
+
+                Err(self
+                    .reject_queued_sender(
+                        server,
+                        due,
+                        "Sender account is not authorized to send email.",
+                    )
+                    .await)
+            }
+            Err(err)
+                if matches!(
+                    err.as_ref(),
+                    trc::EventType::Security(trc::SecurityEvent::Unauthorized)
+                ) =>
+            {
+                trc::error!(err.span_id(self.span_id));
+                Err(self
+                    .reject_queued_sender(server, due, "Sender account no longer exists.")
+                    .await)
+            }
+            Err(err) => {
+                trc::error!(
+                    err.details("Failed to load queued message sender permissions.")
+                        .span_id(self.span_id)
+                        .caused_by(trc::location!())
+                );
+                self.defer_sender_permission_check(server).await;
+                self.save_changes(server, due.into()).await;
+                Err(QueueEventStatus::Deferred)
+            }
+        }
+    }
+
+    async fn reject_queued_sender(
+        mut self,
+        server: &Server,
+        due: u64,
+        reason: &'static str,
+    ) -> QueueEventStatus {
+        let is_sieve = self.message.flags & FROM_SIEVE != 0;
+        let status = Status::PermanentFailure(ErrorDetails {
+            entity: "localhost".into(),
+            details: Error::UnexpectedResponse(UnexpectedResponse {
+                command: "MAIL FROM".into(),
+                response: Response {
+                    code: 550,
+                    esc: [5, 7, 1],
+                    message: reason.into(),
+                },
+            }),
+        });
+
+        for rcpt in &mut self.message.recipients {
+            if rcpt.queue == self.queue_name
+                && matches!(rcpt.status, Status::Scheduled | Status::TemporaryFailure(_))
+            {
+                rcpt.status = status.clone();
+                if is_sieve {
+                    rcpt.flags |= RCPT_DSN_SENT;
+                }
+            }
+        }
+
+        if !is_sieve {
+            server.send_dsn(&mut self).await;
+        }
+
+        self.finish_permission_check(server, due).await
+    }
+
+    async fn defer_sender_permission_check(&mut self, server: &Server) {
+        let rcpt_idxs = self
+            .message
+            .recipients
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, rcpt)| {
+                (rcpt.queue == self.queue_name
+                    && matches!(rcpt.status, Status::Scheduled | Status::TemporaryFailure(_)))
+                .then_some(idx)
+            })
+            .collect::<Vec<_>>();
+
+        for rcpt_idx in rcpt_idxs {
+            self.set_rcpt_status(
+                Status::TemporaryFailure(ErrorDetails {
+                    entity: "localhost".into(),
+                    details: Error::Io("Could not verify sender permissions.".into()),
+                }),
+                rcpt_idx,
+                server,
+            )
+            .await;
+        }
+    }
+
+    async fn finish_permission_check(self, server: &Server, due: u64) -> QueueEventStatus {
+        if self.message.next_event(None).is_some() {
+            self.save_changes(server, due.into()).await;
+            QueueEventStatus::Deferred
+        } else {
+            self.remove(server, due.into()).await;
+            QueueEventStatus::Completed
+        }
+    }
+
     /// Marks as failed all domains that reached their expiration time
     pub fn has_pending_delivery(&mut self) -> PendingDelivery {
         let now = now();

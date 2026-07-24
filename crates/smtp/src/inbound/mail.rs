@@ -8,9 +8,12 @@ use crate::{
     core::{Session, SessionAddress},
     scripts::ScriptResult,
 };
-use common::{config::smtp::session::Stage, network::SessionStream, scripts::ScriptModification};
+use common::{
+    auth::AccessToken, config::smtp::session::Stage, network::SessionStream,
+    scripts::ScriptModification,
+};
 use mail_auth::{IprevOutput, IprevResult, SpfOutput, SpfResult, spf::verify::SpfParameters};
-use registry::schema::structs::Rate;
+use registry::schema::{enums::Permission, structs::Rate};
 use smtp_proto::{MAIL_BY_NOTIFY, MAIL_BY_RETURN, MAIL_REQUIRETLS, MailFrom, MtPriority};
 use std::{
     borrow::Cow,
@@ -52,6 +55,40 @@ impl<T: SessionStream> Session<T> {
             return self
                 .write(b"503 5.5.1 You must authenticate first.\r\n")
                 .await;
+        } else if let Some(account_id) = self
+            .data
+            .authenticated_as
+            .as_ref()
+            .map(|account| account.account_id())
+        {
+            let result = self
+                .server
+                .access_token(account_id)
+                .await
+                .and_then(|token| {
+                    AccessToken::renew(
+                        token,
+                        self.data.authenticated_credential_id,
+                        self.data.remote_ip,
+                    )
+                })
+                .and_then(|token| token.enforce_permission(Permission::EmailSend));
+
+            if let Err(err) = result {
+                let is_unauthorized = matches!(
+                    err.as_ref(),
+                    trc::EventType::Security(trc::SecurityEvent::Unauthorized)
+                );
+                trc::error!(err.span_id(self.data.session_id));
+
+                return self
+                    .write(if is_unauthorized {
+                        b"550 5.7.1 Your account is not authorized to send email.\r\n"
+                    } else {
+                        b"451 4.7.0 Temporary error validating sender permissions.\r\n"
+                    })
+                    .await;
+            }
         } else if self.data.iprev.is_none() && self.params.iprev.verify() {
             let time = Instant::now();
             let iprev = self

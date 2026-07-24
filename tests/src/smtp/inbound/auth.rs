@@ -9,7 +9,10 @@ use crate::{
     utils::server::TestServerBuilder,
 };
 use registry::{
-    schema::structs::{Expression, ExpressionMatch, MtaExtensions, MtaStageAuth},
+    schema::{
+        enums::Permission,
+        structs::{Expression, ExpressionMatch, MtaExtensions, MtaStageAuth},
+    },
     types::list::List,
 };
 use smtp::core::State;
@@ -26,6 +29,7 @@ async fn auth() {
 
     // Create test users
     let admin = test.account("admin");
+    let mut john_id = None;
     for (name, secret, description, aliases) in [
         (
             "john@example.org",
@@ -40,10 +44,14 @@ async fn auth() {
             &["jane@example.org"],
         ),
     ] {
-        admin
+        let account = admin
             .create_user_account(name, secret, description, aliases, vec![])
             .await;
+        if name == "john@example.org" {
+            john_id = Some(account.id());
+        }
     }
+    let john_id = john_id.unwrap();
 
     // Add test settings
     admin
@@ -135,6 +143,29 @@ async fn auth() {
     session.data.auth_errors = 0;
     session
         .auth_plain("john@example.org", "12345 + extra safety", "235 2.7.0")
+        .await;
+
+    // Removing emailSend should affect an already-authenticated session at MAIL FROM,
+    // while still allowing new SMTP sessions to authenticate and access the account.
+    test.account("admin")
+        .patch_account_disabled_permission(john_id, Permission::EmailSend, true)
+        .await;
+    session.mail_from("john@example.org", "550 5.7.1").await;
+
+    let mut readonly_session = test.new_mta_session();
+    readonly_session.data.remote_ip_str = "10.0.0.1".into();
+    readonly_session.eval_session_params().await;
+    readonly_session.stream.tls = true;
+    readonly_session.ehlo("mx.foobar.org").await;
+    readonly_session
+        .auth_plain("john@example.org", "12345 + extra safety", "235 2.7.0")
+        .await;
+    readonly_session
+        .mail_from("john@example.org", "550 5.7.1")
+        .await;
+
+    test.account("admin")
+        .patch_account_disabled_permission(john_id, Permission::EmailSend, false)
         .await;
 
     // Users should be able to send emails only from their own email addresses

@@ -16,6 +16,7 @@ use jmap_client::{
     mailbox::Role,
 };
 use mail_parser::DateTime;
+use registry::schema::enums::Permission;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -213,6 +214,26 @@ pub async fn test(test: &TestServer) {
         .await
         .unwrap()
         .take_id();
+
+    // Account-level emailSend denial applies to JMAP EmailSubmission's local
+    // SMTP session as well as authenticated SMTP sessions.
+    test.account("admin")
+        .set_account_disabled_permissions(account.id(), vec![Permission::EmailSend])
+        .await;
+    assert!(matches!(
+        client
+            .email_submission_create(&email_id, &identity_id)
+            .await,
+        Err(Error::Set(SetError {
+            type_: SetErrorType::ForbiddenMailFrom,
+            ..
+        }))
+    ));
+    expect_nothing(&mut smtp_rx).await;
+    test.account("admin")
+        .set_account_disabled_permissions(account.id(), vec![])
+        .await;
+
     client
         .email_submission_create(&email_id, &identity_id)
         .await

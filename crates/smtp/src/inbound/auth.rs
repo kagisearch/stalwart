@@ -8,7 +8,6 @@ use crate::core::Session;
 use common::{auth::AuthRequest, network::SessionStream};
 use directory::Credentials;
 use mail_parser::decoders::base64::base64_decode;
-use registry::schema::enums::Permission;
 use smtp_proto::{AUTH_LOGIN, AUTH_OAUTHBEARER, AUTH_PLAIN, AUTH_XOAUTH2, IntoString};
 use trc::AuthEvent;
 
@@ -116,17 +115,23 @@ impl<T: SessionStream> Session<T> {
                 self.data.session_id,
                 self.data.remote_ip,
             ))
-            .await
-            .and_then(|access_token| access_token.assert_has_permission(Permission::EmailSend));
+            .await;
 
         let result = match result {
-            Ok(access_token) => self.server.account_info(access_token.account_id()).await,
+            Ok(access_token) => {
+                let credential_id = access_token.credential_id();
+                self.server
+                    .account_info(access_token.account_id())
+                    .await
+                    .map(|account_info| (account_info, credential_id))
+            }
             Err(err) => Err(err),
         };
 
         match result {
-            Ok(account_info) => {
+            Ok((account_info, credential_id)) => {
                 self.data.authenticated_as = account_info.into();
+                self.data.authenticated_credential_id = credential_id;
                 self.eval_post_auth_params().await;
                 self.write(b"235 2.7.0 Authentication succeeded.\r\n")
                     .await?;

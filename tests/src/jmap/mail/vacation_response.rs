@@ -11,6 +11,7 @@ use crate::{
     utils::{dns::DnsCache, server::TestServer, smtp::SmtpConnection},
 };
 use chrono::{TimeDelta, Utc};
+use registry::schema::enums::Permission;
 use std::time::Instant;
 
 pub async fn test(test: &TestServer) {
@@ -41,6 +42,38 @@ pub async fn test(test: &TestServer) {
 
     // Connect to LMTP service
     let mut lmtp = SmtpConnection::connect().await;
+
+    // Read-only accounts should still receive and store incoming messages,
+    // but their vacation response must not enter the outbound queue.
+    let admin = test.account("admin");
+    admin
+        .set_account_disabled_permissions(account.id(), vec![Permission::EmailSend])
+        .await;
+    lmtp.ingest(
+        "readonly-check@remote.org",
+        &["jdoe@example.com"],
+        concat!(
+            "From: readonly-check@remote.org\r\n",
+            "To: jdoe@example.com\r\n",
+            "Subject: Read-only vacation check\r\n",
+            "\r\n",
+            "This message should be delivered without an automatic reply."
+        ),
+    )
+    .await;
+    expect_nothing(&mut smtp_rx).await;
+    assert_eq!(
+        client
+            .email_query(None::<jmap_client::email::query::Filter>, None::<Vec<_>>,)
+            .await
+            .unwrap()
+            .ids()
+            .len(),
+        1
+    );
+    admin
+        .set_account_disabled_permissions(account.id(), vec![])
+        .await;
 
     // Send a message
     lmtp.ingest(

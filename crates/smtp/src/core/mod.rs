@@ -77,6 +77,7 @@ pub struct SessionData {
     pub message: Vec<u8>,
 
     pub authenticated_as: Option<AccountInfo>,
+    pub authenticated_credential_id: Option<u32>,
     pub auth_errors: usize,
 
     pub priority: i16,
@@ -153,6 +154,7 @@ impl SessionData {
             mail_from: None,
             rcpt_to: Vec::new(),
             authenticated_as: None,
+            authenticated_credential_id: None,
             priority: 0,
             valid_until: Instant::now(),
             rcpt_errors: 0,
@@ -279,6 +281,7 @@ impl SessionData {
             rcpt_oks: 0,
             message,
             authenticated_as: Some(authenticated_as),
+            authenticated_credential_id: None,
             auth_errors: 0,
             priority: 0,
             delivery_by: 0,

@@ -17,7 +17,7 @@ use registry::{
             Roles, UserAccount,
         },
     },
-    types::{list::List, map::Map},
+    types::{EnumImpl, list::List, map::Map},
 };
 use serde_json::json;
 use std::time::Duration;
@@ -262,6 +262,47 @@ impl Account {
                 account_id,
                 json!({
                     Property::Roles: Roles::Custom(CustomRoles { role_ids: Map::new(role_ids) })
+                }),
+            )],
+        )
+        .await
+        .updated_id(account_id);
+    }
+
+    pub async fn set_account_disabled_permissions(
+        &self,
+        account_id: Id,
+        permissions: Vec<Permission>,
+    ) {
+        self.registry_update(
+            ObjectType::Account,
+            [(
+                account_id,
+                json!({
+                    Property::Permissions: Permissions::Merge(PermissionsList {
+                        disabled_permissions: Map::new(permissions),
+                        enabled_permissions: Default::default(),
+                    })
+                }),
+            )],
+        )
+        .await
+        .updated_id(account_id);
+    }
+
+    pub async fn patch_account_disabled_permission(
+        &self,
+        account_id: Id,
+        permission: Permission,
+        disabled: bool,
+    ) {
+        self.registry_update(
+            ObjectType::Account,
+            [(
+                account_id,
+                json!({
+                    (format!("permissions/disabledPermissions/{}", permission.as_str())):
+                        disabled.then_some(true)
                 }),
             )],
         )
