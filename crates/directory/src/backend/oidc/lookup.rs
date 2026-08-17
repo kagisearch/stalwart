@@ -243,16 +243,20 @@ impl OpenIdDirectory {
             }
         }
 
-        if self.config.claim_email != "email"
-            && let Some(val) = claims.get("email").and_then(|v| v.as_str())
-            && val.contains('@')
-        {
-            return Ok(val.to_string());
-        }
-
-        Err(OidcError::AuthorizationFailed(
-            "Could not determine a valid email address for account".to_string(),
-        ))
+        // The configured claim is the only accepted source of identity. Resolving
+        // from the standard `email` claim instead would authenticate the caller as
+        // whatever address their IdP reports, which in a deployment that provisions
+        // mailboxes out of band names a different account — one `synchronize_account`
+        // will create if the domain happens to be local. Nothing in this path
+        // consults `email_verified`, so there is no check that would make that safe.
+        //
+        // Reported as `Provider` rather than `AuthorizationFailed` so `authenticate`
+        // maps it to `AuthEvent::Error`: a missing contracted claim is a
+        // misconfiguration worth logging, and `AuthEvent::Failed` resolves to DEBUG.
+        Err(OidcError::Provider(format!(
+            "Claim '{}' is missing or is not a valid email address",
+            self.config.claim_email
+        )))
     }
 }
 
