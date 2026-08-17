@@ -120,6 +120,23 @@ pub async fn test() {
         }
     );
 
+    // A configured claim the IdP does not issue must fail, rather than resolving the
+    // account from the standard `email` claim. The token here carries `email`, so a
+    // fallback would silently authenticate as john.doe@example.org.
+    let mut config_missing_claim = config.clone();
+    config_missing_claim.claim_username = "nonexistent_claim".to_string();
+    assert!(
+        OpenIdDirectory::open(config_missing_claim)
+            .await
+            .unwrap()
+            .authenticate(&Credentials::Bearer {
+                username: None,
+                token: token.clone(),
+            })
+            .await
+            .is_err()
+    );
+
     // Not matching the required audience should fail
     let mut config_wrong_audience = config.clone();
     config_wrong_audience.require_audience = Some("wrong_audience".to_string());
