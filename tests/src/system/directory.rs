@@ -328,6 +328,14 @@ pub async fn test(test: &TestServer) {
             EmailCache::Account(account_id.document_id()),
         ),
         (
+            // The same address rcpt_resolve rewrites to jdoe@example.com below.
+            // The two have to agree: is_local_address is built on this lookup, so
+            // a routing expression asking whether an address is local must not be
+            // told "no" about one the server then delivers locally.
+            "jdoe+promotions@example.com",
+            EmailCache::Account(account_id.document_id()),
+        ),
+        (
             "johndoe@beispiel.de",
             EmailCache::Account(account_id.document_id()),
         ),
@@ -368,6 +376,15 @@ pub async fn test(test: &TestServer) {
     assert_eq!(
         test.server
             .rcpt_id_from_email("unknown@unknown.com")
+            .await
+            .unwrap(),
+        None
+    );
+    // Sub-addressing resolves the local part; it does not conjure one. An unknown
+    // mailbox stays unknown however it is tagged.
+    assert_eq!(
+        test.server
+            .rcpt_id_from_email("unknown+promotions@example.com")
             .await
             .unwrap(),
         None

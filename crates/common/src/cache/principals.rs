@@ -302,7 +302,38 @@ impl Server {
     pub async fn rcpt_id_from_email(&self, address: &str) -> trc::Result<Option<EmailCache>> {
         if let Some((local_part, domain)) = address.split_once('@') {
             if let Some(domain) = self.domain(domain).await? {
-                self.rcpt_id_from_parts(local_part, domain.id).await
+                // Sub-addressing resolution, matching rcpt_resolve and
+                // account_id_from_email. Without it this reports someone+tag@ as
+                // unknown while delivery resolves it to someone@, and the two
+                // disagreeing is worse than either answer: is_local_address is
+                // built on this, so a routing expression asking whether an address
+                // is local gets "no" for an address the server then delivers
+                // locally.
+                let mut local_part = Cow::Borrowed(local_part);
+                if domain.flags & DOMAIN_FLAG_SUB_ADDRESSING != 0 {
+                    if let Some(sub_addressing) = &domain.sub_addressing_custom {
+                        // Custom sub-addressing resolution
+                        if let Some(result) = self
+                            .eval_if::<String, _>(
+                                sub_addressing,
+                                &AddressResolver(local_part.as_ref()),
+                                0,
+                            )
+                            .await
+                        {
+                            local_part = Cow::Owned(result);
+                        }
+                    } else if let Some((new_local_part, _)) = address.split_once('+') {
+                        // Split from `address` rather than `local_part`, as the
+                        // sibling resolvers do: splitting the value being assigned
+                        // to would hold a borrow across the assignment. A domain
+                        // cannot contain '+', so the two are equivalent.
+                        local_part = Cow::Borrowed(new_local_part);
+                    }
+                }
+
+                self.rcpt_id_from_parts(local_part.as_ref(), domain.id)
+                    .await
             } else {
                 Ok(None)
             }
