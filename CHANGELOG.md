@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [Unreleased]
+
+## Added
+
+## Changed
+
+## Fixed
+- MTA: A mailing list whose `recipients` include another mailing list hosted on the same server is not expanded, so the nested list address is placed in the envelope and rejected at local delivery with `550 5.5.0 Mailbox not found`.
+
 ## [0.16.11] - 2026-06-25
 
 If you are upgrading from v0.16.x, replace the binary (or run `docker pull`). If you are upgrading from v0.15.x and below, please read the [upgrading documentation](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING/v0_16.md) for more information on how to upgrade from previous versions.

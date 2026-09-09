@@ -577,6 +577,101 @@ END:VCARD
         }
     }
 
+    // Mailing lists whose recipients include another local list. At this point
+    // "members@example.org" contains jane.smith@example.org and bill@example.org.
+    admin
+        .registry_create_object(MailingList {
+            name: "staff".to_string(),
+            recipients: Map::new(vec![
+                "members@example.org".to_string(),
+                "jdoe@example.org".to_string(),
+            ]),
+            domain_id,
+            ..Default::default()
+        })
+        .await;
+    // Reaches every member both directly and through "staff"
+    admin
+        .registry_create_object(MailingList {
+            name: "everyone".to_string(),
+            recipients: Map::new(vec![
+                "members@example.org".to_string(),
+                "staff@example.org".to_string(),
+                "jdoe@example.org".to_string(),
+            ]),
+            domain_id,
+            ..Default::default()
+        })
+        .await;
+    // Two lists that reference each other
+    admin
+        .registry_create_object(MailingList {
+            name: "cycle-a".to_string(),
+            recipients: Map::new(vec![
+                "cycle-b@example.org".to_string(),
+                "jdoe@example.org".to_string(),
+            ]),
+            domain_id,
+            ..Default::default()
+        })
+        .await;
+    admin
+        .registry_create_object(MailingList {
+            name: "cycle-b".to_string(),
+            recipients: Map::new(vec![
+                "cycle-a@example.org".to_string(),
+                "jane.smith@example.org".to_string(),
+            ]),
+            domain_id,
+            ..Default::default()
+        })
+        .await;
+
+    for (list, subject, expected_deliveries) in [
+        // A member reachable only through a nested list has to receive the message
+        ("staff@example.org", "Fire drill", [1, 1, 1]),
+        // A member reachable through two nested lists receives a single copy
+        ("everyone@example.org", "Coffee machine", [1, 1, 1]),
+        // A cycle terminates and delivers to every member reachable from it
+        ("cycle-a@example.org", "Recursion", [1, 1, 0]),
+    ] {
+        let mut counts = Vec::with_capacity(3);
+        for account in [&john, &jane, &bill] {
+            counts.push(num_cached_messages(&test.server, account).await);
+        }
+
+        lmtp.ingest(
+            "bill@example.org",
+            &[list],
+            &format!(
+                concat!(
+                    "From: bill@example.org\r\n",
+                    "To: {}\r\n",
+                    "Subject: {}\r\n",
+                    "\r\n",
+                    "This is a message for {}."
+                ),
+                list, subject, list
+            ),
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        for ((account, count), expected) in [&john, &jane, &bill]
+            .into_iter()
+            .zip(counts)
+            .zip(expected_deliveries)
+        {
+            assert_eq!(
+                num_cached_messages(&test.server, account).await,
+                count + expected,
+                "for {} delivering to {list}",
+                account.id_string()
+            );
+        }
+    }
+
     // Remove test data
     john.registry_destroy(
         ObjectType::MaskedEmail,
@@ -640,6 +735,16 @@ async fn message_headers(server: &Server, account_id: u32, document_id: u32) -> 
     )
     .unwrap()
     .to_string()
+}
+
+async fn num_cached_messages(server: &Server, account: &Account) -> usize {
+    server
+        .get_cached_messages(account.id().document_id())
+        .await
+        .unwrap()
+        .emails
+        .items
+        .len()
 }
 
 async fn message_metadata(server: &Server, account_id: u32, document_id: u32) -> MessageMetadata {
