@@ -8,7 +8,6 @@ use crate::{
     core::{Session, SessionAddress},
     scripts::ScriptResult,
 };
-use ahash::AHashSet;
 use common::{
     KV_GREYLIST,
     config::smtp::session::Stage,
@@ -18,7 +17,7 @@ use common::{
 use smtp_proto::{
     RCPT_NOTIFY_DELAY, RCPT_NOTIFY_FAILURE, RCPT_NOTIFY_NEVER, RCPT_NOTIFY_SUCCESS, RcptTo,
 };
-use std::{borrow::Cow, collections::VecDeque};
+use std::borrow::Cow;
 use store::dispatch::lookup::KeyValue;
 use trc::{SecurityEvent, SmtpEvent};
 use utils::DomainPart;
@@ -355,69 +354,19 @@ impl<T: SessionStream> Session<T> {
         if let Some(members) = rcpt_members {
             let list_addr = self.data.rcpt_to.pop().unwrap();
             let orcpt = format!("rfc822;{}", list_addr.address_lcase);
-            let mut expanded_lists = AHashSet::from_iter([list_addr.address_lcase.clone()]);
-            let mut pending_lists = VecDeque::from([members]);
-
-            while let Some(members) = pending_lists.pop_front() {
-                for member in members.as_ref() {
-                    let member_lcase = member.to_lowercase();
-                    if expanded_lists.contains(&member_lcase) {
-                        continue;
-                    }
-
-                    let is_local = match self
-                        .server
-                        .account_id_from_email(&member_lcase, false)
-                        .await
-                    {
-                        Ok(account_id) => account_id.is_some(),
-                        Err(err) => {
-                            trc::error!(
-                                err.span_id(self.data.session_id)
-                                    .caused_by(trc::location!())
-                                    .details("Failed to look up mailing list member.")
-                                    .ctx(trc::Key::To, member.to_string())
-                            );
-                            false
-                        }
-                    };
-
-                    // Resolving a member that is not a known local account expands nested
-                    // lists and, on domains served by an external directory, synchronizes
-                    // members that are not cached yet.
-                    if !is_local {
-                        match self
-                            .server
-                            .rcpt_resolve(&member_lcase, self.data.session_id)
-                            .await
-                        {
-                            Ok(RcptResolution::Expand(nested_members)) => {
-                                expanded_lists.insert(member_lcase);
-                                pending_lists.push_back(nested_members);
-                                continue;
-                            }
-                            Ok(_) => (),
-                            Err(err) => {
-                                trc::error!(
-                                    err.span_id(self.data.session_id)
-                                        .caused_by(trc::location!())
-                                        .details("Failed to resolve mailing list member.")
-                                        .ctx(trc::Key::To, member.to_string())
-                                );
-                            }
-                        }
-                    }
-
-                    let mut member_addr = SessionAddress::new(member.to_string());
-                    if !self.data.rcpt_to.contains(&member_addr) {
-                        member_addr.dsn_info = orcpt.clone().into();
-                        member_addr.flags = list_addr.flags;
-                        self.data.rcpt_to.push(member_addr);
-                    }
+            for member in self
+                .server
+                .expand_list_members(members, &list_addr.address_lcase, self.data.session_id)
+                .await
+            {
+                let mut member_addr = SessionAddress::new(member);
+                if !self.data.rcpt_to.contains(&member_addr) {
+                    member_addr.dsn_info = orcpt.clone().into();
+                    member_addr.flags = list_addr.flags;
+                    self.data.rcpt_to.push(member_addr);
                 }
             }
         }
-
         self.data.rcpt_oks += 1;
         self.write(b"250 2.1.5 OK\r\n").await
     }

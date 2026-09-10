@@ -21,12 +21,14 @@ use crate::{
     manager::SPAM_CLASSIFIER_KEY,
     network::RcptResolution,
 };
+use ahash::AHashSet;
 use directory::Recipient;
 use mail_auth::IpLookupStrategy;
 use registry::schema::{enums::ExpressionVariable, structs::MaskedEmail};
 use sieve::Sieve;
 use std::{
     borrow::Cow,
+    collections::VecDeque,
     sync::{Arc, LazyLock},
     time::Duration,
 };
@@ -182,6 +184,72 @@ impl Server {
         } else {
             Ok(RcptResolution::UnknownRecipient)
         }
+    }
+
+    // Flattens a mailing list's recipients, expanding members that are themselves
+    // mailing lists. `seed` is the address being expanded, so a list naming itself
+    // is not re-entered.
+    pub async fn expand_list_members(
+        &self,
+        members: Arc<[Box<str>]>,
+        seed: &str,
+        session_id: u64,
+    ) -> Vec<String> {
+        let mut expanded_lists = AHashSet::from_iter([seed.to_lowercase()]);
+        let mut pending_lists = VecDeque::from([members]);
+        let mut leaves = Vec::new();
+
+        while let Some(members) = pending_lists.pop_front() {
+            for member in members.as_ref() {
+                let member_lcase = member.to_lowercase();
+                if expanded_lists.contains(&member_lcase) {
+                    continue;
+                }
+
+                let is_local = match self.account_id_from_email(&member_lcase, false).await {
+                    Ok(account_id) => account_id.is_some(),
+                    Err(err) => {
+                        trc::error!(
+                            err.span_id(session_id)
+                                .caused_by(trc::location!())
+                                .details("Failed to look up mailing list member.")
+                                .ctx(trc::Key::To, member.to_string())
+                        );
+                        false
+                    }
+                };
+
+                // Expand nested lists and synchronize external directory members
+                if !is_local {
+                    match Box::pin(self.rcpt_resolve(&member_lcase, session_id)).await {
+                        Ok(RcptResolution::Expand(nested_members)) => {
+                            expanded_lists.insert(member_lcase);
+                            pending_lists.push_back(nested_members);
+                            continue;
+                        }
+                        Ok(_) => (),
+                        Err(err) => {
+                            trc::error!(
+                                err.span_id(session_id)
+                                    .caused_by(trc::location!())
+                                    .details("Failed to resolve mailing list member.")
+                                    .ctx(trc::Key::To, member.to_string())
+                            );
+                        }
+                    }
+                }
+
+                // Skip addresses reachable through more than one nested list
+                if !leaves
+                    .iter()
+                    .any(|leaf: &String| leaf.eq_ignore_ascii_case(member))
+                {
+                    leaves.push(member.to_string());
+                }
+            }
+        }
+
+        leaves
     }
 
     pub async fn get_dkim_signers(
