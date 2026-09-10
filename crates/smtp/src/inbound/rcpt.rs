@@ -354,41 +354,19 @@ impl<T: SessionStream> Session<T> {
         if let Some(members) = rcpt_members {
             let list_addr = self.data.rcpt_to.pop().unwrap();
             let orcpt = format!("rfc822;{}", list_addr.address_lcase);
-            for member in members.as_ref() {
-                let mut member_addr = SessionAddress::new(member.to_string());
-                if !self.data.rcpt_to.contains(&member_addr)
-                    && member_addr.address_lcase != list_addr.address_lcase
-                {
-                    // Force external directory synchronization
-                    if let Ok(Some(member_domain)) = self.server.domain(&member_addr.domain).await
-                        && self
-                            .server
-                            .get_directory_for_cached_domain(&member_domain)
-                            .is_some_and(|directory| directory.can_lookup_recipients())
-                        && matches!(
-                            self.server
-                                .account_id_from_email(&member_addr.address_lcase, false)
-                                .await,
-                            Ok(None)
-                        )
-                        && let Err(err) = self
-                            .server
-                            .rcpt_resolve(&member_addr.address_lcase, self.data.session_id)
-                            .await
-                    {
-                        trc::error!(
-                            err.span_id(self.data.session_id)
-                                .caused_by(trc::location!())
-                        );
-                    }
-
+            for member in self
+                .server
+                .expand_list_members(members, &list_addr.address_lcase, self.data.session_id)
+                .await
+            {
+                let mut member_addr = SessionAddress::new(member);
+                if !self.data.rcpt_to.contains(&member_addr) {
                     member_addr.dsn_info = orcpt.clone().into();
                     member_addr.flags = list_addr.flags;
                     self.data.rcpt_to.push(member_addr);
                 }
             }
         }
-
         self.data.rcpt_oks += 1;
         self.write(b"250 2.1.5 OK\r\n").await
     }
