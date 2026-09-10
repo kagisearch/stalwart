@@ -9,7 +9,7 @@ All notable changes to this project will be documented in this file. This projec
 ## Changed
 
 ## Fixed
-- MTA: A mailing list whose `recipients` include another mailing list hosted on the same server is not expanded, so the nested list address is placed in the envelope and rejected at local delivery with `550 5.5.0 Mailbox not found`.
+- MTA: A mailing list whose `recipients` include another mailing list hosted on the same server is not expanded, so the nested list address is placed in the envelope and rejected at local delivery with `550 5.5.0 Mailbox not found`. Affects both `RCPT TO` and the recipient expansion for server-generated mail (Sieve `redirect`/`notify`, DSNs).
 
 ## [0.16.11] - 2026-06-25
 

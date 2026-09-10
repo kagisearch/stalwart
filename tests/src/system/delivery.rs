@@ -577,8 +577,7 @@ END:VCARD
         }
     }
 
-    // Mailing lists whose recipients include another local list. At this point
-    // "members@example.org" contains jane.smith@example.org and bill@example.org.
+    // Create nested mailing lists
     admin
         .registry_create_object(MailingList {
             name: "staff".to_string(),
@@ -590,7 +589,7 @@ END:VCARD
             ..Default::default()
         })
         .await;
-    // Reaches every member both directly and through "staff"
+    // Reaches the same members directly and through "staff"
     admin
         .registry_create_object(MailingList {
             name: "everyone".to_string(),
@@ -603,7 +602,7 @@ END:VCARD
             ..Default::default()
         })
         .await;
-    // Two lists that reference each other
+    // Lists that reference each other
     admin
         .registry_create_object(MailingList {
             name: "cycle-a".to_string(),
@@ -628,11 +627,11 @@ END:VCARD
         .await;
 
     for (list, subject, expected_deliveries) in [
-        // A member reachable only through a nested list has to receive the message
+        // Delivering to a nested list
         ("staff@example.org", "Fire drill", [1, 1, 1]),
-        // A member reachable through two nested lists receives a single copy
+        // Delivering once to a member reached through two lists
         ("everyone@example.org", "Coffee machine", [1, 1, 1]),
-        // A cycle terminates and delivers to every member reachable from it
+        // Delivering to a cycle
         ("cycle-a@example.org", "Recursion", [1, 1, 0]),
     ] {
         let mut counts = Vec::with_capacity(3);
