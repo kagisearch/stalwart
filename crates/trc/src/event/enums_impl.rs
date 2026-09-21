@@ -2955,6 +2955,8 @@ impl EventType {
             EventType::Acme(AcmeEvent::TokenNotFound) => Level::Warn,
             EventType::Ai(AiEvent::ApiError) => Level::Warn,
             EventType::Arc(ArcEvent::SealerNotFound) => Level::Warn,
+            EventType::Auth(AuthEvent::Failed) => Level::Warn,
+            EventType::Auth(AuthEvent::TokenExpired) => Level::Warn,
             EventType::Auth(AuthEvent::TooManyAttempts) => Level::Warn,
             EventType::Calendar(CalendarEvent::AlarmFailed) => Level::Warn,
             EventType::Cluster(ClusterEvent::SubscriberDisconnected) => Level::Warn,
