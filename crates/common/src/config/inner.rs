@@ -105,6 +105,10 @@ impl Caches {
                 (std::mem::size_of::<AccessTokenInner>() + 255) as u64,
             ),
             http_auth: Cache::new(cache.http_auth, (50 + std::mem::size_of::<u32>()) as u64),
+            http_auth_negative: CacheWithTtl::new(
+                cache.http_auth,
+                (255 + std::mem::size_of::<u32>()) as u64,
+            ),
             messages: Cache::new(
                 cache.messages,
                 (std::mem::size_of::<u32>()

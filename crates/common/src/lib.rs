@@ -175,6 +175,7 @@ pub struct LogoCache {
 pub struct Caches {
     pub access_tokens: Cache<u32, Arc<AccessTokenInner>>,
     pub http_auth: Cache<Box<str>, HttpAuthCache>,
+    pub http_auth_negative: CacheWithTtl<Box<str>, u32>,
 
     pub messages: Cache<u32, Arc<MessageStoreCache>>,
     pub files: Cache<u32, Arc<DavResources>>,
