@@ -13,6 +13,16 @@ use mail_parser::decoders::base64::base64_decode;
 use std::future::Future;
 use std::time::{Duration, Instant};
 
+/// How long a rejected bearer token is remembered.
+///
+/// Deliberately short, and not the shared negative-cache TTL. The point is to collapse a
+/// client retrying the same dead token in a loop, and a minute of that is already all but
+/// the whole saving. Against that, a token can be rejected for a reason that later clears
+/// -- an account re-enabled, or an identity provider not yet caught up on a token it has
+/// only just minted -- so the window in which a stale entry keeps a good token out should
+/// stay small.
+const BEARER_REJECTION_TTL: Duration = Duration::from_secs(60);
+
 pub trait Authenticator: Sync + Send {
     fn authenticate_headers(
         &self,
@@ -65,6 +75,25 @@ impl Authenticator for Server {
                 self.is_http_anonymous_request_allowed(session.remote_ip)
                     .await?;
 
+                // A token already rejected is rejected again from cache, without a
+                // second round trip to the OpenID provider. The usual reason -- the
+                // token has expired or been revoked -- never reverses;
+                // BEARER_REJECTION_TTL bounds the ones that can.
+                //
+                // Repeats of a single token bypass the fail2ban counter this way, but a
+                // brute force presents distinct tokens, and every distinct token misses
+                // this cache and still reaches it.
+                if let Some(event_id) = self.inner.cache.http_auth_negative.get(token) {
+                    // Replayed under the event type that was refused the first time, so
+                    // a repeat reads as the same rejection rather than being relabelled.
+                    let event = trc::EventType::from_id(event_id as u16)
+                        .unwrap_or(trc::EventType::Auth(trc::AuthEvent::Failed));
+
+                    return Err(trc::Error::new(event)
+                        .details("Bearer token previously rejected.")
+                        .caused_by(trc::location!()));
+                }
+
                 Credentials::Bearer {
                     username: None,
                     token: token.to_string(),
@@ -82,13 +111,38 @@ impl Authenticator for Server {
             };
 
             // Authenticate
-            let access_token = self
+            let access_token = match self
                 .authenticate(&AuthRequest::from_credentials(
                     credentials,
                     session.session_id,
                     session.remote_ip,
                 ))
-                .await?;
+                .await
+            {
+                Ok(access_token) => access_token,
+                Err(err) => {
+                    // Only a terminal rejection is cached: the credential was read and
+                    // refused. `AuthEvent::Error` is instead the provider being
+                    // unreachable or answering badly, and caching that would turn a brief
+                    // outage into one lasting the whole TTL.
+                    if mechanism.eq_ignore_ascii_case("bearer")
+                        && matches!(
+                            err.as_ref(),
+                            trc::EventType::Auth(
+                                trc::AuthEvent::Failed | trc::AuthEvent::TokenExpired
+                            )
+                        )
+                    {
+                        self.inner.cache.http_auth_negative.insert(
+                            token.into(),
+                            err.as_ref().to_id() as u32,
+                            BEARER_REJECTION_TTL,
+                        );
+                    }
+
+                    return Err(err);
+                }
+            };
 
             // Cache credentials
             self.inner.cache.http_auth.insert(

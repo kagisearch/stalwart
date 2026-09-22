@@ -828,6 +828,33 @@ pub async fn test(test: &mut TestServer) {
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_unauthorized("https://127.0.0.1:8899", &token).await;
 
+    // The refusal is remembered, so a client looping on a dead token is turned away from
+    // cache rather than revalidated on every request. Which rejection surfaces here
+    // depends on whether a bearer-capable directory is configured -- an expired internal
+    // token gives TokenExpired, a directory refusal gives Failed -- and either is cached.
+    assert!(
+        test.server
+            .inner
+            .cache
+            .http_auth_negative
+            .get(token.as_str())
+            .is_some(),
+        "expired bearer token was not cached as rejected"
+    );
+    assert_unauthorized("https://127.0.0.1:8899", &token).await;
+
+    // A token that was never presented is not in the cache, so a first attempt still
+    // reaches the directory.
+    assert!(
+        test.server
+            .inner
+            .cache
+            .http_auth_negative
+            .get("a token that has never been presented")
+            .is_none(),
+        "unseen bearer token should not be cached as rejected"
+    );
+
     // Wait another second for the refresh token to be about to expire
     // and expect a new refresh token
     tokio::time::sleep(Duration::from_secs(1)).await;
