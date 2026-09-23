@@ -16,7 +16,7 @@ use store::{
     rand,
     write::{
         AnyClass, AnyKey, BatchBuilder, BlobLink, BlobOp, Operation, QueueClass, QueueEvent,
-        RegistryClass, ValueClass,
+        RegistryClass, ValueClass, key::KeySerializer,
     },
     *,
 };
@@ -199,9 +199,21 @@ pub async fn test(test: &TestServer) {
     store_destroy(&db).await;
     store_assert_is_empty(&db, db.clone().into(), true).await;
 
-    // Import store
+    // Import store over a node id lease
     println!("Importing store...");
+    let mut batch = BatchBuilder::new();
+    batch.set(
+        ValueClass::NodeId(0),
+        KeySerializer::new(U64_LEN + 9)
+            .write(0u64)
+            .write("localhost")
+            .finalize(),
+    );
+    db.write(batch.build_all()).await.unwrap();
     test.server.core.restore(temp_dir.path.clone()).await;
+    let mut batch = BatchBuilder::new();
+    batch.clear(ValueClass::NodeId(0));
+    db.write(batch.build_all()).await.unwrap();
 
     // Verify hash
     print!("Verifying store hash...");

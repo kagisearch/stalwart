@@ -16,7 +16,10 @@ use mail_auth::{IpLookupStrategy, mta_sts::TlsRpt};
 use serde::{Deserialize, Serialize};
 use smtp::outbound::{
     client::{SmtpClient, StartTlsResult},
-    dane::{dnssec::TlsaLookup, verify::TlsaVerify},
+    dane::{
+        dnssec::{TlsaLookup, TlsaResult},
+        verify::TlsaVerify,
+    },
     error::ClientError,
     lookup::{DnsLookup, SourceIp, ToNextHop},
     mta_sts::{lookup::MtaStsLookup, verify::VerifyPolicy},
@@ -227,14 +230,7 @@ async fn delivery_diagnose(
 
     // Lookup MX
     let now = Instant::now();
-    let mxs = match server
-        .core
-        .smtp
-        .resolvers
-        .dns
-        .mx_lookup(&domain, Some(&server.inner.cache.dns_mx))
-        .await
-    {
+    let mxs = match server.mx_lookup(domain.as_str()).await {
         Ok(mxs) => mxs,
         Err(err) => {
             tx.send(DeliveryStage::MxLookupError {
@@ -249,13 +245,14 @@ async fn delivery_diagnose(
 
     // Obtain remote host list
     let mx_config = MxConfig {
-        max_mx: mxs.len(),
+        max_mx: mxs.rrset.len(),
         max_multi_homed: 10,
         ip_lookup_strategy: IpLookupStrategy::Ipv4thenIpv6,
     };
     let hosts = if let Some(hosts) = mxs.to_remote_hosts(&domain, &mx_config) {
         tx.send(DeliveryStage::MxLookupSuccess {
             mxs: mxs
+                .rrset
                 .iter()
                 .map(|mx| MX {
                     exchanges: mx.exchanges.iter().map(|e| e.to_string()).collect(),
@@ -292,7 +289,9 @@ async fn delivery_diagnose(
         Err(err) => {
             if matches!(
                 &err,
-                smtp::outbound::mta_sts::Error::Dns(mail_auth::Error::DnsRecordNotFound(_))
+                smtp::outbound::mta_sts::Error::Dns(mail_auth::Error::Dns(
+                    mail_auth::DnsError::RecordNotFound(_)
+                ))
             ) {
                 tx.send(DeliveryStage::MtaStsNotFound {
                     elapsed: now.elapsed_ms(),
@@ -342,7 +341,10 @@ async fn delivery_diagnose(
             .await?;
         }
         Err(err) => {
-            if matches!(&err, mail_auth::Error::DnsRecordNotFound(_)) {
+            if matches!(
+                &err,
+                mail_auth::Error::Dns(mail_auth::DnsError::RecordNotFound(_))
+            ) {
                 tx.send(DeliveryStage::TlsRptNotFound {
                     elapsed: now.elapsed_ms(),
                 })
@@ -385,7 +387,7 @@ async fn delivery_diagnose(
 
         let now = Instant::now();
         let dane_policy = match server.tlsa_lookup(format!("_25._tcp.{hostname}.")).await {
-            Ok(Some(tlsa)) if tlsa.has_end_entities => {
+            Ok(TlsaResult::Secure(tlsa)) if tlsa.has_end_entities => {
                 tx.send(DeliveryStage::TlsaLookupSuccess {
                     record: tlsa.as_ref().clone(),
                     elapsed: now.elapsed_ms(),
@@ -394,7 +396,7 @@ async fn delivery_diagnose(
 
                 Some(tlsa)
             }
-            Ok(Some(_)) => {
+            Ok(TlsaResult::Secure(_)) => {
                 tx.send(DeliveryStage::TlsaLookupError {
                     elapsed: now.elapsed_ms(),
                     reason: "TLSA record does not have end entities".to_string(),
@@ -403,7 +405,16 @@ async fn delivery_diagnose(
 
                 None
             }
-            Ok(None) => {
+            Ok(TlsaResult::Bogus) => {
+                tx.send(DeliveryStage::TlsaLookupError {
+                    elapsed: now.elapsed_ms(),
+                    reason: "Bogus TLSA record".to_string(),
+                })
+                .await?;
+
+                continue 'outer;
+            }
+            Ok(TlsaResult::Missing) => {
                 tx.send(DeliveryStage::TlsaNotFound {
                     elapsed: now.elapsed_ms(),
                     reason: "No TLSA DNSSEC records found".to_string(),
@@ -413,20 +424,26 @@ async fn delivery_diagnose(
                 None
             }
             Err(err) => {
-                if matches!(&err, mail_auth::Error::DnsRecordNotFound(_)) {
+                if matches!(
+                    &err,
+                    mail_auth::Error::Dns(mail_auth::DnsError::RecordNotFound(_))
+                ) {
                     tx.send(DeliveryStage::TlsaNotFound {
                         elapsed: now.elapsed_ms(),
                         reason: "No TLSA records found for MX".to_string(),
                     })
                     .await?;
+
+                    None
                 } else {
                     tx.send(DeliveryStage::TlsaLookupError {
                         elapsed: now.elapsed_ms(),
                         reason: err.to_string(),
                     })
                     .await?;
+
+                    continue 'outer;
                 }
-                None
             }
         };
 
@@ -436,10 +453,10 @@ async fn delivery_diagnose(
         let remote_ips = match host.fqdn_hostname() {
             HostOrIp::Host(hostname) => {
                 match server
-                    .ip_lookup(&hostname, IpLookupStrategy::Ipv4thenIpv6, usize::MAX)
+                    .ip_lookup(&hostname, IpLookupStrategy::Ipv4thenIpv6, usize::MAX, false)
                     .await
                 {
-                    Ok(remote_ips) if !remote_ips.is_empty() => remote_ips,
+                    Ok((remote_ips, _)) if !remote_ips.is_empty() => remote_ips,
                     Ok(_) => {
                         tx.send(DeliveryStage::IpLookupError {
                             reason: "No IP addresses found for host".to_string(),

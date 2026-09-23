@@ -54,7 +54,7 @@ impl<T: SessionStream> Session<T> {
                     .caused_by(trc::location!())?;
                 response.push(b'\"');
                 for ch in script.name.as_bytes() {
-                    if [b'\\', b'\"'].contains(ch) {
+                    if b"\\\"".contains(ch) {
                         response.push(b'\\');
                     }
                     response.push(*ch);

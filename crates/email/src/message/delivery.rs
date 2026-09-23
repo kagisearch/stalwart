@@ -26,6 +26,8 @@ use crate::{
 use super::delivery_hooks::try_delivery_hook;
 use crate::hooks::ModificationOut as HookModification;
 
+pub const ORCPT_ADDR_TYPE: &str = "rfc822;";
+
 // Prepend AddHeader modifications to a raw RFC 5322 message
 fn apply_add_header_modifications(
     add_headers: &[(String, String)],
@@ -221,7 +223,20 @@ pub struct IngestMessage {
 pub struct IngestRecipient {
     pub address: String,
     pub orcpt: Option<String>,
-    pub is_spam: bool,
+    pub spam_percentage: Option<u8>,
+}
+
+impl IngestRecipient {
+    pub fn orcpt_parameter(&self) -> Option<String> {
+        self.orcpt
+            .as_deref()
+            .map(|orcpt| format!("{ORCPT_ADDR_TYPE}{orcpt}"))
+    }
+
+    pub fn is_spam(&self) -> bool {
+        self.spam_percentage
+            .is_some_and(|percentage| percentage >= 50)
+    }
 }
 
 #[cfg(test)]
@@ -1005,7 +1020,8 @@ async fn deliver_to_recipient(
                 source: IngestSource::Smtp {
                     deliver_to: &rcpt.address,
                     is_sender_authenticated,
-                    is_spam: rcpt.is_spam,
+                    // A message the user's script explicitly filed is not treated as spam
+                    is_spam: rcpt.is_spam() && !output_message.did_file_into,
                 },
                 session_id,
                 preview_text: hook_preview_text,

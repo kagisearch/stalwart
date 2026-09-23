@@ -8,7 +8,7 @@ use super::{GrantType, crypto::SymmetricEncrypt};
 use crate::Server;
 use base64::{Engine, engine::general_purpose};
 use std::time::SystemTime;
-use store::rand::{Rng, rng};
+use store::rand::{RngExt, rng};
 use utils::codec::leb128::{Leb128Iterator, Leb128Vec};
 
 pub const FAILED_TO_DECODE_TOKEN: &str = concat!(
@@ -17,7 +17,7 @@ pub const FAILED_TO_DECODE_TOKEN: &str = concat!(
     "the Authentication object."
 );
 
-const TOKEN_HEADER: &str = "sw1.";
+pub(crate) const TOKEN_HEADER: &str = "sw1.";
 const TOKEN_KEY_CONTEXT: &str = "stalwart-oauth-token-sw1";
 const OAUTH_EPOCH: u64 = 946684800; // Jan 1, 2000
 

@@ -121,9 +121,8 @@ impl CardGetRequestHandler for Server {
         let _ = card.card.write_to(
             &mut vcard,
             headers
-                .max_vcard_version
-                .or_else(|| card.card.version())
-                .unwrap_or_default(),
+                .vcard_version
+                .unwrap_or(self.core.groupware.vcard_version),
         );
 
         if !is_head {

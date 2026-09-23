@@ -106,9 +106,9 @@ impl MysqlStore {
             let table = char::from(table);
             conn.query_drop(format!(
                 "CREATE TABLE IF NOT EXISTS {table} (
-                    k TINYBLOB,
+                    k VARBINARY(255) NOT NULL,
                     v MEDIUMBLOB NOT NULL,
-                    PRIMARY KEY (k(255))
+                    PRIMARY KEY (k)
                 ) ENGINE=InnoDB"
             ))
             .await
@@ -117,9 +117,9 @@ impl MysqlStore {
 
         conn.query_drop(format!(
             "CREATE TABLE IF NOT EXISTS {} (
-                k TINYBLOB,
+                k VARBINARY(255) NOT NULL,
                 v LONGBLOB NOT NULL,
-                PRIMARY KEY (k(255))
+                PRIMARY KEY (k)
             ) ENGINE=InnoDB",
             char::from(SUBSPACE_BLOBS),
         ))
@@ -141,9 +141,9 @@ impl MysqlStore {
         for table in [SUBSPACE_COUNTER, SUBSPACE_QUOTA, SUBSPACE_IN_MEMORY_COUNTER] {
             conn.query_drop(format!(
                 "CREATE TABLE IF NOT EXISTS {} (
-                k TINYBLOB,
+                k VARBINARY(255) NOT NULL,
                 v BIGINT NOT NULL DEFAULT 0,
-                PRIMARY KEY (k(255))
+                PRIMARY KEY (k)
             ) ENGINE=InnoDB",
                 char::from(table)
             ))

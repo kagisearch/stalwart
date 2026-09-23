@@ -6,11 +6,12 @@
 
 use crate::{
     smtp::{
-        inbound::{TestMessage, TestQueueEvent},
+        inbound::TestMessage,
         session::{TestSession, VerifyResponse},
     },
     utils::server::TestServerBuilder,
 };
+use common::config::mailstore::spamfilter::spam_status;
 use core::panic;
 use registry::schema::structs::{
     CertificateManagement, DkimManagement, DnsManagement, Domain, Expression, LookupStore,
@@ -223,6 +224,53 @@ async fn sieve_scripts() {
         }
     }
 
+    // Test spamtest normalization
+    let spamtest_script = test
+        .server
+        .core
+        .sieve
+        .trusted_scripts
+        .get("spamtest_include")
+        .expect("spamtest_include script not found")
+        .clone();
+    for (percentage, score, expected) in [
+        (None, 0.0, "spamtest=0 percent=0 score= is_spam="),
+        (Some(0), -3.5, "spamtest=1 percent=0 score=-3.5 is_spam=0"),
+        (Some(25), 2.5, "spamtest=2 percent=25 score=2.5 is_spam=0"),
+        (Some(49), 4.9, "spamtest=4 percent=49 score=4.9 is_spam=0"),
+        (Some(50), 5.0, "spamtest=5 percent=50 score=5 is_spam=1"),
+        (Some(75), 7.5, "spamtest=7 percent=75 score=7.5 is_spam=1"),
+        (Some(99), 9.9, "spamtest=9 percent=99 score=9.9 is_spam=1"),
+        (
+            Some(100),
+            10.0,
+            "spamtest=10 percent=100 score=10 is_spam=1",
+        ),
+    ] {
+        let mut params = session
+            .build_script_parameters("data")
+            .with_spam_status(spam_status(percentage));
+        if percentage.is_some() {
+            params = params
+                .set_variable("spam.score", score)
+                .set_variable("spam.is_spam", score >= 5.0);
+        }
+
+        match test
+            .server
+            .run_script("spamtest_include".into(), spamtest_script.clone(), params)
+            .await
+        {
+            ScriptResult::Reject(message) => {
+                assert!(
+                    message.contains(expected),
+                    "expected {expected:?} for {percentage:?}, got {message:?}"
+                );
+            }
+            other => panic!("Unexpected script result {other:?} for {percentage:?}"),
+        }
+    }
+
     // Test connect script
     session
         .response()
@@ -296,8 +344,8 @@ async fn sieve_scripts() {
             "250",
         )
         .await;
-    test.read_event().await.assert_refresh();
-    test.read_event().await.assert_refresh();
+    test.expect_refresh().await;
+    test.expect_refresh().await;
     let messages = test.read_queued_messages().await;
     assert_eq!(messages.len(), 2);
     let mut messages = messages.into_iter();
@@ -343,8 +391,8 @@ async fn sieve_scripts() {
             "250",
         )
         .await;
-    test.read_event().await.assert_refresh();
-    test.read_event().await.assert_refresh();
+    test.expect_refresh().await;
+    test.expect_refresh().await;
     let messages = test.read_queued_messages().await;
     assert_eq!(messages.len(), 2);
     let mut messages = messages.into_iter();

@@ -15,6 +15,8 @@ impl DkimSignature {
         let (stage, next_transition) = match self {
             DkimSignature::Dkim1Ed25519Sha256(sign) => (sign.stage, sign.next_transition_at),
             DkimSignature::Dkim1RsaSha256(sign) => (sign.stage, sign.next_transition_at),
+            DkimSignature::Dkim2Ed25519Sha256(sign) => (sign.stage, sign.next_transition_at),
+            DkimSignature::Dkim2RsaSha256(sign) => (sign.stage, sign.next_transition_at),
         };
         next_transition.and_then(|next_transition| {
             if next_transition <= UTCDateTime::now() {
@@ -29,6 +31,8 @@ impl DkimSignature {
         match self {
             DkimSignature::Dkim1Ed25519Sha256(sign) => sign.next_transition_at,
             DkimSignature::Dkim1RsaSha256(sign) => sign.next_transition_at,
+            DkimSignature::Dkim2Ed25519Sha256(sign) => sign.next_transition_at,
+            DkimSignature::Dkim2RsaSha256(sign) => sign.next_transition_at,
         }
     }
 
@@ -38,6 +42,10 @@ impl DkimSignature {
                 sign.next_transition_at = Some(next_transition)
             }
             DkimSignature::Dkim1RsaSha256(sign) => sign.next_transition_at = Some(next_transition),
+            DkimSignature::Dkim2Ed25519Sha256(sign) => {
+                sign.next_transition_at = Some(next_transition)
+            }
+            DkimSignature::Dkim2RsaSha256(sign) => sign.next_transition_at = Some(next_transition),
         }
     }
 
@@ -45,6 +53,8 @@ impl DkimSignature {
         match self {
             DkimSignature::Dkim1Ed25519Sha256(sign) => sign.stage,
             DkimSignature::Dkim1RsaSha256(sign) => sign.stage,
+            DkimSignature::Dkim2Ed25519Sha256(sign) => sign.stage,
+            DkimSignature::Dkim2RsaSha256(sign) => sign.stage,
         }
     }
 
@@ -52,6 +62,8 @@ impl DkimSignature {
         match self {
             DkimSignature::Dkim1Ed25519Sha256(sign) => sign.stage = stage,
             DkimSignature::Dkim1RsaSha256(sign) => sign.stage = stage,
+            DkimSignature::Dkim2Ed25519Sha256(sign) => sign.stage = stage,
+            DkimSignature::Dkim2RsaSha256(sign) => sign.stage = stage,
         }
     }
 
@@ -59,13 +71,21 @@ impl DkimSignature {
         match self {
             DkimSignature::Dkim1Ed25519Sha256(sign) => sign.stage == DkimRotationStage::Active,
             DkimSignature::Dkim1RsaSha256(sign) => sign.stage == DkimRotationStage::Active,
+            DkimSignature::Dkim2Ed25519Sha256(sign) => sign.stage == DkimRotationStage::Active,
+            DkimSignature::Dkim2RsaSha256(sign) => sign.stage == DkimRotationStage::Active,
         }
+    }
+
+    pub fn is_published(&self) -> bool {
+        !matches!(self.stage(), DkimRotationStage::Retired)
     }
 
     pub fn selector(&self) -> &str {
         match self {
             DkimSignature::Dkim1Ed25519Sha256(sign) => &sign.selector,
             DkimSignature::Dkim1RsaSha256(sign) => &sign.selector,
+            DkimSignature::Dkim2Ed25519Sha256(sign) => &sign.selector,
+            DkimSignature::Dkim2RsaSha256(sign) => &sign.selector,
         }
     }
 
@@ -73,6 +93,8 @@ impl DkimSignature {
         match self {
             DkimSignature::Dkim1Ed25519Sha256(sign) => sign.domain_id,
             DkimSignature::Dkim1RsaSha256(sign) => sign.domain_id,
+            DkimSignature::Dkim2Ed25519Sha256(sign) => sign.domain_id,
+            DkimSignature::Dkim2RsaSha256(sign) => sign.domain_id,
         }
     }
 }
@@ -80,20 +102,19 @@ impl DkimSignature {
 impl DkimSignatureType {
     pub const fn algorithm(self) -> &'static str {
         match self {
-            Self::Dkim1Ed25519Sha256 => "ed25519",
-            Self::Dkim1RsaSha256 => "rsa",
+            Self::Dkim1Ed25519Sha256 | Self::Dkim2Ed25519Sha256 => "ed25519",
+            Self::Dkim1RsaSha256 | Self::Dkim2RsaSha256 => "rsa",
         }
     }
 
     pub const fn hash(self) -> &'static str {
-        match self {
-            Self::Dkim1Ed25519Sha256 | Self::Dkim1RsaSha256 => "sha256",
-        }
+        "sha256"
     }
 
     pub const fn version(self) -> &'static str {
         match self {
             Self::Dkim1Ed25519Sha256 | Self::Dkim1RsaSha256 => "1",
+            Self::Dkim2Ed25519Sha256 | Self::Dkim2RsaSha256 => "2",
         }
     }
 }

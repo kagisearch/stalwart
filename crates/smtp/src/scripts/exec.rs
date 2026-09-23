@@ -95,19 +95,31 @@ impl<T: SessionStream> Session<T> {
                     params
                         .envelope
                         .push((Envelope::To, rcpt.address_lcase.to_string().into()));
-                    if let Some(orcpt) = &rcpt.dsn_info {
-                        params
-                            .envelope
-                            .push((Envelope::Orcpt, orcpt.as_str().to_lowercase().into()));
+                    if let Some(orcpt) = rcpt.orcpt_parameter() {
+                        params.envelope.push((Envelope::Orcpt, orcpt.into()));
                     }
                 }
             } else {
                 // Build recipients list
-                let mut recipients = vec![];
+                let mut recipients = Vec::with_capacity(self.data.rcpt_to.len());
+                let mut orcpts = Vec::with_capacity(self.data.rcpt_to.len());
+                let mut has_orcpts = false;
+
                 for rcpt in &self.data.rcpt_to {
                     recipients.push(Variable::from(rcpt.address_lcase.to_string()));
+                    orcpts.push(match rcpt.orcpt_parameter() {
+                        Some(orcpt) => {
+                            has_orcpts = true;
+                            Variable::from(orcpt)
+                        }
+                        None => Variable::default(),
+                    });
                 }
+
                 params.envelope.push((Envelope::To, recipients.into()));
+                if has_orcpts {
+                    params.envelope.push((Envelope::Orcpt, orcpts.into()));
+                }
             }
 
             if (mail_from.flags & MAIL_RET_FULL) != 0 {

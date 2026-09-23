@@ -8,7 +8,7 @@ use super::{ImapContext, ToModSeq};
 use crate::core::{SavedSearch, SelectedMailbox, Session, State};
 use common::network::SessionStream;
 use imap_proto::{
-    Command, ResponseCode, StatusResponse,
+    Command, ResponseCode, ResponseType, StatusResponse,
     protocol::{
         ImapResponse, ObjectId, Sequence, fetch,
         list::ListItem,
@@ -18,7 +18,7 @@ use imap_proto::{
 };
 use registry::schema::enums::Permission;
 use std::{sync::Arc, time::Instant};
-use types::id::Id;
+use types::{acl::Acl, id::Id};
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_select(&mut self, request: Request<Command>) -> trc::Result<()> {
@@ -65,6 +65,18 @@ impl<T: SessionStream> Session<T> {
             .or_else(|| data.get_mailbox_by_name(&arguments.mailbox_name));
 
         if let Some(mailbox) = mailbox {
+            if !data
+                .check_mailbox_acl(mailbox.account_id, mailbox.mailbox_id, Acl::ReadItems)
+                .await
+                .imap_ctx(&arguments.tag, trc::location!())?
+            {
+                return Err(trc::ImapEvent::Error
+                    .into_err()
+                    .details("You do not have the required permissions to read this mailbox.")
+                    .code(ResponseCode::NoPerm)
+                    .id(arguments.tag));
+            }
+
             // Try obtaining the mailbox from the cache
             let state = data
                 .fetch_messages(&mailbox, None)
@@ -102,6 +114,17 @@ impl<T: SessionStream> Session<T> {
                         .details("QRESYNC is not enabled.")
                         .id(arguments.tag));
                 }
+                if self.is_uidonly && qresync.seq_match.is_some() {
+                    return Err(trc::ImapEvent::Error
+                        .into_err()
+                        .details(concat!(
+                            "The QRESYNC sequence matching parameter ",
+                            "is not allowed once UIDONLY is enabled."
+                        ))
+                        .code(ResponseCode::UidRequired)
+                        .ctx(trc::Key::Type, ResponseType::Bad)
+                        .id(arguments.tag));
+                }
                 if qresync.uid_validity == mailbox_state.uid_validity as u32 {
                     // Send flags for changed messages
                     data.fetch(
@@ -121,7 +144,10 @@ impl<T: SessionStream> Session<T> {
                         mailbox.clone(),
                         true,
                         true,
+                        self.is_uidonly,
                         false,
+                        self.is_utf8,
+                        u32::MAX,
                         Instant::now(),
                     )
                     .await

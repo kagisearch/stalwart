@@ -111,6 +111,8 @@ pub enum SetErrorType {
     NodeHasChildren,
     #[serde(rename = "calendarHasEvent")]
     CalendarHasEvent,
+    #[serde(rename = "noSupportedScheduleMethods")]
+    NoSupportedScheduleMethods,
     // Stalwart registry errors
     #[serde(rename = "objectIsLinked")]
     ObjectIsLinked,
@@ -153,6 +155,7 @@ impl SetErrorType {
             SetErrorType::AddressBookHasContents => "addressBookHasContents",
             SetErrorType::NodeHasChildren => "nodeHasChildren",
             SetErrorType::CalendarHasEvent => "calendarHasEvent",
+            SetErrorType::NoSupportedScheduleMethods => "noSupportedScheduleMethods",
             SetErrorType::ObjectIsLinked => "objectIsLinked",
             SetErrorType::InvalidForeignKey => "invalidForeignKey",
             SetErrorType::PrimaryKeyViolation => "primaryKeyViolation",
@@ -177,6 +180,18 @@ impl<T: Property> SetError<T> {
     pub fn with_description(mut self, description: impl Into<Cow<'static, str>>) -> Self {
         self.0.description = description.into().into();
         self
+    }
+
+    pub fn error_type(&self) -> &SetErrorType {
+        &self.0.type_
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        self.0.description.as_deref()
+    }
+
+    pub fn validation_errors(&self) -> &[ValidationError] {
+        &self.0.validation_errors
     }
 
     pub fn with_property(mut self, property: impl Into<InvalidProperty<T>>) -> Self {
@@ -247,6 +262,12 @@ impl<T: Property> SetError<T> {
 
     pub fn already_exists() -> Self {
         Self::new(SetErrorType::AlreadyExists)
+    }
+
+    pub fn no_supported_schedule_methods(calendar_address: &str) -> Self {
+        Self::new(SetErrorType::NoSupportedScheduleMethods).with_description(format!(
+            "No supported scheduling method for calendar address {calendar_address}."
+        ))
     }
 
     pub fn too_large() -> Self {

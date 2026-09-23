@@ -600,6 +600,10 @@ impl ValueClass {
     }
 }
 
+pub fn is_node_id_key(key: &[u8]) -> bool {
+    key.len() == U32_LEN + U16_LEN && key.starts_with(&u32::MAX.to_be_bytes())
+}
+
 impl From<ValueClass> for ValueKey<ValueClass> {
     fn from(class: ValueClass) -> Self {
         ValueKey {

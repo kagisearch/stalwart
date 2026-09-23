@@ -9,13 +9,12 @@ use common::{
     Server,
     config::mailstore::spamfilter::SpamFilterAction,
     ipc::{BroadcastEvent, QueueEvent, RegistryChange},
-    psl,
 };
 use jmap_proto::error::set::{SetError, SetErrorType};
 use jmap_tools::{JsonPointer, Key};
 use mail_auth::{
-    AuthenticatedMessage, DkimResult, DmarcResult, dmarc::verify::DmarcParameters,
-    spf::verify::SpfParameters,
+    AuthenticatedMessage, Dkim2Result, DkimResult, DmarcResult, dkim2::Envelope as Dkim2Envelope,
+    dmarc::verify::DmarcParameters, spf::verify::SpfParameters,
 };
 use mail_parser::MessageParser;
 use registry::{
@@ -158,6 +157,7 @@ pub(crate) async fn action_set(
                                         | Property::RemoteIp
                                         | Property::EhloDomain
                                         | Property::MailFrom
+                                        | Property::To
                                 )
                             )
                         });
@@ -237,8 +237,9 @@ pub(crate) async fn action_set(
 
 async fn classify_spam(server: &Server, mut request: SpamClassify) -> Option<SpamClassify> {
     // Built spam filter input
+    let raw_message = request.message.as_bytes();
     let message = MessageParser::new()
-        .parse(request.message.as_bytes())
+        .parse(raw_message)
         .filter(|m| m.root_part().headers().iter().any(|h| !h.name.is_other()))?;
 
     let remote_ip = request.remote_ip.into_inner();
@@ -302,7 +303,7 @@ async fn classify_spam(server: &Server, mut request: SpamClassify) -> Option<Spa
             .await
     };
 
-    let auth_message = AuthenticatedMessage::from_parsed(&message, true);
+    let auth_message = AuthenticatedMessage::from_parsed(&message, raw_message, true);
 
     let dkim_output = server
         .core
@@ -320,6 +321,20 @@ async fn classify_spam(server: &Server, mut request: SpamClassify) -> Option<Spa
         .verify_arc(server.inner.cache.build_auth_parameters(&auth_message))
         .await;
 
+    let dkim2_output = server
+        .core
+        .smtp
+        .resolvers
+        .dns
+        .verify_dkim2(
+            server.inner.cache.build_auth_parameters(&auth_message),
+            Dkim2Envelope {
+                mail_from: &mail_from,
+                rcpt_to: request.env_rcpt_to.iter(),
+            },
+        )
+        .await;
+
     let dmarc_output = server
         .core
         .smtp
@@ -328,22 +343,12 @@ async fn classify_spam(server: &Server, mut request: SpamClassify) -> Option<Spa
         .verify_dmarc(server.inner.cache.build_auth_parameters(DmarcParameters {
             message: &auth_message,
             dkim_output: &dkim_output,
+            dkim2_output: Some(&dkim2_output),
             rfc5321_mail_from_domain: mail_from_domain.unwrap_or(ehlo_domain.as_str()),
             spf_output: &spf_mail_from_result,
-            domain_suffix_fn: |domain| psl::domain_str(domain).unwrap_or(domain),
         }))
         .await;
-    let dmarc_pass = matches!(dmarc_output.spf_result(), DmarcResult::Pass)
-        || matches!(dmarc_output.dkim_result(), DmarcResult::Pass);
-    let dmarc_result = if dmarc_pass {
-        DmarcResult::Pass
-    } else if dmarc_output.spf_result() != &DmarcResult::None {
-        dmarc_output.spf_result().clone()
-    } else if dmarc_output.dkim_result() != &DmarcResult::None {
-        dmarc_output.dkim_result().clone()
-    } else {
-        DmarcResult::None
-    };
+    let dmarc_result = dmarc_output.result();
     let dmarc_policy = dmarc_output.policy();
 
     let asn_geo = server.lookup_asn_country(remote_ip).await;
@@ -355,6 +360,7 @@ async fn classify_spam(server: &Server, mut request: SpamClassify) -> Option<Spa
         spf_ehlo_result: Some(&spf_ehlo_result),
         spf_mail_from_result: Some(&spf_mail_from_result),
         dkim_result: dkim_output.as_slice(),
+        dkim2_result: Some(&dkim2_output),
         dmarc_result: Some(&dmarc_result),
         dmarc_policy: Some(&dmarc_policy),
         iprev_result: Some(&iprev_result),
@@ -485,7 +491,7 @@ async fn dmarc_troubleshoot(
         .message
         .take()
         .unwrap_or_else(|| format!("From: {mail_from}\r\nSubject: test\r\n\r\ntest"));
-    let auth_message = AuthenticatedMessage::parse_with_opts(body.as_bytes(), true)?;
+    let auth_message = AuthenticatedMessage::parse_with_opts(body.as_bytes(), None, true)?;
 
     let dkim_output = server
         .core
@@ -497,6 +503,21 @@ async fn dmarc_troubleshoot(
     let dkim_pass = dkim_output
         .iter()
         .any(|d| matches!(d.result(), DkimResult::Pass));
+
+    let dkim2_output = server
+        .core
+        .smtp
+        .resolvers
+        .dns
+        .verify_dkim2(
+            server.inner.cache.build_auth_parameters(&auth_message),
+            Dkim2Envelope {
+                mail_from: &mail_from,
+                rcpt_to: request.to.iter(),
+            },
+        )
+        .await;
+    let dkim2_pass = matches!(dkim2_output.result(), Dkim2Result::Pass);
 
     let arc_output = server
         .core
@@ -514,22 +535,13 @@ async fn dmarc_troubleshoot(
         .verify_dmarc(server.inner.cache.build_auth_parameters(DmarcParameters {
             message: &auth_message,
             dkim_output: &dkim_output,
+            dkim2_output: Some(&dkim2_output),
             rfc5321_mail_from_domain: mail_from_domain.unwrap_or(ehlo_domain.as_str()),
             spf_output: &mail_spf_output,
-            domain_suffix_fn: |domain| psl::domain_str(domain).unwrap_or(domain),
         }))
         .await;
-    let dmarc_pass = matches!(dmarc_output.spf_result(), DmarcResult::Pass)
-        || matches!(dmarc_output.dkim_result(), DmarcResult::Pass);
-    let dmarc_result = if dmarc_pass {
-        DmarcResult::Pass
-    } else if dmarc_output.spf_result() != &DmarcResult::None {
-        dmarc_output.spf_result().clone()
-    } else if dmarc_output.dkim_result() != &DmarcResult::None {
-        dmarc_output.dkim_result().clone()
-    } else {
-        DmarcResult::None
-    };
+    let dmarc_result = dmarc_output.result();
+    let dmarc_pass = dmarc_result == DmarcResult::Pass;
 
     request.spf_ehlo_domain = ehlo_spf_output.domain().to_string();
     request.spf_ehlo_result = (&ehlo_spf_output).into();
@@ -547,6 +559,8 @@ async fn dmarc_troubleshoot(
         .into();
     request.ip_rev_result = (&iprev).into();
     request.dkim_pass = dkim_pass;
+    request.dkim2_result = dkim2_output.result().into();
+    request.dkim2_pass = dkim2_pass;
     request.dkim_results = dkim_output
         .iter()
         .map(|result| result.result().into())

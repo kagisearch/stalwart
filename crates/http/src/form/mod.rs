@@ -158,10 +158,9 @@ impl FormHandler for Server {
                 )
                 .header("Auto-Submitted", HeaderType::Text("auto-generated".into()))
                 .message_id(format!(
-                    "<{}@{}.{}>",
+                    "{}@{}",
                     make_boundary("."),
-                    session.remote_ip,
-                    session.remote_port
+                    self.core.network.server_name
                 ))
                 .subject(from_subject)
                 .text_body(body)
@@ -184,7 +183,7 @@ impl FormHandler for Server {
                         .map(|address| IngestRecipient {
                             address: address.clone(),
                             orcpt: None,
-                            is_spam: false,
+                            spam_percentage: None,
                         })
                         .collect(),
                     message_blob,

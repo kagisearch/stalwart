@@ -726,7 +726,7 @@ async fn accept_milter(
                                 "shutdown" => Action::Shutdown,
                                 "conn_fail" => Action::ConnectionFailure,
                                 "reply_code" => Action::ReplyCode {
-                                    code: [b'3', b'2', b'1'],
+                                    code: *b"321",
                                     text: "test".into(),
                                 },
                                 test_num => {

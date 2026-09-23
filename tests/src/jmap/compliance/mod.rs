@@ -81,7 +81,7 @@ pub fn check_contains(haystack: &str, needle: &str, msg: impl std::fmt::Display)
     } else {
         Err(Fail::Assert(format!(
             "{msg}: expected to contain {needle:?}, got {:?}",
-            &haystack.chars().take(200).collect::<String>()
+            haystack.chars().take(200).collect::<String>()
         )))
     }
 }

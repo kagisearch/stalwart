@@ -6,7 +6,7 @@
 
 use crate::utils::{dns::DnsCache, server::TestServerBuilder};
 use common::expr::{tokenizer::TokenMap, *};
-use mail_auth::MX;
+use mail_auth::{DnssecStatus, MX};
 use registry::schema::{
     enums::ExpressionVariable,
     prelude::{ObjectType, Property},
@@ -32,6 +32,14 @@ const TESTS: &[(&str, &str)] = &[
     (
         "is_local_domain('foobar.org') + '-' + is_local_domain('unknown.org')  + '-' + is_local_address('john@foobar.org') + '-' + is_local_address('unknown@foobar.org')",
         "1-0-1-0",
+    ),
+    (
+        "is_local_domain('FooBar.org') + '-' + is_local_address('John@FooBar.org') + '-' + is_local_address('JOHN@FOOBAR.ORG')",
+        "1-1-1",
+    ),
+    (
+        "bit_and(254, 16) + '-' + bit_and(254, 1) + '-' + bit_and(80, 64) + '-' + bit_and(255, 128)",
+        "16-0-64-128",
     ),
 ];
 
@@ -75,6 +83,7 @@ async fn expressions() {
             exchanges: vec!["mx.foobar.org".into()].into_boxed_slice(),
             preference: 10,
         }],
+        DnssecStatus::Secure,
         Instant::now() + Duration::from_secs(10),
     );
 

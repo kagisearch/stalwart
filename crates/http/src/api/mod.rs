@@ -23,9 +23,10 @@ use common::{
     auth::{AccessToken, oauth::GrantType},
     manager::application::Resource,
 };
+use groupware::calendar::itip::{ItipIngest, RsvpRequest};
 use http_body_util::{StreamBody, combinators::BoxBody};
 use http_proto::{
-    HttpRequest, HttpResponse, HttpSessionData, ToHttpResponse,
+    HttpRequest, HttpResponse, HttpSessionData, JsonResponse, ToHttpResponse,
     request::{decode_path_element, fetch_body},
 };
 use hyper::{
@@ -76,6 +77,25 @@ impl ManagementApi for Server {
                     body.ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?,
                 ))
                 .await
+            }
+            "calendar"
+                if is_post
+                    && path.get(1).copied() == Some("rsvp")
+                    && self.core.groupware.itip_http_rsvp_url.is_some() =>
+            {
+                self.is_http_anonymous_request_allowed(session.remote_ip)
+                    .await?;
+
+                let request = serde_json::from_slice::<RsvpRequest>(
+                    &body.ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?,
+                )
+                .map_err(|err| {
+                    trc::EventType::Resource(trc::ResourceEvent::BadParameters).from_json_error(err)
+                })?;
+
+                self.http_rsvp_handle(request, accept_language(req), session.remote_ip)
+                    .await
+                    .map(|response| JsonResponse::new(response).no_cache().into_http_response())
             }
             "discover" => {
                 if let Some(email) = path.get(1).copied() {
@@ -306,36 +326,58 @@ impl ManagementApi for Server {
 }
 
 pub trait ToManageHttpResponse {
-    fn into_http_response(self) -> HttpResponse;
+    fn into_http_response(self, challenge: AuthChallenge) -> HttpResponse;
 }
 
 impl ToManageHttpResponse for &trc::Error {
-    fn into_http_response(self) -> HttpResponse {
+    fn into_http_response(self, challenge: AuthChallenge) -> HttpResponse {
         match self.as_ref() {
             trc::EventType::Auth(
                 trc::AuthEvent::Failed | trc::AuthEvent::Error | trc::AuthEvent::TokenExpired,
-            ) => HttpResponse::unauthorized(true),
+            ) => HttpResponse::unauthorized(challenge),
             _ => self.to_request_error().into_http_response(),
         }
     }
 }
 
+pub fn accept_language(req: &HttpRequest) -> &str {
+    req.headers()
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|value| value.to_str().ok())
+        .map(|language| {
+            let language = language.split_once(',').map_or(language, |(l, _)| l);
+            language.split_once(';').map_or(language, |(l, _)| l).trim()
+        })
+        .filter(|language| !language.is_empty())
+        .unwrap_or("en")
+}
+
+const BEARER_CHALLENGE: &str = concat!(
+    "Bearer realm=\"Stalwart Server\", ",
+    "resource_metadata=\"/.well-known/oauth-protected-resource\""
+);
+const BASIC_CHALLENGE: &str = "Basic realm=\"Stalwart Server\"";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthChallenge {
+    Bearer,
+    BearerAndBasic,
+}
+
 pub trait UnauthorizedResponse {
-    fn unauthorized(include_realms: bool) -> Self;
+    fn unauthorized(challenge: AuthChallenge) -> Self;
 }
 
 impl UnauthorizedResponse for HttpResponse {
-    fn unauthorized(include_realms: bool) -> Self {
-        (if include_realms {
-            HttpResponse::new(StatusCode::UNAUTHORIZED)
-                .with_header(
-                    header::WWW_AUTHENTICATE,
-                    "Bearer realm=\"Stalwart Server\", resource_metadata=\"/.well-known/oauth-protected-resource\"",
-                )
-                .with_header(header::WWW_AUTHENTICATE, "Basic realm=\"Stalwart Server\"")
+    fn unauthorized(challenge: AuthChallenge) -> Self {
+        let response = HttpResponse::new(StatusCode::UNAUTHORIZED)
+            .with_header(header::WWW_AUTHENTICATE, BEARER_CHALLENGE);
+
+        if challenge == AuthChallenge::BearerAndBasic {
+            response.with_header(header::WWW_AUTHENTICATE, BASIC_CHALLENGE)
         } else {
-            HttpResponse::new(StatusCode::UNAUTHORIZED)
-        })
+            response
+        }
         .with_content_type("application/problem+json")
         .with_text_body(serde_json::to_string(&RequestError::unauthorized()).unwrap_or_default())
     }

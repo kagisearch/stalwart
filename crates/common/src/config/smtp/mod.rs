@@ -15,7 +15,7 @@ use self::{
     auth::MailAuthConfig, queue::QueueConfig, report::ReportConfig, resolver::Resolvers,
     session::SessionConfig,
 };
-use crate::{config::smtp::queue::RequireOptional, expr::Expression};
+use crate::{config::smtp::queue::RequireOptional, expr::if_block::IfBlock};
 use registry::{
     schema::{properties::ObjectType, structs::Rate},
     types::id::ObjectId,
@@ -29,13 +29,15 @@ pub struct SmtpConfig {
     pub resolvers: Resolvers,
     pub mail_auth: MailAuthConfig,
     pub report: ReportConfig,
+    pub mta_sts_client: reqwest::Client,
+    pub tls_report_client: reqwest::Client,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 //#[cfg_attr(feature = "test_mode", derive(PartialEq, Eq))]
 pub struct QueueRateLimiter {
     pub id: ObjectId,
-    pub expr: Expression,
+    pub expr: IfBlock,
     pub keys: u16,
     pub rate: Rate,
 }
@@ -59,6 +61,13 @@ impl SmtpConfig {
             resolvers: Resolvers::parse(bp).await,
             mail_auth: MailAuthConfig::parse(bp).await,
             report: ReportConfig::parse(bp).await,
+            mta_sts_client: utils::http::http_client_builder(false)
+                .pool_max_idle_per_host(0)
+                .user_agent(crate::USER_AGENT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default(),
+            tls_report_client: utils::http::unpooled_http_client(false),
         };
 
         if !config.resolvers.dnssec_available
@@ -74,7 +83,7 @@ impl SmtpConfig {
                 concat!(
                     "The configured DNS resolver cannot validate DNSSEC. ",
                     "DANE has been disabled to avoid deferring mail. ",
-                    "Configure a DNSSEC-validating resolver to enable DANE."
+                    "Ensure the resolver is DNSSEC-capable and reachable over TCP."
                 ),
             );
         }

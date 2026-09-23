@@ -5,7 +5,10 @@
  */
 
 use crate::{
-    backend::postgres::{PostgresStore, PsqlSearchField, into_error, into_pool_error},
+    backend::postgres::{
+        DELETE_CHUNK_SIZE, MIN_DELETE_CHUNK_SIZE, PostgresStore, PsqlSearchField, into_error,
+        into_pool_error, is_timeout_error,
+    },
     search::{
         IndexDocument, SearchComparator, SearchDocumentId, SearchFilter, SearchOperator,
         SearchQuery, SearchValue,
@@ -20,6 +23,12 @@ use tokio_postgres::{
 };
 
 impl PostgresStore {
+    fn ts_config(&self, language: &Language) -> &'static str {
+        pg_lang(language)
+            .filter(|config| self.ts_configs.contains(config))
+            .unwrap_or(PG_UNSTEMMED_LANG)
+    }
+
     pub async fn index(&self, documents: Vec<IndexDocument>) -> trc::Result<()> {
         let mut conn = self.conn_pool.get().await.map_err(into_pool_error)?;
         let trx = conn
@@ -60,9 +69,9 @@ impl PostgresStore {
                     let value_ref = format!("${}", values.len() + 1);
                     let (text_len, language) = if let SearchValue::Text { value, language } = value
                     {
-                        (value.len(), pg_lang(language).unwrap_or("simple"))
+                        (value.len(), self.ts_config(language))
                     } else {
-                        (0, "simple")
+                        (0, PG_UNSTEMMED_LANG)
                     };
 
                     if field.is_text() {
@@ -143,14 +152,44 @@ impl PostgresStore {
 
     pub async fn unindex(&self, filter: SearchQuery) -> trc::Result<u64> {
         debug_assert!(!filter.filters.is_empty());
-        let mut query = format!("DELETE FROM {} ", filter.index.psql_table());
-        let params = self.build_filter(&mut query, &filter.filters);
+        let table = filter.index.psql_table();
+        let mut where_clause = String::new();
+        let params = self.build_filter(&mut where_clause, &filter.filters);
         let conn = self.conn_pool.get().await.map_err(into_pool_error)?;
-        let s = conn.prepare_cached(&query).await.map_err(into_error)?;
-
-        conn.execute(&s, params.as_slice())
+        let s = conn
+            .prepare_cached(&format!("DELETE FROM {table}{where_clause}"))
             .await
-            .map_err(into_error)
+            .map_err(into_error)?;
+
+        match conn.execute(&s, params.as_slice()).await {
+            Ok(deleted) => return Ok(deleted),
+            Err(err) if is_timeout_error(&err) => (),
+            Err(err) => return Err(into_error(err)),
+        }
+
+        let mut chunk_size = DELETE_CHUNK_SIZE;
+        let mut deleted = 0;
+
+        loop {
+            let s = conn
+                .prepare_cached(&format!(
+                    "DELETE FROM {table} WHERE ctid IN (SELECT ctid FROM {table}{where_clause} LIMIT {chunk_size})"
+                ))
+                .await
+                .map_err(into_error)?;
+
+            loop {
+                match conn.execute(&s, params.as_slice()).await {
+                    Ok(0) => return Ok(deleted),
+                    Ok(affected) => deleted += affected,
+                    Err(err) if is_timeout_error(&err) && chunk_size > MIN_DELETE_CHUNK_SIZE => {
+                        chunk_size = (chunk_size / 2).max(MIN_DELETE_CHUNK_SIZE);
+                        break;
+                    }
+                    Err(err) => return Err(into_error(err)),
+                }
+            }
+        }
     }
 
     fn build_filter<'x>(
@@ -187,16 +226,27 @@ impl PostgresStore {
                         query.push(' ');
 
                         let language = match &value {
-                            SearchValue::Text { language, .. } => {
-                                pg_lang(language).unwrap_or("simple")
-                            }
-                            _ => "simple",
+                            SearchValue::Text { language, .. } => *language,
+                            _ => Language::None,
                         };
+                        let config = self.ts_config(&language);
                         let method = match op {
                             SearchOperator::Equal => "phraseto_tsquery",
                             _ => "plainto_tsquery",
                         };
-                        let _ = write!(query, "@@ {method}('{language}', ${value_pos})");
+
+                        if matches!(language, Language::None) {
+                            let _ = write!(query, "@@ {method}('{config}', ${value_pos})");
+                        } else {
+                            let _ = write!(query, "@@ ({method}('{config}', ${value_pos})");
+                            for fallback in [PG_FALLBACK_LANG, PG_UNSTEMMED_LANG] {
+                                if fallback != config && self.ts_configs.contains(fallback) {
+                                    let _ =
+                                        write!(query, " || {method}('{fallback}', ${value_pos})");
+                                }
+                            }
+                            query.push(')');
+                        }
                         values.push(value as &(dyn ToSql + Sync));
                     } else if let SearchValue::KeyValues(kv) = value {
                         query.push_str(field.column());
@@ -411,6 +461,38 @@ impl SearchOperator {
         }
     }
 }
+
+pub(super) const PG_FALLBACK_LANG: &str = "english";
+pub(super) const PG_UNSTEMMED_LANG: &str = "simple";
+
+pub(super) const PG_LANGS: &[&str] = &[
+    "arabic",
+    "armenian",
+    "catalan",
+    "danish",
+    "dutch",
+    "english",
+    "finnish",
+    "french",
+    "german",
+    "greek",
+    "hindi",
+    "hungarian",
+    "indonesian",
+    "italian",
+    "lithuanian",
+    "nepali",
+    "norwegian",
+    "portuguese",
+    "romanian",
+    "russian",
+    "serbian",
+    "spanish",
+    "swedish",
+    "tamil",
+    "turkish",
+    "yiddish",
+];
 
 #[inline(always)]
 fn pg_lang(lang: &Language) -> Option<&'static str> {

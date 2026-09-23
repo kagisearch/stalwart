@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::headers::{BuildHeader, ValueToHeader};
 use crate::{
     blob::download::BlobDownload,
     changes::state::JmapCacheState,
@@ -13,6 +12,7 @@ use crate::{
 use common::{
     Server, auth::AccessToken, ipc::PushNotification, storage::index::ObjectIndexBuilder,
 };
+use email::message::headers::{BuildHeader, ValueToHeader};
 use email::{
     cache::{MessageCacheFetch, email::MessageCacheAccess, mailbox::MailboxCacheAccess},
     mailbox::{JUNK_ID, TRASH_ID, UidMailbox},
@@ -737,6 +737,19 @@ impl EmailSet for Server {
                         .with_description("Message has to have at least one header or body part."),
                 );
                 continue 'create;
+            }
+
+            match builder
+                .headers
+                .iter()
+                .position(|(name, _)| name.eq_ignore_ascii_case("Message-ID"))
+            {
+                Some(pos) => {
+                    builder.headers[pos].0 = Cow::Borrowed("Message-ID");
+                }
+                None => {
+                    builder = builder.message_id(self.core.network.message_id());
+                }
             }
 
             // In test, sort headers to avoid randomness

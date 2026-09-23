@@ -14,7 +14,8 @@ use common::{
             client_id::{ClientMeta, decode_client_id, encode_client_id, scopes_to_mask},
             registration::{
                 ClientRegistrationError, ClientRegistrationRequest, ClientRegistrationResponse,
-                TokenEndpointAuthMethod, validate_grant_metadata, validate_redirect_uri,
+                TokenEndpointAuthMethod, redirect_uri_matches, validate_grant_metadata,
+                validate_redirect_uri,
             },
         },
     },
@@ -29,7 +30,7 @@ use registry::schema::{
 };
 use std::future::Future;
 use store::{
-    rand::{Rng, distr::Alphanumeric, rng},
+    rand::{RngExt, distr::Alphanumeric, rng},
     registry::write::{RegistryWrite, RegistryWriteResult},
     write::now,
 };
@@ -247,7 +248,11 @@ impl ClientRegistrationHandler for Server {
                             .caused_by(trc::location!())
                             .ctx(trc::Key::Id, client_id.id().id())
                     })?;
-                if client.redirect_uris.iter().any(|uri| uri == redirect_uri) {
+                if client
+                    .redirect_uris
+                    .iter()
+                    .any(|uri| redirect_uri_matches(uri, redirect_uri))
+                {
                     return Ok(None);
                 }
             } else {

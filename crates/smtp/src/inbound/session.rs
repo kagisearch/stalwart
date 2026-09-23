@@ -55,7 +55,9 @@ impl<T: SessionStream> Session<T> {
                                 }
                             }
                             Request::Data => {
-                                if self.can_send_data().await? {
+                                if let Some(response) = self.can_send_data().await {
+                                    self.write(response).await?;
+                                } else {
                                     self.write(b"354 Start mail input; end with <CRLF>.<CRLF>\r\n")
                                         .await?;
                                     self.data.message = Vec::with_capacity(1024);
@@ -67,7 +69,12 @@ impl<T: SessionStream> Session<T> {
                                 chunk_size,
                                 is_last,
                             } => {
-                                state = if chunk_size + self.data.message.len()
+                                state = if let Some(response) = self.can_send_data().await {
+                                    State::SkipData(
+                                        DummyDataReceiver::new_bdat(chunk_size),
+                                        response,
+                                    )
+                                } else if chunk_size.saturating_add(self.data.message.len())
                                     < self.params.max_message_size
                                 {
                                     if self.data.message.is_empty() {
@@ -77,8 +84,17 @@ impl<T: SessionStream> Session<T> {
                                     }
                                     State::Bdat(BdatReceiver::new(chunk_size, is_last))
                                 } else {
-                                    // Chunk is too large, ignore.
-                                    State::DataTooLarge(DummyDataReceiver::new_bdat(chunk_size))
+                                    trc::event!(
+                                        Smtp(SmtpEvent::MessageTooLarge),
+                                        SpanId = self.data.session_id,
+                                        Size = chunk_size.saturating_add(self.data.message.len()),
+                                        Limit = self.params.max_message_size,
+                                    );
+
+                                    State::SkipData(
+                                        DummyDataReceiver::new_bdat(chunk_size),
+                                        b"552 5.3.4 Message too big for system.\r\n",
+                                    )
                                 };
                                 continue 'outer;
                             }
@@ -161,6 +177,7 @@ impl<T: SessionStream> Session<T> {
                                             return Err(());
                                         }
                                         self.state = State::default();
+                                        self.reset_tls();
                                         return Ok(false);
                                     } else {
                                         trc::event!(
@@ -367,34 +384,40 @@ impl<T: SessionStream> Session<T> {
                             break 'outer;
                         }
                     } else {
-                        state = State::DataTooLarge(DummyDataReceiver::new_data(receiver));
+                        trc::event!(
+                            Smtp(SmtpEvent::MessageTooLarge),
+                            SpanId = self.data.session_id,
+                            Size = self.data.message.len() + bytes.len(),
+                            Limit = self.params.max_message_size,
+                        );
+
+                        state = State::SkipData(
+                            DummyDataReceiver::new_data(receiver),
+                            b"552 5.3.4 Message too big for system.\r\n",
+                        );
                     }
                 }
                 State::Bdat(receiver) => {
                     if receiver.ingest(&mut iter, &mut self.data.message) {
-                        if self.can_send_data().await? {
-                            if receiver.is_last {
-                                let message = self.queue_message().await;
-                                if !message.is_empty() {
-                                    let num_responses =
-                                        if self.instance.protocol == ServerProtocol::Smtp {
-                                            1
-                                        } else {
-                                            self.data.rcpt_oks
-                                        };
-                                    for _ in 0..num_responses {
-                                        self.write(message.as_ref()).await?;
-                                    }
-                                    self.reset();
-                                } else {
-                                    // Disconnect requested
-                                    return Err(());
+                        if receiver.is_last {
+                            let message = self.queue_message().await;
+                            if !message.is_empty() {
+                                let num_responses =
+                                    if self.instance.protocol == ServerProtocol::Smtp {
+                                        1
+                                    } else {
+                                        self.data.rcpt_oks
+                                    };
+                                for _ in 0..num_responses {
+                                    self.write(message.as_ref()).await?;
                                 }
+                                self.reset();
                             } else {
-                                self.write(b"250 2.6.0 Chunk accepted.\r\n").await?;
+                                // Disconnect requested
+                                return Err(());
                             }
                         } else {
-                            self.data.message = Vec::with_capacity(0);
+                            self.write(b"250 2.6.0 Chunk accepted.\r\n").await?;
                         }
                         state = State::default();
                     } else {
@@ -428,16 +451,10 @@ impl<T: SessionStream> Session<T> {
                         break 'outer;
                     }
                 }
-                State::DataTooLarge(receiver) => {
+                State::SkipData(receiver, response) => {
                     if receiver.ingest(&mut iter) {
-                        trc::event!(
-                            Smtp(SmtpEvent::MessageTooLarge),
-                            SpanId = self.data.session_id,
-                        );
-
                         self.data.message = Vec::with_capacity(0);
-                        self.write(b"552 5.3.4 Message too big for system.\r\n")
-                            .await?;
+                        self.write(response).await?;
                         state = State::default();
                     } else {
                         break 'outer;
@@ -475,6 +492,13 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
         self.data.delivery_by = 0;
         self.data.future_release = 0;
         self.data.rcpt_oks = 0;
+    }
+
+    pub fn reset_tls(&mut self) {
+        self.reset();
+        self.data.helo_domain.clear();
+        self.data.spf_ehlo = None;
+        self.data.authenticated_as = None;
     }
 
     #[inline(always)]

@@ -11,7 +11,9 @@ pub mod modules;
 
 use analysis::ElementLocation;
 use analysis::url::UrlParts;
-use mail_auth::{ArcOutput, DkimOutput, DmarcResult, IprevOutput, SpfOutput, dmarc::Policy};
+use mail_auth::{
+    ArcOutput, DkimOutput, DmarcResult, IprevOutput, SpfOutput, dkim2::Dkim2Output, dmarc::Policy,
+};
 use mail_parser::Message;
 use modules::html::HtmlToken;
 use nlp::tokenizers::types::TokenType;
@@ -30,6 +32,7 @@ pub struct SpamFilterInput<'x> {
     pub spf_ehlo_result: Option<&'x SpfOutput>,
     pub spf_mail_from_result: Option<&'x SpfOutput>,
     pub dkim_result: &'x [DkimOutput<'x>],
+    pub dkim2_result: Option<&'x Dkim2Output<'x>>,
     pub dmarc_result: Option<&'x DmarcResult>,
     pub dmarc_policy: Option<&'x Policy>,
     pub iprev_result: Option<&'x IprevOutput>,
@@ -147,6 +150,7 @@ impl<'x> SpamFilterInput<'x> {
             spf_ehlo_result: None,
             spf_mail_from_result: None,
             dkim_result: &[],
+            dkim2_result: None,
             dmarc_result: None,
             dmarc_policy: None,
             iprev_result: None,
@@ -181,7 +185,7 @@ impl Eq for Hostname {}
 
 impl PartialEq for Email {
     fn eq(&self, other: &Self) -> bool {
-        self.address.eq(&other.address)
+        self.local_part.eq(&other.local_part) && self.domain_part.eq(&other.domain_part)
     }
 }
 
@@ -195,7 +199,8 @@ impl Hash for Hostname {
 
 impl Hash for Email {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.address.hash(state)
+        self.local_part.hash(state);
+        self.domain_part.hash(state);
     }
 }
 
@@ -243,7 +248,9 @@ impl PartialOrd for Recipient {
 
 impl Ord for Email {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.address.cmp(&other.address)
+        self.local_part
+            .cmp(&other.local_part)
+            .then_with(|| self.domain_part.fqdn.cmp(&other.domain_part.fqdn))
     }
 }
 

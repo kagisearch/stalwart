@@ -28,7 +28,7 @@ use groupware::{
 use jmap_proto::{
     method::get::{GetRequest, GetResponse},
     object::{JmapObjectId, calendar_event},
-    request::{IntoValid, reference::MaybeResultReference},
+    request::IntoValid,
 };
 use jmap_tools::{Key, Map, Value};
 use std::{borrow::Cow, str::FromStr};
@@ -60,12 +60,10 @@ impl CalendarEventGet for Server {
         mut request: GetRequest<calendar_event::CalendarEvent>,
         access_token: &AccessToken,
     ) -> trc::Result<GetResponse<calendar_event::CalendarEvent>> {
-        let return_all_properties = request
-            .properties
-            .as_ref()
-            .is_none_or(|v| matches!(v, MaybeResultReference::Value(v) if v.is_empty()));
+        let return_all_properties = request.properties.is_none();
         let properties = request.unwrap_properties(&[]);
         let account_id = request.account_id.document_id();
+        let personal_id = access_token.personal_id(account_id, Collection::Calendar);
         let cache = self
             .fetch_dav_resources(
                 access_token.account_id(),
@@ -134,6 +132,7 @@ impl CalendarEventGet for Server {
                     }
                     JSCalendarProperty::IsOrigin => {
                         return_is_origin = true;
+                        jmap_properties.push(property);
                     }
                     _ => {
                         if matches!(property, JSCalendarProperty::ICalendar) {
@@ -209,7 +208,7 @@ impl CalendarEventGet for Server {
         let default_tz = request.arguments.time_zone.unwrap_or(Tz::UTC);
         let reduce_participants = request.arguments.reduce_participants.unwrap_or(false);
 
-        'outer: while let Some(id) = ids.next() {
+        while let Some(id) = ids.next() {
             // Obtain the calendar_event object
             let document_id = id.document_id();
             if !calendar_event_ids.contains(document_id) {
@@ -233,18 +232,18 @@ impl CalendarEventGet for Server {
                 .deserialize::<CalendarEvent>()
                 .caused_by(trc::location!())?;
 
-            // Extract expansion ids from synthetic ids
-            let mut expansion_ids = AHashSet::new();
+            // Extract recurrence keys from synthetic ids
+            let mut recurrence_keys = AHashSet::new();
             let mut include_base_event = false;
-            if let Some(expansion_id) = id.expansion_id() {
-                expansion_ids.insert(expansion_id);
+            if let Some(recurrence_key) = id.recurrence_key() {
+                recurrence_keys.insert(recurrence_key);
             } else {
                 include_base_event = true;
             }
             while let Some(next_id) = ids.peek() {
                 if next_id.document_id() == document_id {
-                    if let Some(expansion_id) = next_id.expansion_id() {
-                        expansion_ids.insert(expansion_id);
+                    if let Some(recurrence_key) = next_id.recurrence_key() {
+                        recurrence_keys.insert(recurrence_key);
                     } else {
                         include_base_event = true;
                     }
@@ -281,22 +280,19 @@ impl CalendarEventGet for Server {
             }
 
             // Expand synthetic ids
-            let mut results = Vec::with_capacity(expansion_ids.len() + 1);
-            if !expansion_ids.is_empty() {
+            let mut results = Vec::with_capacity(recurrence_keys.len() + 1);
+            if !recurrence_keys.is_empty() {
                 let ical = &calendar_event.data.event;
                 if let Some(expansions) = calendar_event
                     .data
-                    .expand_from_ids(&mut expansion_ids, default_tz)
+                    .expand_from_ids(&mut recurrence_keys, default_tz)
                 {
                     for expansion in expansions {
-                        if !expansion.is_valid() {
-                            response.push_not_found(<Id as CalendarSyntheticId>::new(
-                                expansion.expansion_id,
-                                document_id,
-                            ));
-                            continue 'outer;
-                        }
+                        let Some(recurrence_key) = expansion.recurrence_key() else {
+                            continue;
+                        };
                         let component = &ical.components[expansion.comp_id as usize];
+                        let source_component = component;
                         let is_recurrent = component.is_recurrent();
                         let is_recurrent_or_override =
                             is_recurrent || component.is_recurrence_override();
@@ -363,13 +359,30 @@ impl CalendarEventGet for Server {
                         });
 
                         if is_recurrent_or_override {
-                            component.entries.push(ICalendarEntry {
-                                name: ICalendarProperty::RecurrenceId,
-                                params: vec![ICalendarParameter::tzid(tz_name.clone())],
-                                values: vec![ICalendarValue::PartialDateTime(Box::new(
-                                    PartialDateTime::from_naive_timestamp(start_timestamp),
-                                ))],
-                            });
+                            component.entries.push(
+                                source_component
+                                    .property(&ICalendarProperty::RecurrenceId)
+                                    .filter(|entry| {
+                                        entry
+                                            .parameters(&ICalendarParameterName::Range)
+                                            .next()
+                                            .is_none()
+                                            || calendar_event
+                                                .data
+                                                .expand_single(expansion.comp_id, default_tz)
+                                                .is_some_and(|first| {
+                                                    first.start_naive == expansion.start_naive
+                                                })
+                                    })
+                                    .cloned()
+                                    .unwrap_or_else(|| ICalendarEntry {
+                                        name: ICalendarProperty::RecurrenceId,
+                                        params: vec![ICalendarParameter::tzid(tz_name.clone())],
+                                        values: vec![ICalendarValue::PartialDateTime(Box::new(
+                                            PartialDateTime::from_naive_timestamp(start_timestamp),
+                                        ))],
+                                    }),
+                            );
                         }
 
                         if !has_duration {
@@ -405,19 +418,18 @@ impl CalendarEventGet for Server {
                         }
 
                         results.push((
-                            <Id as CalendarSyntheticId>::new(expansion.expansion_id, document_id),
+                            <Id as CalendarSyntheticId>::new(recurrence_key, document_id),
                             expanded_ical,
                             expansion,
                         ));
                     }
-                } else {
-                    for expansion_id in expansion_ids {
-                        response.push_not_found(<Id as CalendarSyntheticId>::new(
-                            expansion_id,
-                            document_id,
-                        ));
-                    }
-                    continue;
+                }
+
+                for recurrence_key in recurrence_keys {
+                    response.push_not_found(<Id as CalendarSyntheticId>::new(
+                        recurrence_key,
+                        document_id,
+                    ));
                 }
             }
 
@@ -502,10 +514,28 @@ impl CalendarEventGet for Server {
                 let mut result = if return_all_properties {
                     jscal.into_object().unwrap()
                 } else {
-                    Map::from_iter(jscal.into_expanded_object().filter(|(k, _)| {
-                        k.as_property()
-                            .is_some_and(|p| jscal_properties.contains(p))
-                    }))
+                    let is_synthetic = id.is_synthetic();
+                    let is_null_for_synthetic = |property: &JSCalendarProperty<Id>| {
+                        is_synthetic
+                            && matches!(
+                                property,
+                                JSCalendarProperty::RecurrenceRule
+                                    | JSCalendarProperty::RecurrenceOverrides
+                            )
+                    };
+                    let mut result =
+                        Map::from_iter(jscal.into_expanded_object().filter(|(k, _)| {
+                            k.as_property().is_some_and(|p| {
+                                jscal_properties.contains(p) && !is_null_for_synthetic(p)
+                            })
+                        }));
+                    for property in jscal_properties
+                        .iter()
+                        .filter(|property| is_null_for_synthetic(property))
+                    {
+                        result.insert_unchecked(property.clone(), Value::Null);
+                    }
+                    result
                 };
 
                 for property in &jmap_properties {
@@ -519,7 +549,11 @@ impl CalendarEventGet for Server {
                         JSCalendarProperty::BaseEventId => {
                             result.insert_unchecked(
                                 JSCalendarProperty::BaseEventId,
-                                Value::Element(JSCalendarValue::Id(id.document_id().into())),
+                                if id.is_synthetic() {
+                                    Value::Element(JSCalendarValue::Id(id.document_id().into()))
+                                } else {
+                                    Value::Null
+                                },
                             );
                         }
                         JSCalendarProperty::CalendarIds => {
@@ -589,8 +623,8 @@ impl CalendarEventGet for Server {
                                 JSCalendarProperty::UseDefaultAlerts,
                                 Value::Bool(
                                     calendar_event
-                                        .preferences(access_token)
-                                        .is_none_or(|v| v.flags & PREF_USE_DEFAULT_ALERTS != 0),
+                                        .preferences(personal_id)
+                                        .is_some_and(|v| v.flags & PREF_USE_DEFAULT_ALERTS != 0),
                                 ),
                             );
                         }

@@ -9,7 +9,7 @@ use crate::{
     utils::{dns::DnsCache, server::TestServerBuilder},
 };
 use ahash::{AHashMap, HashMap, HashSet};
-use mail_auth::MX;
+use mail_auth::{DnssecStatus, MX};
 use registry::{
     schema::{
         enums::NetworkListenerProtocol,
@@ -134,6 +134,7 @@ async fn manage_queue() {
             exchanges: vec!["mx1.foobar.org".into()].into_boxed_slice(),
             preference: 10,
         }],
+        DnssecStatus::Secure,
         Instant::now() + Duration::from_secs(10),
     );
 

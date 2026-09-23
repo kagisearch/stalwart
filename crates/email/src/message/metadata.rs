@@ -696,6 +696,15 @@ impl ArchivedMessageMetadataPart {
             .and_then(|header| header.as_content_type())
     }
 
+    pub fn is_text_mime_type(&self) -> bool {
+        matches!(
+            self.body,
+            ArchivedMetadataPartType::Text | ArchivedMetadataPartType::Html
+        ) && self
+            .content_type()
+            .is_none_or(|ct| ct.ctype().eq_ignore_ascii_case("text"))
+    }
+
     pub fn content_language(&self) -> &ArchivedMetadataHeaderValue {
         self.header_value(&MetadataHeaderName::ContentLanguage)
             .unwrap_or(&ArchivedMetadataHeaderValue::Empty)
@@ -757,18 +766,34 @@ impl From<HeaderName<'_>> for MetadataHeaderName {
             HeaderName::ArcAuthenticationResults => MetadataHeaderName::ArcAuthenticationResults,
             HeaderName::ArcMessageSignature => MetadataHeaderName::ArcMessageSignature,
             HeaderName::ArcSeal => MetadataHeaderName::ArcSeal,
+
+            // Delivery/Routing
+            HeaderName::DeliveredTo => MetadataHeaderName::DeliveredTo,
+            HeaderName::DispositionNotificationTo => MetadataHeaderName::DispositionNotificationTo,
+            HeaderName::ErrorsTo => MetadataHeaderName::ErrorsTo,
+
+            // Authentication
+            HeaderName::AuthenticationResults => MetadataHeaderName::AuthenticationResults,
+            HeaderName::ReceivedSpf => MetadataHeaderName::ReceivedSpf,
+
+            // Priority
+            HeaderName::Importance => MetadataHeaderName::Importance,
+            HeaderName::Priority => MetadataHeaderName::Priority,
+
+            // Auto-response
+            HeaderName::AutoSubmitted => MetadataHeaderName::AutoSubmitted,
+
+            // Organization/Threading
+            HeaderName::Organization => MetadataHeaderName::Organization,
+
+            // List (additional)
+            HeaderName::ListUnsubscribePost => MetadataHeaderName::ListUnsubscribePost,
+
             HeaderName::Other(value) => {
                 let name = hashify::tiny_map_ignore_case!(value.as_bytes(),
                     // Delivery/Routing
-                    "Delivered-To" => MetadataHeaderName::DeliveredTo,
                     "X-Original-To" => MetadataHeaderName::XOriginalTo,
                     "Return-Receipt-To" => MetadataHeaderName::ReturnReceiptTo,
-                    "Disposition-Notification-To" => MetadataHeaderName::DispositionNotificationTo,
-                    "Errors-To" => MetadataHeaderName::ErrorsTo,
-
-                    // Authentication
-                    "Authentication-Results" => MetadataHeaderName::AuthenticationResults,
-                    "Received-SPF" => MetadataHeaderName::ReceivedSpf,
 
                     // Spam/Virus
                     "X-Spam-Status" => MetadataHeaderName::XSpamStatus,
@@ -777,8 +802,6 @@ impl From<HeaderName<'_>> for MetadataHeaderName {
                     "X-Spam-Result" => MetadataHeaderName::XSpamResult,
 
                     // Priority
-                    "Importance" => MetadataHeaderName::Importance,
-                    "Priority" => MetadataHeaderName::Priority,
                     "X-Priority" => MetadataHeaderName::XPriority,
                     "X-MSMail-Priority" => MetadataHeaderName::XMSMailPriority,
 
@@ -793,17 +816,14 @@ impl From<HeaderName<'_>> for MetadataHeaderName {
                     "X-Forwarded-For" => MetadataHeaderName::XForwardedFor,
 
                     // Auto-response
-                    "Auto-Submitted" => MetadataHeaderName::AutoSubmitted,
                     "X-Auto-Response-Suppress" => MetadataHeaderName::XAutoResponseSuppress,
                     "Precedence" => MetadataHeaderName::Precedence,
 
                     // Organization/Threading
-                    "Organization" => MetadataHeaderName::Organization,
                     "Thread-Index" => MetadataHeaderName::ThreadIndex,
                     "Thread-Topic" => MetadataHeaderName::ThreadTopic,
 
                     // List (additional)
-                    "List-Unsubscribe-Post" => MetadataHeaderName::ListUnsubscribePost,
                     "Feedback-ID" => MetadataHeaderName::FeedbackId,
                 );
                 name.unwrap_or_else(|| {

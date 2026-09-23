@@ -17,6 +17,8 @@ use reqwest::{Error, Response, Url};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 
+pub(crate) const MAX_TOTAL_HITS: u64 = 100_000;
+
 impl MeiliSearchStore {
     pub async fn open(config: structs::MeilisearchStore) -> Result<SearchStore, String> {
         let client = config
@@ -60,8 +62,33 @@ impl MeiliSearchStore {
         Ok(())
     }
 
+    async fn index_exists(&self, index_uid: &str) -> trc::Result<bool> {
+        let response = self
+            .client
+            .get(format!("{}/indexes/{}", self.url, index_uid))
+            .send()
+            .await
+            .map_err(|err| trc::StoreEvent::MeilisearchError.reason(err))?;
+
+        match response.status().as_u16() {
+            200..=299 => Ok(true),
+            404 => Ok(false),
+            status => {
+                let text = response.text().await.unwrap_or_default();
+                Err(trc::StoreEvent::MeilisearchError
+                    .reason(text)
+                    .ctx(trc::Key::Code, status))
+            }
+        }
+    }
+
     async fn create_index<T: SearchableField>(&self) -> trc::Result<()> {
         let index_name = T::index().index_name();
+
+        if self.index_exists(index_name).await? {
+            return Ok(());
+        }
+
         let response = assert_success(
             self.client
                 .post(format!("{}/indexes", self.url))
@@ -130,7 +157,25 @@ impl MeiliSearchStore {
                 .await?;
         }
 
+        self.update_index_pagination(index_name).await?;
+
         Ok(())
+    }
+
+    async fn update_index_pagination(&self, index_uid: &str) -> trc::Result<bool> {
+        let response = assert_success(
+            self.client
+                .patch(format!(
+                    "{}/indexes/{}/settings/pagination",
+                    self.url, index_uid
+                ))
+                .body(json!({ "maxTotalHits": MAX_TOTAL_HITS }).to_string())
+                .send()
+                .await,
+        )
+        .await?;
+
+        self.wait_for_task(response).await
     }
 
     async fn update_index_settings(

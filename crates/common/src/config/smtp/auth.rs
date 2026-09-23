@@ -11,15 +11,16 @@ use crate::expr::{
 use mail_auth::{
     common::crypto::{Ed25519Key, HashAlgorithm, RsaKey, Sha256, SigningKey},
     dkim::{Canonicalization, Done},
+    dkim2::{Dkim2Signer, Done as Dkim2Done, Flag},
 };
 use mail_parser::decoders::base64::base64_decode;
 use registry::{
     schema::{
-        enums::{self, ExpressionConstant},
+        enums::{self, Dkim2Flag, ExpressionConstant},
         prelude::ObjectType,
         structs::{Dkim1Signature, DkimSignature, SenderAuth},
     },
-    types::ObjectImpl,
+    types::{ObjectImpl, map::Map},
 };
 use rustls_pki_types::{PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, pem::PemObject};
 use store::registry::bootstrap::Bootstrap;
@@ -71,14 +72,15 @@ pub enum VerifyStrategy {
     Disable,
 }
 
-pub enum DkimSigner {
+pub enum Dkim1Signer {
     RsaSha256(mail_auth::dkim::DkimSigner<RsaKey<Sha256>, Done>),
     Ed25519Sha256(mail_auth::dkim::DkimSigner<Ed25519Key, Done>),
 }
 
-pub enum ArcSealer {
-    RsaSha256(mail_auth::arc::ArcSealer<RsaKey<Sha256>, Done>),
-    Ed25519Sha256(mail_auth::arc::ArcSealer<Ed25519Key, Done>),
+#[derive(Default)]
+pub struct DkimSigners {
+    pub dkim1: Vec<Dkim1Signer>,
+    pub dkim2: Option<Dkim2Signer<Dkim2Done>>,
 }
 
 impl MailAuthConfig {
@@ -123,8 +125,8 @@ impl MailAuthConfig {
     }
 }
 
-impl DkimSigner {
-    pub async fn new(domain: String, signature: DkimSignature) -> trc::Result<Self> {
+impl DkimSigners {
+    pub async fn insert(&mut self, domain: String, signature: DkimSignature) -> trc::Result<()> {
         let mut errors = vec![];
         if !signature.validate(&mut errors) {
             return Err(trc::DkimEvent::BuildError
@@ -156,9 +158,10 @@ impl DkimSigner {
                             .details("Failed to build ED25519 key")
                     })?;
 
-                Ok(DkimSigner::Ed25519Sha256(build_dkim1_signer(
-                    domain, signature, key,
-                )))
+                self.dkim1
+                    .push(Dkim1Signer::Ed25519Sha256(build_dkim1_signer(
+                        domain, signature, key,
+                    )));
             }
             DkimSignature::Dkim1RsaSha256(signature) => {
                 let private_key = signature
@@ -168,12 +171,68 @@ impl DkimSigner {
                     .map_err(|err| trc::DkimEvent::BuildError.reason(err))?;
                 let key = rsa_key_parse(private_key.as_bytes())?;
 
-                Ok(DkimSigner::RsaSha256(build_dkim1_signer(
+                self.dkim1.push(Dkim1Signer::RsaSha256(build_dkim1_signer(
                     domain, signature, key,
-                )))
+                )));
+            }
+            DkimSignature::Dkim2Ed25519Sha256(signature) => {
+                let private_key = signature
+                    .private_key
+                    .secret()
+                    .await
+                    .map_err(|err| trc::DkimEvent::BuildError.reason(err))?;
+                let private_key = simple_pem_parse(&private_key).ok_or_else(|| {
+                    trc::DkimEvent::BuildError
+                        .reason("Failed to parse ED25519 private key PEM")
+                        .details("Invalid PEM format")
+                })?;
+                let key =
+                    Ed25519Key::from_pkcs8_maybe_unchecked_der(&private_key).map_err(|err| {
+                        trc::DkimEvent::BuildError
+                            .reason(err)
+                            .details("Failed to build ED25519 key")
+                    })?;
+
+                self.dkim2 = Some(match self.dkim2.take() {
+                    None => Dkim2Signer::from_key(key)
+                        .domain(domain)
+                        .selector(signature.selector)
+                        .flags(map_dkim2_flags(signature.flags)),
+                    Some(signer) => signer
+                        .additional_key(key, signature.selector)
+                        .flags(map_dkim2_flags(signature.flags)),
+                });
+            }
+            DkimSignature::Dkim2RsaSha256(signature) => {
+                let private_key = signature
+                    .private_key
+                    .secret()
+                    .await
+                    .map_err(|err| trc::DkimEvent::BuildError.reason(err))?;
+                let key = rsa_key_parse(private_key.as_bytes())?;
+
+                self.dkim2 = Some(match self.dkim2.take() {
+                    None => Dkim2Signer::from_key(key)
+                        .domain(domain)
+                        .selector(signature.selector)
+                        .flags(map_dkim2_flags(signature.flags)),
+                    Some(signer) => signer
+                        .additional_key(key, signature.selector)
+                        .flags(map_dkim2_flags(signature.flags)),
+                });
             }
         }
+
+        Ok(())
     }
+}
+
+fn map_dkim2_flags(flags: Map<enums::Dkim2Flag>) -> impl Iterator<Item = Flag> {
+    flags.into_inner().into_iter().map(|flag| match flag {
+        Dkim2Flag::Donotmodify => Flag::DoNotModify,
+        Dkim2Flag::Donotexplode => Flag::DoNotExplode,
+        Dkim2Flag::Feedback => Flag::Feedback,
+    })
 }
 
 pub fn rsa_key_parse(private_key: &[u8]) -> trc::Result<RsaKey<Sha256>> {
@@ -306,8 +365,16 @@ impl VerifyStrategy {
     }
 }
 
-impl CacheItemWeight for DkimSigner {
+impl CacheItemWeight for Dkim1Signer {
     fn weight(&self) -> u64 {
         std::mem::size_of::<Self>() as u64
+    }
+}
+
+impl CacheItemWeight for DkimSigners {
+    fn weight(&self) -> u64 {
+        (std::mem::size_of::<Self>()
+            + self.dkim1.len() * std::mem::size_of::<Dkim1Signer>()
+            + std::mem::size_of::<Dkim2Signer<Dkim2Done>>()) as u64
     }
 }

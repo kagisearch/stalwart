@@ -9,7 +9,7 @@ use crate::{
     utils::{dns::DnsCache, server::TestServerBuilder},
 };
 use common::{BuildServer, ipc::QueueEvent};
-use mail_auth::MX;
+use mail_auth::{DnssecStatus, MX};
 use registry::{
     schema::{
         enums::NetworkListenerProtocol,
@@ -125,6 +125,7 @@ async fn concurrent_queue() {
             exchanges: vec!["mx.foobar.org".into()].into_boxed_slice(),
             preference: 10,
         }],
+        DnssecStatus::Secure,
         Instant::now() + Duration::from_secs(100),
     );
     local.server.ipv4_add(
@@ -149,6 +150,7 @@ async fn concurrent_queue() {
                 exchanges: vec!["mx.foobar.org".into()].into_boxed_slice(),
                 preference: 10,
             }],
+            DnssecStatus::Secure,
             Instant::now() + Duration::from_secs(100),
         );
         server.ipv4_add(

@@ -5,7 +5,10 @@
  */
 
 use super::{ImapSessionManager, Session, State};
-use crate::{GREETING_WITH_TLS, GREETING_WITHOUT_TLS};
+use crate::{
+    GREETING_WITH_TLS, GREETING_WITH_TLS_LOGIN_DISABLED, GREETING_WITHOUT_TLS,
+    GREETING_WITHOUT_TLS_LOGIN_DISABLED,
+};
 use common::{
     BuildServer,
     network::{SessionData, SessionManager, SessionResult, SessionStream, stream::NullIo},
@@ -118,10 +121,14 @@ impl<T: SessionStream> Session<T> {
     ) -> Result<Session<T>, ()> {
         // Write greeting
         let is_tls = session.stream.is_tls();
-        let greeting = if !is_tls && session.instance.acceptor.is_tls() {
-            &GREETING_WITH_TLS
-        } else {
-            &GREETING_WITHOUT_TLS
+        let server = manager.inner.build_server();
+        let offer_tls = !is_tls && session.instance.acceptor.is_tls();
+        let allow_auth = is_tls || server.core.imap.allow_plain_auth;
+        let greeting = match (offer_tls, allow_auth) {
+            (true, true) => &GREETING_WITH_TLS,
+            (true, false) => &GREETING_WITH_TLS_LOGIN_DISABLED,
+            (false, true) => &GREETING_WITHOUT_TLS,
+            (false, false) => &GREETING_WITHOUT_TLS_LOGIN_DISABLED,
         };
 
         if let Err(err) = session.stream.write_all(greeting).await {
@@ -137,7 +144,6 @@ impl<T: SessionStream> Session<T> {
 
         // Split stream into read and write halves
         let (stream_rx, stream_tx) = tokio::io::split(session.stream);
-        let server = manager.inner.build_server();
 
         Ok(Session {
             receiver: Receiver::with_max_request_size(server.core.imap.max_request_size),
@@ -148,6 +154,7 @@ impl<T: SessionStream> Session<T> {
             is_qresync: false,
             is_utf8: false,
             is_objectid: false,
+            is_uidonly: false,
             server,
             instance: session.instance,
             session_id: session.session_id,
@@ -194,11 +201,12 @@ impl<T: SessionStream> Session<T> {
         let (stream_rx, stream_tx) =
             tokio::io::split(self.instance.tls_accept(stream, self.session_id).await?);
         let stream_tx = Arc::new(tokio::sync::Mutex::new(stream_tx));
+        let receiver = Receiver::with_max_request_size(self.server.core.imap.max_request_size);
 
         Ok(Session {
             server: self.server,
             instance: self.instance,
-            receiver: self.receiver,
+            receiver,
             version: self.version,
             state: state.try_replace_stream_tx(stream_tx.clone()).unwrap(),
             is_tls: true,
@@ -206,6 +214,7 @@ impl<T: SessionStream> Session<T> {
             is_qresync: self.is_qresync,
             is_utf8: self.is_utf8,
             is_objectid: self.is_objectid,
+            is_uidonly: self.is_uidonly,
             session_id: self.session_id,
             in_flight: self.in_flight,
             remote_addr: self.remote_addr,

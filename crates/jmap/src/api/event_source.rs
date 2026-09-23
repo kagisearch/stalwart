@@ -78,13 +78,14 @@ impl EventSourceHandler for Server {
 
         let mut ping = if ping > 0 {
             #[cfg(not(feature = "test_mode"))]
-            let interval = std::cmp::max(ping, 30) * 1000;
+            let interval = std::cmp::max(ping, 30);
             #[cfg(feature = "test_mode")]
-            let interval = ping * 1000;
+            let interval = ping;
+            let interval_duration = Duration::from_secs(interval as u64);
 
             Ping {
-                interval: Duration::from_millis(interval as u64),
-                last_ping: Instant::now() - Duration::from_millis(interval as u64),
+                interval: interval_duration,
+                last_ping: Instant::now() - interval_duration,
                 payload: Bytes::from(format!(
                     "event: ping\ndata: {{\"interval\": {}}}\n\n",
                     interval
@@ -116,7 +117,7 @@ impl EventSourceHandler for Server {
                                     for type_state in state_change.types {
                                         changed
                                             .get_mut_or_insert(state_change.account_id.into())
-                                            .set(type_state, (state_change.change_id).into());
+                                            .set(type_state, State::Exact(state_change.change_id));
                                     }
                                 }
                                 PushNotification::CalendarAlert(calendar_alert) => {
@@ -130,7 +131,7 @@ impl EventSourceHandler for Server {
                                     for type_state in state_change.types {
                                         changed
                                             .get_mut_or_insert(state_change.account_id.into())
-                                            .set(type_state, state_change.change_id.into());
+                                            .set(type_state, State::Exact(state_change.change_id));
                                     }
                                 }
                             }

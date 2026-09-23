@@ -65,6 +65,17 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
             .with_status(StatusCode::MULTI_STATUS)
             .with_hrefs([format!("{user_base_path}/").as_str()]);
 
+        client
+            .propfind_with_headers(
+                &user_base_path,
+                [DavProperty::WebDav(WebDavProperty::GetCTag)],
+                [("depth", "0")],
+            )
+            .await
+            .properties(&format!("{user_base_path}/"))
+            .get(DavProperty::WebDav(WebDavProperty::GetCTag))
+            .is_not_empty();
+
         // Test 3: PROPFIND Depth 1 on root
         client
             .request_with_headers("PROPFIND", resource_type.base_path(), [("depth", "1")], "")
@@ -267,13 +278,10 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                     .value()
                     .parse()
                     .unwrap();
-                let available_bytes: u64 = properties
-                    .get(DavProperty::WebDav(WebDavProperty::QuotaAvailableBytes))
-                    .value()
-                    .parse()
-                    .unwrap();
                 assert!(used_bytes > 0);
-                assert!(available_bytes > 0);
+                properties
+                    .get(DavProperty::WebDav(WebDavProperty::QuotaAvailableBytes))
+                    .with_status(StatusCode::NOT_FOUND);
                 properties
                     .get(DavProperty::WebDav(WebDavProperty::SupportedReportSet))
                     .with_values(match resource_type {

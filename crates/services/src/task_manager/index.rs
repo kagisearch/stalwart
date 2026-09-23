@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::task_manager::{Task, TaskDetails, TaskResult};
+use crate::task_manager::{Task, TaskDetails, TaskFailureType, TaskResult, deferred_retry_time};
 use common::Server;
 use email::{cache::MessageCacheFetch, message::metadata::MessageMetadata};
 use groupware::{cache::GroupwareCache, calendar::CalendarEvent, contact::ContactCard};
@@ -20,7 +20,7 @@ use std::cmp::Ordering;
 use store::{
     IterateParams, ValueKey,
     ahash::AHashMap,
-    rand::{self, Rng},
+    rand::{self, RngExt},
     search::{IndexDocument, SearchField, SearchFilter, SearchQuery},
     write::{
         AlignedBytes, Archive, BatchBuilder, SearchIndex, TelemetryClass, ValueClass,
@@ -39,11 +39,19 @@ pub(crate) trait SearchIndexTask: Sync + Send {
 }
 
 const NUM_INDEXES: usize = 5;
+const MISSING_DOCUMENT_MAX_ATTEMPTS: u64 = 3;
+const MISSING_DOCUMENT_RETRY_DELAY: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskType {
     Insert,
     Delete,
+}
+
+enum BuildResult {
+    Document(IndexDocument),
+    NotIndexed,
+    NotFound,
 }
 
 #[derive(Debug)]
@@ -83,8 +91,9 @@ impl SearchIndexTask for Server {
                         }
                     };
 
+                    // Retry non found errors in case they are due to SQL read replication lag
                     let result = match document {
-                        Ok(Some(doc)) if !doc.is_empty() => {
+                        Ok(BuildResult::Document(doc)) if !doc.is_empty() => {
                             document_insertions.push(doc);
                             TaskResult::Success(vec![])
                         }
@@ -98,6 +107,27 @@ impl SearchIndexTask for Server {
                                     .details("Failed to build document for indexing")
                             );
                             result
+                        }
+                        Ok(BuildResult::NotFound)
+                            if attempt_number(&task.status) < MISSING_DOCUMENT_MAX_ATTEMPTS =>
+                        {
+                            TaskResult::Failure {
+                                typ: TaskFailureType::Retry(
+                                    now().saturating_add(MISSING_DOCUMENT_RETRY_DELAY),
+                                ),
+                                message: "Document not found in data store".into(),
+                                max_attempts: Some(MISSING_DOCUMENT_MAX_ATTEMPTS),
+                            }
+                        }
+                        Ok(BuildResult::NotFound) => {
+                            trc::event!(
+                                TaskManager(TaskManagerEvent::TaskIgnored),
+                                Collection = task.document_type.as_str(),
+                                Reason = "Document no longer exists",
+                                AccountId = account_id,
+                                DocumentId = document_id,
+                            );
+                            TaskResult::Ignored
                         }
                         _ => {
                             trc::event!(
@@ -218,13 +248,14 @@ impl SearchIndexTask for Server {
         if !document_insertions.is_empty()
             && let Err(err) = self.search_store().index(document_insertions).await
         {
+            let retry_at = deferred_retry_time(&err);
             trc::error!(
                 err.caused_by(trc::location!())
                     .details("Failed to index documents")
             );
             for r in results.iter_mut() {
                 if r.task_type == TaskType::Insert && r.result.is_success() {
-                    r.result = TaskResult::temporary("Failed to index documents");
+                    r.result = TaskResult::deferred(retry_at, "Failed to index documents");
                 }
             }
             return results;
@@ -272,6 +303,7 @@ impl SearchIndexTask for Server {
             }
 
             if let Err(err) = self.search_store().unindex(query).await {
+                let retry_at = deferred_retry_time(&err);
                 trc::error!(
                     err.caused_by(trc::location!())
                         .details("Failed to delete documents from index")
@@ -279,7 +311,8 @@ impl SearchIndexTask for Server {
                 );
                 for r in results.iter_mut() {
                     if r.task_type == TaskType::Delete && r.result.is_success() {
-                        r.result = TaskResult::temporary("Failed to delete documents from index");
+                        r.result =
+                            TaskResult::deferred(retry_at, "Failed to delete documents from index");
                     }
                 }
                 return results;
@@ -293,7 +326,7 @@ impl SearchIndexTask for Server {
 pub(crate) async fn reindex_telemetry(server: &Server) -> trc::Result<()> {
     let mut spans = Vec::new();
     server
-        .store()
+        .tracing_store()
         .iterate(
             IterateParams::new(
                 ValueKey::from(ValueClass::Telemetry(TelemetryClass::Span(0))),
@@ -367,7 +400,6 @@ pub(crate) async fn reindex_account(server: &Server, account_id: u32) -> trc::Re
             )
             .await
             .caused_by(trc::location!())?;
-        let mut batch = BatchBuilder::new();
 
         for document_id in cache.document_ids(false) {
             batch.schedule_task(Task::IndexDocument(TaskIndexDocument {
@@ -377,7 +409,7 @@ pub(crate) async fn reindex_account(server: &Server, account_id: u32) -> trc::Re
                 status: TaskStatus::at(now + rand::rng().random_range(0..=300)),
             }));
 
-            if batch.len() >= 2000 {
+            if batch.is_large_batch() {
                 server.core.storage.data.write(batch.build_all()).await?;
                 batch = BatchBuilder::new();
             }
@@ -394,13 +426,21 @@ pub(crate) async fn reindex_account(server: &Server, account_id: u32) -> trc::Re
     Ok(())
 }
 
+fn attempt_number(status: &TaskStatus) -> u64 {
+    match status {
+        TaskStatus::Pending(_) => 0,
+        TaskStatus::Retry(status) => status.attempt_number,
+        TaskStatus::Failed(status) => status.failed_attempt_number,
+    }
+}
+
 async fn build_email_document(
     server: &Server,
     account_id: u32,
     document_id: u32,
-) -> trc::Result<Option<IndexDocument>> {
+) -> trc::Result<BuildResult> {
     let Some(index_fields) = server.core.email.index_fields.get(&SearchIndex::Email) else {
-        return Ok(None);
+        return Ok(BuildResult::NotIndexed);
     };
 
     match server
@@ -429,7 +469,7 @@ async fn build_email_document(
                         .details("Blob not found")
                 })?;
 
-            Ok(Some(metadata.index_document(
+            Ok(BuildResult::Document(metadata.index_document(
                 account_id,
                 document_id,
                 &raw_message,
@@ -437,7 +477,7 @@ async fn build_email_document(
                 server.core.email.default_language,
             )))
         }
-        None => Ok(None),
+        None => Ok(BuildResult::NotFound),
     }
 }
 
@@ -445,9 +485,9 @@ async fn build_calendar_document(
     server: &Server,
     account_id: u32,
     document_id: u32,
-) -> trc::Result<Option<IndexDocument>> {
+) -> trc::Result<BuildResult> {
     let Some(index_fields) = server.core.email.index_fields.get(&SearchIndex::Calendar) else {
-        return Ok(None);
+        return Ok(BuildResult::NotIndexed);
     };
 
     match server
@@ -459,7 +499,7 @@ async fn build_calendar_document(
         ))
         .await?
     {
-        Some(metadata_) => Ok(Some(
+        Some(metadata_) => Ok(BuildResult::Document(
             metadata_
                 .unarchive::<CalendarEvent>()
                 .caused_by(trc::location!())?
@@ -470,7 +510,7 @@ async fn build_calendar_document(
                     server.core.email.default_language,
                 ),
         )),
-        None => Ok(None),
+        None => Ok(BuildResult::NotFound),
     }
 }
 
@@ -478,9 +518,9 @@ async fn build_contact_document(
     server: &Server,
     account_id: u32,
     document_id: u32,
-) -> trc::Result<Option<IndexDocument>> {
+) -> trc::Result<BuildResult> {
     let Some(index_fields) = server.core.email.index_fields.get(&SearchIndex::Contacts) else {
-        return Ok(None);
+        return Ok(BuildResult::NotIndexed);
     };
 
     match server
@@ -492,7 +532,7 @@ async fn build_contact_document(
         ))
         .await?
     {
-        Some(metadata_) => Ok(Some(
+        Some(metadata_) => Ok(BuildResult::Document(
             metadata_
                 .unarchive::<ContactCard>()
                 .caused_by(trc::location!())?
@@ -503,7 +543,7 @@ async fn build_contact_document(
                     server.core.email.default_language,
                 ),
         )),
-        None => Ok(None),
+        None => Ok(BuildResult::NotFound),
     }
 }
 

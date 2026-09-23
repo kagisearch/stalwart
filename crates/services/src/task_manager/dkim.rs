@@ -19,8 +19,8 @@ use registry::{
         enums::{DkimRotationStage, DkimSignatureType, DnsRecordType},
         prelude::{Object, ObjectType, Property},
         structs::{
-            Dkim1Signature, DkimManagement, DkimSignature, DnsManagement, Domain, SecretText,
-            SecretTextValue, Task, TaskDomainManagement, TaskStatus,
+            Dkim1Signature, Dkim2Signature, DkimManagement, DkimSignature, DnsManagement, Domain,
+            SecretText, SecretTextValue, Task, TaskDomainManagement, TaskStatus,
         },
     },
     types::{datetime::UTCDateTime, id::ObjectId},
@@ -33,7 +33,7 @@ use store::{
     },
     write::now,
 };
-use trc::DkimEvent;
+use trc::{DkimEvent, DnsEvent};
 use types::id::Id;
 
 pub(crate) trait DkimManagementTask: Sync + Send {
@@ -148,8 +148,11 @@ async fn dkim_management(server: &Server, task: &TaskDomainManagement) -> trc::R
         let secret = {
             if dkim.selector_template.contains("dummy") {
                 match algorithm {
-                    DkimSignatureType::Dkim1Ed25519Sha256 => TEST_ED25519_KEY.to_string(),
-                    DkimSignatureType::Dkim1RsaSha256 => TEST_RSA_KEY.to_string(),
+                    DkimSignatureType::Dkim1Ed25519Sha256
+                    | DkimSignatureType::Dkim2Ed25519Sha256 => TEST_ED25519_KEY.to_string(),
+                    DkimSignatureType::Dkim1RsaSha256 | DkimSignatureType::Dkim2RsaSha256 => {
+                        TEST_RSA_KEY.to_string()
+                    }
                 }
             } else {
                 generate_dkim_private_key(algorithm).await.unwrap().unwrap()
@@ -175,17 +178,38 @@ async fn dkim_management(server: &Server, task: &TaskDomainManagement) -> trc::R
         };
 
         // Build key
-        let signature = Dkim1Signature {
-            stage: DkimRotationStage::Active,
-            domain_id: task.domain_id,
-            member_tenant_id: domain.member_tenant_id,
-            selector: selector.clone(),
-            private_key: SecretText::Text(SecretTextValue { secret }),
-            ..Default::default()
-        };
+        let private_key = SecretText::Text(SecretTextValue { secret });
         let mut signature = match algorithm {
-            DkimSignatureType::Dkim1Ed25519Sha256 => DkimSignature::Dkim1Ed25519Sha256(signature),
-            DkimSignatureType::Dkim1RsaSha256 => DkimSignature::Dkim1RsaSha256(signature),
+            DkimSignatureType::Dkim1Ed25519Sha256 | DkimSignatureType::Dkim1RsaSha256 => {
+                let signature = Dkim1Signature {
+                    stage: DkimRotationStage::Active,
+                    domain_id: task.domain_id,
+                    member_tenant_id: domain.member_tenant_id,
+                    selector: selector.clone(),
+                    private_key,
+                    ..Default::default()
+                };
+                if algorithm == DkimSignatureType::Dkim1Ed25519Sha256 {
+                    DkimSignature::Dkim1Ed25519Sha256(signature)
+                } else {
+                    DkimSignature::Dkim1RsaSha256(signature)
+                }
+            }
+            DkimSignatureType::Dkim2Ed25519Sha256 | DkimSignatureType::Dkim2RsaSha256 => {
+                let signature = Dkim2Signature {
+                    stage: DkimRotationStage::Active,
+                    domain_id: task.domain_id,
+                    member_tenant_id: domain.member_tenant_id,
+                    selector: selector.clone(),
+                    private_key,
+                    ..Default::default()
+                };
+                if algorithm == DkimSignatureType::Dkim2Ed25519Sha256 {
+                    DkimSignature::Dkim2Ed25519Sha256(signature)
+                } else {
+                    DkimSignature::Dkim2RsaSha256(signature)
+                }
+            }
         };
 
         // Publish key
@@ -449,6 +473,20 @@ async fn dkim_management(server: &Server, task: &TaskDomainManagement) -> trc::R
     // Delete signatures
     for signature in delete_signatures {
         let record = generate_dkim_dns_record_name(&signature.object, &domain.name);
+
+        if let Some((updater, origin)) = &dns_updater
+            && let Err(err) = updater
+                .set_rrset(origin, &record, dns_update::DnsRecordType::TXT, Vec::new())
+                .await
+        {
+            trc::event!(
+                Dns(DnsEvent::RecordDeletionFailed),
+                Hostname = record.clone(),
+                Details = origin.clone(),
+                Type = "TXT",
+                Reason = err.to_string(),
+            );
+        }
 
         trc::event!(
             Dkim(DkimEvent::SignatureDeleted),

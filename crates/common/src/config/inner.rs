@@ -13,7 +13,7 @@ use crate::{
         mailstore::spamfilter::SpamClassifier,
         server::tls::parse_certificates,
         smtp::{
-            auth::DkimSigner,
+            auth::DkimSigners,
             resolver::{Policy, Tlsa},
         },
     },
@@ -22,7 +22,7 @@ use crate::{
 };
 use ahash::{AHashMap, AHashSet};
 use arc_swap::ArcSwap;
-use mail_auth::{MX, Parameters, Txt};
+use mail_auth::{MX, Parameters, RecordSet, Txt};
 use parking_lot::RwLock;
 use registry::schema::{prelude::ObjectType, structs};
 use std::{
@@ -33,7 +33,7 @@ use store::{LookupStores, registry::bootstrap::Bootstrap};
 use utils::{
     UnwrapFailure,
     cache::{Cache, CacheWithTtl},
-    snowflake::SnowflakeIdGenerator,
+    snowflake::{MAX_NODE_ID, SnowflakeIdGenerator},
     tls::build_tls_connector,
 };
 
@@ -49,6 +49,9 @@ impl Data {
 
         // Build and test snowflake id generator
         let node_id = bp.node_id();
+        if node_id > MAX_NODE_ID {
+            panic!("Node id {node_id} exceeds {MAX_NODE_ID}, panicking to avoid data corruption");
+        }
         SnowflakeIdGenerator::set_node_id(node_id as u64);
         let id_generator = SnowflakeIdGenerator::new();
         if !id_generator.is_valid() {
@@ -100,34 +103,34 @@ impl Caches {
         let cache = bp.setting_infallible::<structs::Cache>().await;
 
         Caches {
-            access_tokens: Cache::new(
+            access_tokens: Cache::new_single_shard(
                 cache.access_tokens,
                 (std::mem::size_of::<AccessTokenInner>() + 255) as u64,
             ),
             http_auth: Cache::new(cache.http_auth, (50 + std::mem::size_of::<u32>()) as u64),
-            messages: Cache::new(
+            messages: Cache::new_single_shard(
                 cache.messages,
                 (std::mem::size_of::<u32>()
                     + std::mem::size_of::<Arc<MessageStoreCache>>()
                     + (1024 * std::mem::size_of::<MessageUidCache>())
                     + (15 * (std::mem::size_of::<MailboxCache>() + 60))) as u64,
             ),
-            files: Cache::new(
+            files: Cache::new_single_shard(
                 cache.files,
                 (std::mem::size_of::<DavResources>() + (500 * std::mem::size_of::<DavResource>()))
                     as u64,
             ),
-            events: Cache::new(
+            events: Cache::new_single_shard(
                 cache.events,
                 (std::mem::size_of::<DavResources>() + (500 * std::mem::size_of::<DavResource>()))
                     as u64,
             ),
-            contacts: Cache::new(
+            contacts: Cache::new_single_shard(
                 cache.contacts,
                 (std::mem::size_of::<DavResources>() + (500 * std::mem::size_of::<DavResource>()))
                     as u64,
             ),
-            scheduling: Cache::new(
+            scheduling: Cache::new_single_shard(
                 cache.scheduling,
                 (std::mem::size_of::<DavResources>() + (500 * std::mem::size_of::<DavResource>()))
                     as u64,
@@ -164,7 +167,7 @@ impl Caches {
             ),
             dkim_signers: Cache::new(
                 cache.dkim_signatures,
-                (std::mem::size_of::<DkimSigner>() + 255) as u64,
+                (std::mem::size_of::<DkimSigners>() + 255) as u64,
             ),
             dns_txt: CacheWithTtl::new(cache.dns_txt, (std::mem::size_of::<Txt>() + 255) as u64),
             dns_mx: CacheWithTtl::new(cache.dns_mx, ((std::mem::size_of::<MX>() + 255) * 2) as u64),
@@ -178,10 +181,6 @@ impl Caches {
                 ((std::mem::size_of::<Ipv6Addr>() + 255) * 2) as u64,
             ),
             dns_tlsa: CacheWithTtl::new(cache.dns_tlsa, (std::mem::size_of::<Tlsa>() + 255) as u64),
-            dns_dnssec: CacheWithTtl::new(
-                cache.dns_tlsa,
-                (std::mem::size_of::<bool>() + 255) as u64,
-            ),
             dns_mta_sts: CacheWithTtl::new(
                 cache.dns_mta_sts,
                 (std::mem::size_of::<Policy>() + 255) as u64,
@@ -203,10 +202,10 @@ impl Caches {
         '_,
         T,
         CacheWithTtl<Box<str>, Txt>,
-        CacheWithTtl<Box<str>, Arc<[MX]>>,
-        CacheWithTtl<Box<str>, Arc<[Ipv4Addr]>>,
-        CacheWithTtl<Box<str>, Arc<[Ipv6Addr]>>,
-        CacheWithTtl<IpAddr, Arc<[Box<str>]>>,
+        CacheWithTtl<Box<str>, RecordSet<MX>>,
+        CacheWithTtl<Box<str>, RecordSet<Ipv4Addr>>,
+        CacheWithTtl<Box<str>, RecordSet<Ipv6Addr>>,
+        CacheWithTtl<IpAddr, RecordSet<Box<str>>>,
     > {
         Parameters {
             params,

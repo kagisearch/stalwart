@@ -11,6 +11,7 @@ use common::{
     config::smtp::auth::VerifyStrategy,
     network::{ServerInstance, asn::AsnGeoLookupResult},
 };
+use email::message::delivery::ORCPT_ADDR_TYPE;
 use mail_auth::{IprevOutput, SpfOutput};
 use smtp_proto::request::receiver::{
     BdatReceiver, DataReceiver, DummyDataReceiver, DummyLineReceiver, LineReceiver, RequestReceiver,
@@ -43,7 +44,7 @@ pub enum State {
     Bdat(BdatReceiver),
     Data(DataReceiver),
     Sasl(LineReceiver<SaslToken>),
-    DataTooLarge(DummyDataReceiver),
+    SkipData(DummyDataReceiver, &'static [u8]),
     RequestTooLarge(DummyLineReceiver),
     Accepted(QueueId),
     None,
@@ -304,5 +305,15 @@ impl SessionAddress {
             flags: 0,
             dsn_info: None,
         }
+    }
+
+    pub fn orig_address(&self) -> &str {
+        self.dsn_info.as_deref().unwrap_or(&self.address_lcase)
+    }
+
+    pub fn orcpt_parameter(&self) -> Option<String> {
+        self.dsn_info
+            .as_deref()
+            .map(|orcpt| format!("{ORCPT_ADDR_TYPE}{}", orcpt.to_lowercase()))
     }
 }

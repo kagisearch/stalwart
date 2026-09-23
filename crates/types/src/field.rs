@@ -79,6 +79,7 @@ pub enum IdentityField {
 pub enum PrincipalField {
     Archive = ARCHIVE_FIELD,
     ParticipantIdentities = 45,
+    IdentityAddresses = 110,
     DefaultCalendarId = 47,
     DefaultAddressBookId = 48,
     ActiveScriptId = 49,
@@ -158,6 +159,7 @@ impl From<PrincipalField> for u8 {
     fn from(value: PrincipalField) -> Self {
         match value {
             PrincipalField::ParticipantIdentities => 45,
+            PrincipalField::IdentityAddresses => 110,
             PrincipalField::DefaultCalendarId => 47,
             PrincipalField::DefaultAddressBookId => 48,
             PrincipalField::ActiveScriptId => 49,

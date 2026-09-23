@@ -5,6 +5,7 @@
  */
 
 use crate::api::acl::{JmapAcl, JmapRights};
+use crate::changes::state::JmapCacheState;
 use common::{Server, auth::AccessToken, sharing::EffectiveAcl};
 use groupware::{
     DestroyArchive,
@@ -20,7 +21,7 @@ use jmap_proto::{
     types::state::State,
 };
 use jmap_tools::{JsonPointerItem, Key, Value};
-use rand::{Rng, distr::Alphanumeric};
+use rand::{RngExt, distr::Alphanumeric};
 use store::{
     SerializeInfallible, ValueKey,
     ahash::AHashSet,
@@ -58,7 +59,8 @@ impl AddressBookSet for Server {
                 SyncCollection::AddressBook,
             )
             .await?;
-        let mut response = SetResponse::from_request(&request, self.core.jmap.set_max_objects)?;
+        let mut response = SetResponse::from_request(&request, self.core.jmap.set_max_objects)?
+            .with_state(cache.assert_state(true, &request.if_in_state)?);
         let will_destroy = response.collect_will_destroy(request.unwrap_destroy());
         let is_shared = access_token.is_shared(account_id);
         let mut set_default = None;
@@ -90,7 +92,9 @@ impl AddressBookSet for Server {
             };
 
             // Process changes
-            if let Err(err) = update_address_book(None, object, &mut address_book, account_id) {
+            if let Err(err) =
+                update_address_book(None, object, &mut address_book, access_token, account_id)
+            {
                 response.not_created.append(id, err);
                 continue 'create;
             }
@@ -171,14 +175,19 @@ impl AddressBookSet for Server {
                 .caused_by(trc::location!())?;
 
             // Apply changes
-            let has_acl_changes =
-                match update_address_book(Some(id), object, &mut new_address_book, account_id) {
-                    Ok(has_acl_changes_) => has_acl_changes_,
-                    Err(err) => {
-                        response.not_updated.append(id, err);
-                        continue 'update;
-                    }
-                };
+            let has_acl_changes = match update_address_book(
+                Some(id),
+                object,
+                &mut new_address_book,
+                access_token,
+                account_id,
+            ) {
+                Ok(has_acl_changes_) => has_acl_changes_,
+                Err(err) => {
+                    response.not_updated.append(id, err);
+                    continue 'update;
+                }
+            };
 
             // Validate ACL
             if is_shared {
@@ -409,8 +418,10 @@ fn update_address_book(
     expected_id: Option<Id>,
     updates: Value<'_, AddressBookProperty, AddressBookValue>,
     address_book: &mut AddressBook,
+    access_token: &AccessToken,
     account_id: u32,
 ) -> Result<bool, SetError<AddressBookProperty>> {
+    let personal_id = access_token.personal_id(account_id, Collection::AddressBook);
     let mut has_acl_changes = false;
 
     for (property, value) in updates.into_expanded_object() {
@@ -422,24 +433,24 @@ fn update_address_book(
 
         match (property, value) {
             (AddressBookProperty::Name, Value::Str(value)) if (1..=255).contains(&value.len()) => {
-                address_book.preferences_mut(account_id).name = value.into_owned();
+                address_book.preferences_mut(personal_id).name = value.into_owned();
             }
             (AddressBookProperty::Description, Value::Str(value)) if value.len() < 255 => {
-                address_book.preferences_mut(account_id).description = value.into_owned().into();
+                address_book.preferences_mut(personal_id).description = value.into_owned().into();
             }
             (AddressBookProperty::Description, Value::Null) => {
-                address_book.preferences_mut(account_id).description = None;
+                address_book.preferences_mut(personal_id).description = None;
             }
             (AddressBookProperty::SortOrder, Value::Number(value)) => {
-                address_book.preferences_mut(account_id).sort_order = value.cast_to_u64() as u32;
+                address_book.preferences_mut(personal_id).sort_order = value.cast_to_u64() as u32;
             }
             (AddressBookProperty::IsSubscribed, Value::Bool(subscribe)) => {
                 if subscribe {
-                    if !address_book.subscribers.contains(&account_id) {
-                        address_book.subscribers.push(account_id);
+                    if !address_book.subscribers.contains(&personal_id) {
+                        address_book.subscribers.push(personal_id);
                     }
                 } else {
-                    address_book.subscribers.retain(|id| *id != account_id);
+                    address_book.subscribers.retain(|id| *id != personal_id);
                 }
             }
             (AddressBookProperty::ShareWith, value) => {
@@ -480,7 +491,7 @@ fn update_address_book(
     }
 
     // Validate name
-    if address_book.preferences(account_id).name.is_empty() {
+    if address_book.preferences(personal_id).name.is_empty() {
         return Err(SetError::invalid_properties()
             .with_property(AddressBookProperty::Name)
             .with_description("Missing name."));

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use ahash::AHashMap;
 use mail_auth::{
     MessageAuthenticator,
     hickory_resolver::{
@@ -25,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fmt::Display,
     hash::{DefaultHasher, Hash, Hasher},
+    net::IpAddr,
     str::FromStr,
     sync::Arc,
 };
@@ -139,6 +141,7 @@ impl Resolvers {
             },
             DnsResolver::Custom(resolver) => {
                 resolver_config = ResolverConfig::default();
+                let mut nameservers: AHashMap<IpAddr, Vec<ConnectionConfig>> = AHashMap::new();
 
                 for server in resolver.servers {
                     let ip = server.address.into_inner();
@@ -152,11 +155,11 @@ impl Resolvers {
                     };
                     let mut connection = ConnectionConfig::new(protocol);
                     connection.port = port;
-                    resolver_config.add_name_server(NameServerConfig::new(
-                        ip,
-                        true,
-                        vec![connection],
-                    ));
+                    nameservers.entry(ip).or_default().push(connection);
+                }
+
+                for (ip, connections) in nameservers {
+                    resolver_config.add_name_server(NameServerConfig::new(ip, true, connections));
                 }
 
                 opts.num_concurrent_reqs = resolver.concurrency as usize;
@@ -211,6 +214,7 @@ impl Resolvers {
         let config_dnssec = resolver_config.clone();
         let mut opts_dnssec = opts.clone();
         opts_dnssec.validate = true;
+        opts_dnssec.num_concurrent_reqs = 1;
 
         let dnssec = DnssecResolver {
             resolver: TokioResolver::builder_with_config(
@@ -223,19 +227,24 @@ impl Resolvers {
         };
 
         Resolvers {
-            dns: MessageAuthenticator::new(resolver_config, opts).unwrap(),
             #[cfg(not(feature = "test_mode"))]
-            dnssec_available: dnssec_capable(&dnssec.resolver).await,
+            dnssec_available: ensure_dnssec(&resolver_config, &dnssec.resolver).await,
             #[cfg(feature = "test_mode")]
             dnssec_available: true,
+            dns: MessageAuthenticator::new(resolver_config, opts).unwrap(),
             dnssec,
         }
     }
 }
 
 #[cfg(not(feature = "test_mode"))]
-async fn dnssec_capable(resolver: &TokioResolver) -> bool {
-    resolver
+async fn ensure_dnssec(config: &ResolverConfig, resolver: &TokioResolver) -> bool {
+    config.name_servers().iter().any(|name_server| {
+        name_server
+            .connections
+            .iter()
+            .any(|connection| !matches!(connection.protocol, ProtocolConfig::Udp))
+    }) && resolver
         .lookup(
             hickory_proto::rr::Name::root(),
             hickory_proto::rr::RecordType::DNSKEY,
@@ -252,6 +261,11 @@ async fn dnssec_capable(resolver: &TokioResolver) -> bool {
 impl Policy {
     pub async fn try_parse(bp: &mut Bootstrap) -> Option<Self> {
         let mta = bp.setting_infallible::<MtaSts>().await;
+
+        if matches!(mta.mode, PolicyEnforcement::Disable) {
+            return None;
+        }
+
         let mut mx_hosts = mta.mx_hosts.into_inner();
 
         if mx_hosts.is_empty() {
@@ -330,6 +344,7 @@ impl Default for Resolvers {
         let config_dnssec = config.clone();
         let mut opts_dnssec = opts.clone();
         opts_dnssec.validate = true;
+        opts_dnssec.num_concurrent_reqs = 1;
 
         Self {
             dns: MessageAuthenticator::new(config, opts).expect("Failed to build DNS resolver"),
@@ -354,7 +369,7 @@ impl Display for Policy {
         match self.mode {
             Mode::Enforce => f.write_str("enforce")?,
             Mode::Testing => f.write_str("testing")?,
-            Mode::None => unreachable!(),
+            Mode::None => f.write_str("none")?,
         }
         f.write_str("\r\nmax_age: ")?;
         self.max_age.fmt(f)?;

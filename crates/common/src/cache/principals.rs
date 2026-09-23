@@ -15,7 +15,7 @@ use crate::{
         DomainCache, EmailAddress, EmailAddressRef, EmailCache, MailingListCache, PermissionsGroup,
         RECOVERY_ADMIN_ID, RoleCache, TenantCache, permissions::BuildPermissions,
     },
-    config::smtp::auth::DkimSigner,
+    config::smtp::auth::DkimSigners,
     expr::if_block::BootstrapExprExt,
     network::mta::AddressResolver,
     storage::{
@@ -68,7 +68,7 @@ impl Server {
         } else {
             let domain_names_negative = &self.inner.cache.domain_names_negative;
             if domain_names_negative.get(domain).is_none() {
-                if let Some(domain) = self
+                let mut object = self
                     .registry()
                     .primary_key(
                         ObjectType::Domain.into(),
@@ -76,8 +76,20 @@ impl Server {
                         domain.as_bytes().to_vec(),
                     )
                     .await
-                    .caused_by(trc::location!())?
-                {
+                    .caused_by(trc::location!())?;
+                if object.is_none() {
+                    object = self
+                        .registry()
+                        .primary_key(
+                            ObjectType::Domain.into(),
+                            Property::Aliases,
+                            domain.as_bytes().to_vec(),
+                        )
+                        .await
+                        .caused_by(trc::location!())?;
+                }
+
+                if let Some(domain) = object {
                     // Cache positive result
                     let domain_id = domain.id().document_id();
                     let domain = self.domain_by_id(domain_id).await?;
@@ -146,6 +158,15 @@ impl Server {
                 if domain.allow_relaying {
                     flags |= DOMAIN_FLAG_RELAY;
                 }
+
+                // SPDX-SnippetBegin
+                // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                // SPDX-License-Identifier: LicenseRef-SEL
+                if domain.allow_scim_provisioning {
+                    flags |= crate::auth::DOMAIN_FLAG_SCIM_PROVISIONING;
+                }
+                // SPDX-SnippetEnd
+
                 let sub_addressing_custom = match domain.sub_addressing {
                     SubAddressing::Enabled => {
                         flags |= DOMAIN_FLAG_SUB_ADDRESSING;
@@ -300,6 +321,7 @@ impl Server {
     }
 
     pub async fn rcpt_id_from_email(&self, address: &str) -> trc::Result<Option<EmailCache>> {
+        let address = address.to_canonical_address();
         if let Some((local_part, domain)) = address.split_once('@') {
             if let Some(domain) = self.domain(domain).await? {
                 // Sub-addressing resolution, matching rcpt_resolve and
@@ -607,6 +629,7 @@ impl Server {
         address: &str,
         resolve: bool,
     ) -> trc::Result<Option<u32>> {
+        let address = address.to_canonical_address();
         if let Some((local_part, domain)) = address.split_once('@') {
             if let Some(domain) = self.domain(domain).await? {
                 let mut local_part = Cow::Borrowed(local_part);
@@ -680,6 +703,28 @@ impl Server {
     pub async fn account_info(&self, id: u32) -> trc::Result<AccountInfo> {
         let account = self.account(id).await?;
         self.build_account_info(account).await
+    }
+
+    pub async fn scheduling_account_info(
+        &self,
+        authenticated_account_id: u32,
+        owner_account_id: u32,
+    ) -> trc::Result<AccountInfo> {
+        let account = self.account(authenticated_account_id).await?;
+        let mut account_info = self.build_account_info(account).await?;
+
+        if owner_account_id != authenticated_account_id {
+            let owner_account = self.account(owner_account_id).await?;
+            let owner_account_info = self.build_account_info(owner_account).await?;
+
+            for address in owner_account_info.addresses {
+                if !account_info.addresses.contains(&address) {
+                    account_info.addresses.push(address);
+                }
+            }
+        }
+
+        Ok(account_info)
     }
 
     pub async fn build_account_info(&self, account: Arc<AccountCache>) -> trc::Result<AccountInfo> {
@@ -870,7 +915,7 @@ impl Server {
         }
     }
 
-    pub async fn dkim_signers(&self, domain: &str) -> trc::Result<Option<Arc<[DkimSigner]>>> {
+    pub async fn dkim_signers(&self, domain: &str) -> trc::Result<Option<Arc<DkimSigners>>> {
         let Some(domain) = self.domain(domain).await? else {
             return Ok(None);
         };
@@ -899,26 +944,24 @@ impl Server {
                             .equal(Property::DomainId, domain.id),
                     )
                     .await?;
-                let mut signatures = Vec::with_capacity(ids.len());
+                let domain_name = &domain.names[0];
+                let mut signers = DkimSigners {
+                    dkim1: Vec::with_capacity(ids.len()),
+                    dkim2: None,
+                };
                 for id in ids {
                     if let Some(signature) = self.registry().object::<DkimSignature>(id).await?
                         && matches!(signature.stage(), DkimRotationStage::Active)
+                        && let Err(err) = signers.insert(domain_name.to_string(), signature).await
                     {
-                        match DkimSigner::new(domain.names[0].to_string(), signature).await {
-                            Ok(signer) => signatures.push(signer),
-                            Err(err) => {
-                                trc::error!(
-                                    err.ctx(trc::Key::Id, id.id()).caused_by(trc::location!())
-                                );
-                            }
-                        }
+                        trc::error!(err.ctx(trc::Key::Id, id.id()).caused_by(trc::location!()));
                     }
                 }
 
-                if !signatures.is_empty() {
-                    let signatures: Arc<[DkimSigner]> = signatures.into();
-                    let _ = guard.insert(signatures.clone());
-                    Ok(Some(signatures))
+                if !signers.dkim1.is_empty() || signers.dkim2.is_some() {
+                    let signers = Arc::new(signers);
+                    let _ = guard.insert(signers.clone());
+                    Ok(Some(signers))
                 } else {
                     Ok(None)
                 }

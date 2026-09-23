@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{MysqlStore, into_error};
+use super::{MysqlStore, into_error, is_timeout_error};
 use crate::{Deserialize, IterateParams, Key, ValueKey, write::ValueClass};
 use futures::TryStreamExt;
 use mysql_async::{Row, prelude::Queryable};
@@ -83,40 +83,69 @@ impl MysqlStore {
             })
             .await
             .map_err(into_error)?;
-        let mut rows = conn
-            .exec_stream::<Row, _, _>(&s, (begin, end))
-            .await
-            .map_err(into_error)?;
+        let mut from = begin;
+        let mut to = end;
+        let mut resume_key = None;
 
-        if params.values {
-            while let Some(mut row) = rows.try_next().await.map_err(into_error)? {
-                let value = row
-                    .take_opt::<Vec<u8>, _>(1)
-                    .unwrap_or_else(|| Ok(vec![]))
-                    .map_err(into_error)?;
-                let key = row
-                    .take_opt::<Vec<u8>, _>(0)
-                    .unwrap_or_else(|| Ok(vec![]))
+        loop {
+            let mut last_key = None;
+            let mut timed_out = false;
+
+            {
+                let mut rows = conn
+                    .exec_stream::<Row, _, _>(&s, (from.clone(), to.clone()))
+                    .await
                     .map_err(into_error)?;
 
-                if !cb(&key, &value)? {
-                    break;
+                loop {
+                    match rows.try_next().await {
+                        Ok(Some(mut row)) => {
+                            let value = if params.values {
+                                row.take_opt::<Vec<u8>, _>(1)
+                                    .unwrap_or_else(|| Ok(vec![]))
+                                    .map_err(into_error)?
+                            } else {
+                                vec![]
+                            };
+                            let key = row
+                                .take_opt::<Vec<u8>, _>(0)
+                                .unwrap_or_else(|| Ok(vec![]))
+                                .map_err(into_error)?;
+
+                            if resume_key.take().is_some_and(|resumed| resumed == key) {
+                                continue;
+                            }
+
+                            if !cb(&key, &value)? {
+                                return Ok(());
+                            }
+
+                            last_key = Some(key);
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            if params.first || last_key.is_none() || !is_timeout_error(&err) {
+                                return Err(into_error(err));
+                            }
+                            timed_out = true;
+                            break;
+                        }
+                    }
                 }
             }
-        } else {
-            while let Some(mut row) = rows.try_next().await.map_err(into_error)? {
-                if !cb(
-                    &row.take_opt::<Vec<u8>, _>(0)
-                        .unwrap_or_else(|| Ok(vec![]))
-                        .map_err(into_error)?,
-                    b"",
-                )? {
-                    break;
+
+            match last_key {
+                Some(last_key) if timed_out => {
+                    if params.ascending {
+                        from.clone_from(&last_key);
+                    } else {
+                        to.clone_from(&last_key);
+                    }
+                    resume_key = Some(last_key);
                 }
+                _ => return Ok(()),
             }
         }
-
-        Ok(())
     }
 
     pub(crate) async fn get_counter(

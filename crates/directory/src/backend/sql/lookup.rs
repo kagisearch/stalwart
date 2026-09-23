@@ -22,6 +22,12 @@ impl SqlDirectory {
                     .details("Unsupported credentials type for SQL authentication"));
             }
         };
+        if secret.is_empty() {
+            return Err(trc::AuthEvent::Failed
+                .into_err()
+                .details("Empty secret rejected")
+                .ctx(trc::Key::AccountName, username.to_string()));
+        }
 
         let Recipient::Account(mut account) = self.mappings.row_to_account(
             self.sql_store
@@ -52,6 +58,7 @@ impl SqlDirectory {
 
         // Obtain members
         if let Some(query) = &self.mappings.query_member_of {
+            let members = account.groups.get_or_insert_default();
             for row in self
                 .sql_store
                 .sql_query::<Rows>(query, vec![username.into()])
@@ -62,7 +69,7 @@ impl SqlDirectory {
                 if let Some(Value::Text(address)) = row.values.first()
                     && let Some(email) = sanitize_email(address)
                 {
-                    account.groups.push(email);
+                    members.push(email);
                 }
             }
         }
@@ -103,6 +110,7 @@ impl SqlDirectory {
             Recipient::Account(mut account) => {
                 // Obtain members
                 if let Some(query) = &self.mappings.query_member_of {
+                    let members = account.groups.get_or_insert_default();
                     for row in self
                         .sql_store
                         .sql_query::<Rows>(query, vec![account.email.as_str().into()])
@@ -113,7 +121,7 @@ impl SqlDirectory {
                         if let Some(Value::Text(address)) = row.values.first()
                             && let Some(email) = sanitize_email(address)
                         {
-                            account.groups.push(email);
+                            members.push(email);
                         }
                     }
                 }
@@ -161,7 +169,9 @@ impl SqlMappings {
                         account.email = email;
                     }
                 } else if name.eq_ignore_ascii_case(&self.column_secret) {
-                    if let Value::Text(text) = value {
+                    if let Value::Text(text) = value
+                        && !text.is_empty()
+                    {
                         account.secret = Some(text.into_owned());
                     }
                 } else if let Some(column_type) = &self.column_type
@@ -171,6 +181,7 @@ impl SqlMappings {
                 } else if let Some(column_description) = &self.column_description
                     && name.eq_ignore_ascii_case(column_description)
                     && let Value::Text(text) = value
+                    && !text.is_empty()
                 {
                     account.description = Some(text.into_owned());
                 }

@@ -15,7 +15,7 @@ use std::{
 use store::{
     SearchStore,
     ahash::AHashMap,
-    rand::{self, Rng, distr::Alphanumeric},
+    rand::{self, RngExt, distr::Alphanumeric},
     roaring::RoaringBitmap,
     search::{
         EmailSearchField, IndexDocument, SearchComparator, SearchField, SearchFilter,
@@ -375,6 +375,7 @@ pub async fn test(test: &TestServer) {
 
 async fn test_filter(store: SearchStore, fields: &AHashMap<u32, String>, mask: &RoaringBitmap) {
     let can_stem = !store.is_mysql();
+    let can_negate_text = !store.is_meilisearch();
 
     let tests = [
         (
@@ -532,6 +533,10 @@ async fn test_filter(store: SearchStore, fields: &AHashMap<u32, String>, mask: &
     ];
 
     for (filters, expected_results) in tests {
+        if !can_negate_text && has_negated_text(&filters) {
+            continue;
+        }
+
         //println!("Running test: {:?}", filter);
         let ids = store
             .query_account(
@@ -549,6 +554,38 @@ async fn test_filter(store: SearchStore, fields: &AHashMap<u32, String>, mask: &
         }
         assert_eq!(results, expected_results);
     }
+}
+
+fn has_negated_text(filters: &[SearchFilter]) -> bool {
+    let mut stack = Vec::new();
+    let mut negated = 0;
+
+    for filter in filters {
+        match filter {
+            SearchFilter::Not => {
+                stack.push(true);
+                negated += 1;
+            }
+            SearchFilter::And | SearchFilter::Or => {
+                stack.push(false);
+            }
+            SearchFilter::End => {
+                if stack.pop().unwrap_or(false) {
+                    negated -= 1;
+                }
+            }
+            SearchFilter::Operator {
+                op: SearchOperator::Equal | SearchOperator::Contains,
+                value: SearchValue::Text { .. },
+                ..
+            } if negated > 0 => {
+                return true;
+            }
+            _ => (),
+        }
+    }
+
+    false
 }
 
 async fn test_sort(store: SearchStore, fields: &AHashMap<u32, String>, mask: &RoaringBitmap) {

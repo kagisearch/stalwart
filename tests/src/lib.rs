@@ -6,10 +6,10 @@
 
 #[cfg(test)]
 use ::store::registry::bootstrap::Bootstrap;
-#[cfg(not(target_env = "msvc"))]
-use jemallocator::Jemalloc;
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+use tikv_jemallocator::Jemalloc;
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
@@ -23,6 +23,8 @@ pub mod directory;
 pub mod imap;
 #[cfg(test)]
 pub mod jmap;
+#[cfg(test)]
+pub mod scim;
 #[cfg(test)]
 pub mod smtp;
 #[cfg(test)]

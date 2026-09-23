@@ -15,11 +15,13 @@ use crate::{
 use proxy_header::io::ProxiedStream;
 use rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256;
 use std::{
+    io,
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 use store::registry::bootstrap::Bootstrap;
-use tokio::{net::TcpStream, sync::watch};
+use tokio::{net::TcpStream, sync::watch, time::timeout};
 use tokio_rustls::server::TlsStream;
 use trc::{EventType, HttpEvent, ImapEvent, ManageSieveEvent, Pop3Event, SmtpEvent};
 use utils::UnwrapFailure;
@@ -38,6 +40,7 @@ impl Listener {
             protocol: self.protocol,
             proxy_networks: self.proxy_networks,
             limiter: ConcurrencyLimiter::new(self.max_connections),
+            tls_timeout: self.tls_timeout,
             acceptor,
             shutdown_rx,
             span_id_gen: self.span_id_gen,
@@ -112,11 +115,17 @@ impl Listener {
                     ),
                 };
 
+                const ACCEPT_BACKOFF: Duration = Duration::from_millis(5);
+                const MAX_ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
+                let mut accept_backoff = ACCEPT_BACKOFF;
+
                 loop {
                     tokio::select! {
                         stream = listener.accept() => {
                             match stream {
                                 Ok((stream, remote_addr)) => {
+                                    accept_backoff = ACCEPT_BACKOFF;
+
                                     let server = inner.build_server();
                                     let enable_acme = (is_https && server.has_acme_tls_providers()).then(|| server.clone());
 
@@ -130,10 +139,20 @@ impl Listener {
                                         tokio::spawn(async move {
                                             match ProxiedStream::create_from_tokio(stream, Default::default()).await {
                                                 Ok(stream) =>{
-                                                    let remote_addr = stream.proxy_header()
+                                                    let (remote_addr, local_addr) = stream.proxy_header()
                                                                             .proxied_address()
-                                                                            .map(|addr| addr.source)
-                                                                            .unwrap_or(remote_addr);
+                                                                            .map(|addr| {
+                                                                                let local_addr = match addr.destination.ip() {
+                                                                                    IpAddr::V6(ip) => ip
+                                                                                        .to_ipv4_mapped()
+                                                                                        .map(|ip| SocketAddr::new(IpAddr::V4(ip), addr.destination.port()))
+                                                                                        .unwrap_or(addr.destination),
+                                                                                    _ => addr.destination,
+                                                                                };
+
+                                                                                (addr.source, local_addr)
+                                                                            })
+                                                                            .unwrap_or((remote_addr, local_addr));
                                                     if let Some(session) = instance.build_session(stream, local_addr, remote_addr, &server) {
                                                         // Spawn session
                                                         manager.spawn(session, is_tls, enable_acme, span_start, span_end);
@@ -160,6 +179,15 @@ impl Listener {
                                     }
                                 }
                                 Err(err) => {
+                                    if matches!(
+                                        err.kind(),
+                                        std::io::ErrorKind::ConnectionAborted
+                                            | std::io::ErrorKind::ConnectionReset
+                                            | std::io::ErrorKind::Interrupted
+                                    ) {
+                                        continue;
+                                    }
+
                                     trc::event!(
                                         Network(trc::NetworkEvent::AcceptError),
                                         ListenerId = instance.id.clone(),
@@ -168,6 +196,16 @@ impl Listener {
                                         Tls = is_tls,
                                         Reason = err.to_string(),
                                     );
+
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(accept_backoff) => {}
+                                        _ = shutdown_rx.changed() => {
+                                            manager.shutdown().await;
+                                            break;
+                                        }
+                                    }
+
+                                    accept_backoff = (accept_backoff * 2).min(MAX_ACCEPT_BACKOFF);
                                 }
                             }
                         },
@@ -349,41 +387,46 @@ impl ServerInstance {
         session_id: u64,
     ) -> Result<TlsStream<T>, ()> {
         match &self.acceptor {
-            TcpAcceptor::Tls { acceptor, .. } => match acceptor.accept(stream).await {
-                Ok(stream) => {
-                    trc::event!(
-                        Tls(trc::TlsEvent::Handshake),
-                        ListenerId = self.id.clone(),
-                        SpanId = session_id,
-                        Version = format!(
-                            "{:?}",
-                            stream
-                                .get_ref()
-                                .1
-                                .protocol_version()
-                                .unwrap_or(rustls::ProtocolVersion::TLSv1_3)
-                        ),
-                        Details = format!(
-                            "{:?}",
-                            stream
-                                .get_ref()
-                                .1
-                                .negotiated_cipher_suite()
-                                .unwrap_or(TLS13_AES_128_GCM_SHA256)
-                        )
-                    );
-                    Ok(stream)
+            TcpAcceptor::Tls { acceptor, .. } => {
+                match timeout(self.tls_timeout, acceptor.accept(stream))
+                    .await
+                    .unwrap_or_else(|_| Err(io::Error::from(io::ErrorKind::TimedOut)))
+                {
+                    Ok(stream) => {
+                        trc::event!(
+                            Tls(trc::TlsEvent::Handshake),
+                            ListenerId = self.id.clone(),
+                            SpanId = session_id,
+                            Version = format!(
+                                "{:?}",
+                                stream
+                                    .get_ref()
+                                    .1
+                                    .protocol_version()
+                                    .unwrap_or(rustls::ProtocolVersion::TLSv1_3)
+                            ),
+                            Details = format!(
+                                "{:?}",
+                                stream
+                                    .get_ref()
+                                    .1
+                                    .negotiated_cipher_suite()
+                                    .unwrap_or(TLS13_AES_128_GCM_SHA256)
+                            )
+                        );
+                        Ok(stream)
+                    }
+                    Err(err) => {
+                        trc::event!(
+                            Tls(trc::TlsEvent::HandshakeError),
+                            ListenerId = self.id.clone(),
+                            SpanId = session_id,
+                            Reason = err.to_string(),
+                        );
+                        Err(())
+                    }
                 }
-                Err(err) => {
-                    trc::event!(
-                        Tls(trc::TlsEvent::HandshakeError),
-                        ListenerId = self.id.clone(),
-                        SpanId = session_id,
-                        Reason = err.to_string(),
-                    );
-                    Err(())
-                }
-            },
+            }
             TcpAcceptor::Plain => {
                 trc::event!(
                     Tls(trc::TlsEvent::NotConfigured),

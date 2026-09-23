@@ -50,6 +50,29 @@ impl Server {
                             .ctx(trc::Key::AccountName, account.email.clone())
                             .ctx(trc::Key::AccountId, account_id)
                     })?;
+                // SPDX-SnippetBegin
+                // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                // SPDX-License-Identifier: LicenseRef-SEL
+                #[cfg(feature = "enterprise")]
+                if domain.allows_scim_provisioning() && self.core.is_enterprise_edition() {
+                    return Account::from(current_account)
+                        .into_user()
+                        .map(|account| AccountWithId {
+                            id: account_id,
+                            account: Account::User(account),
+                        })
+                        .ok_or_else(|| {
+                            trc::AuthEvent::Error
+                                .into_err()
+                                .details(
+                                    "Account ID from directory does not correspond to a user account",
+                                )
+                                .ctx(trc::Key::AccountName, account.email.clone())
+                                .ctx(trc::Key::AccountId, account_id)
+                        });
+                }
+                // SPDX-SnippetEnd
+
                 let mut updated_account = Account::from(current_account.clone())
                     .into_user()
                     .ok_or_else(|| {
@@ -61,6 +84,7 @@ impl Server {
                             .ctx(trc::Key::AccountName, account.email.clone())
                             .ctx(trc::Key::AccountId, account_id)
                     })?;
+
                 let mut has_changes = false;
                 if let Some(secret) = account.secret
                     && secret != updated_account.password().unwrap_or_default()
@@ -91,27 +115,28 @@ impl Server {
                         has_changes = true;
                     }
                 }
-                let mut member_group_ids = Vec::with_capacity(account.groups.len());
-                for email in account.groups {
-                    member_group_ids.push(
-                        self.synchronize_group(directory::Group {
-                            email,
-                            ..Default::default()
-                        })
-                        .await
-                        .caused_by(trc::location!())?
-                        .into(),
-                    );
-                }
-                if !member_group_ids.is_empty()
-                    && ((updated_account.member_group_ids.len() != member_group_ids.len())
+                if let Some(groups) = account.groups {
+                    let mut member_group_ids = Vec::with_capacity(groups.len());
+                    for email in groups {
+                        member_group_ids.push(
+                            self.synchronize_group(directory::Group {
+                                email,
+                                ..Default::default()
+                            })
+                            .await
+                            .caused_by(trc::location!())?
+                            .into(),
+                        );
+                    }
+                    if updated_account.member_group_ids.len() != member_group_ids.len()
                         || !updated_account
                             .member_group_ids
                             .iter()
-                            .all(|id| member_group_ids.contains(id)))
-                {
-                    updated_account.member_group_ids = member_group_ids.into();
-                    has_changes = true;
+                            .all(|id| member_group_ids.contains(id))
+                    {
+                        updated_account.member_group_ids = member_group_ids.into();
+                        has_changes = true;
+                    }
                 }
 
                 if has_changes {
@@ -152,6 +177,21 @@ impl Server {
                 }
             }
             None => {
+                // SPDX-SnippetBegin
+                // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                // SPDX-License-Identifier: LicenseRef-SEL
+                #[cfg(feature = "enterprise")]
+                if domain.allows_scim_provisioning() && self.core.is_enterprise_edition() {
+                    return Err(trc::AuthEvent::Error
+                        .into_err()
+                        .details(concat!(
+                            "Accounts in this domain are provisioned through SCIM, ",
+                            "just-in-time provisioning is disabled"
+                        ))
+                        .ctx(trc::Key::Domain, domain.name().to_string()));
+                }
+                // SPDX-SnippetEnd
+
                 let mut aliases = Vec::with_capacity(account.email_aliases.len());
                 for alias in account.email_aliases {
                     if let Some((local, alias_domain)) = self.validate_alias(&alias).await?
@@ -169,8 +209,8 @@ impl Server {
                         });
                     }
                 }
-                let mut member_group_ids = Vec::with_capacity(account.groups.len());
-                for email in account.groups {
+                let mut member_group_ids = Vec::new();
+                for email in account.groups.unwrap_or_default() {
                     member_group_ids.push(
                         self.synchronize_group(directory::Group {
                             email,
@@ -260,6 +300,28 @@ impl Server {
                             .ctx(trc::Key::AccountName, group.email.clone())
                             .ctx(trc::Key::AccountId, account_id)
                     })?;
+                // SPDX-SnippetBegin
+                // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                // SPDX-License-Identifier: LicenseRef-SEL
+                #[cfg(feature = "enterprise")]
+                if domain.allows_scim_provisioning() && self.core.is_enterprise_edition() {
+                    return if matches!(
+                        &current_account.inner,
+                        registry::schema::prelude::ObjectInner::Account(Account::Group(_))
+                    ) {
+                        Ok(account_id)
+                    } else {
+                        Err(trc::AuthEvent::Error
+                            .into_err()
+                            .details(
+                                "Account ID from directory does not correspond to a group account",
+                            )
+                            .ctx(trc::Key::AccountName, group.email.clone())
+                            .ctx(trc::Key::AccountId, account_id))
+                    };
+                }
+                // SPDX-SnippetEnd
+
                 let mut updated_account = Account::from(current_account.clone())
                     .into_group()
                     .ok_or_else(|| {
@@ -271,6 +333,7 @@ impl Server {
                             .ctx(trc::Key::AccountName, group.email.clone())
                             .ctx(trc::Key::AccountId, account_id)
                     })?;
+
                 let mut has_changes = false;
                 if group.description.is_some() && group.description != updated_account.description {
                     updated_account.description = group.description;
@@ -326,6 +389,21 @@ impl Server {
                 }
             }
             None => {
+                // SPDX-SnippetBegin
+                // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                // SPDX-License-Identifier: LicenseRef-SEL
+                #[cfg(feature = "enterprise")]
+                if domain.allows_scim_provisioning() && self.core.is_enterprise_edition() {
+                    return Err(trc::AuthEvent::Error
+                        .into_err()
+                        .details(concat!(
+                            "Groups in this domain are provisioned through SCIM, ",
+                            "just-in-time provisioning is disabled"
+                        ))
+                        .ctx(trc::Key::Domain, domain.name().to_string()));
+                }
+                // SPDX-SnippetEnd
+
                 let mut aliases = Vec::with_capacity(group.email_aliases.len());
                 for alias in group.email_aliases {
                     if let Some((local, alias_domain)) = self.validate_alias(&alias).await?

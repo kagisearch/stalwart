@@ -147,6 +147,7 @@ pub async fn wait_for_shutdown() {
 
 pub trait DomainPart {
     fn to_lowercase_address(&self, lower_local: bool) -> String;
+    fn to_canonical_address(&self) -> Cow<'_, str>;
     fn domain_part(&self) -> &str;
     fn try_domain_part(&self) -> Option<&str>;
     fn try_local_part(&self) -> Option<&str>;
@@ -185,6 +186,19 @@ impl<T: AsRef<str>> DomainPart for T {
         }
     }
 
+    fn to_canonical_address(&self) -> Cow<'_, str> {
+        let address = self.as_ref();
+
+        if address
+            .bytes()
+            .any(|ch| !ch.is_ascii() || ch.is_ascii_uppercase())
+        {
+            Cow::Owned(address.to_lowercase_address(true))
+        } else {
+            Cow::Borrowed(address)
+        }
+    }
+
     #[inline(always)]
     fn try_domain_part(&self) -> Option<&str> {
         self.as_ref().rsplit_once('@').map(|(_, d)| d)
@@ -207,10 +221,12 @@ impl<T: AsRef<str>> DomainPart for T {
     fn to_ascii_domain(&self) -> Option<Cow<'_, str>> {
         let domain = self.as_ref();
 
-        if domain.is_ascii() {
-            Some(Cow::Borrowed(domain))
-        } else {
+        if !domain.is_ascii() {
             idna::domain_to_ascii(domain).ok().map(Cow::Owned)
+        } else if domain.bytes().any(|ch| ch.is_ascii_uppercase()) {
+            Some(Cow::Owned(domain.to_ascii_lowercase()))
+        } else {
+            Some(Cow::Borrowed(domain))
         }
     }
 }
@@ -285,8 +301,14 @@ pub fn sanitize_email(email: &str) -> Option<String> {
 
     for ch in chars {
         match ch {
-            '.' | '-' | '_' => {
+            '.' => {
                 if !last_ch.is_alphanumeric() {
+                    return None;
+                }
+                result.push('.');
+            }
+            '-' | '_' => {
+                if last_ch == NIL_CHAR || last_ch == '.' {
                     return None;
                 }
                 result.push(ch);
@@ -416,7 +438,7 @@ pub fn is_valid_domain(domain: &str) -> bool {
         "private",
         "localdomain",
     ];
-    psl::domain(domain.as_bytes()).is_some_and(|d| d.suffix().typ().is_some())
+    (domain.contains('.') && psl::suffix(domain.as_bytes()).is_some_and(|s| s.typ().is_some()))
         || RESERVED_TLDS.contains(&domain)
         || domain
             .rsplit_once('.')
@@ -474,6 +496,29 @@ mod tests {
         assert_eq!(
             sanitize_email("user@example.com").as_deref(),
             Some("user@example.com")
+        );
+    }
+
+    #[test]
+    fn bare_public_suffix_domains_are_accepted() {
+        assert_eq!(
+            sanitize_email("user@gov.in").as_deref(),
+            Some("user@gov.in")
+        );
+        assert_eq!(sanitize_email("user@co.uk").as_deref(), Some("user@co.uk"));
+        assert_eq!(sanitize_email("user@com"), None);
+        assert_eq!(sanitize_email("user@example.invalidtld"), None);
+    }
+
+    #[test]
+    fn a_label_email_domains_are_accepted_and_idempotent() {
+        assert_eq!(
+            sanitize_email("user@xn--fsqu00a.com").as_deref(),
+            Some("user@xn--fsqu00a.com")
+        );
+        assert_eq!(
+            sanitize_email("User@例子.com").as_deref(),
+            sanitize_email("user@xn--fsqu00a.com").as_deref()
         );
     }
 

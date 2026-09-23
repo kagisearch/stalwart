@@ -208,7 +208,7 @@ impl StatusResponse {
         if !self.message.is_empty() {
             buf.extend_from_slice(b" \"");
             for ch in self.message.as_bytes() {
-                if [b'\"', b'\\'].contains(ch) {
+                if b"\"\\".contains(ch) {
                     buf.push(b'\\');
                 }
                 buf.push(*ch);
@@ -290,7 +290,7 @@ impl SerializeResponse for trc::Error {
             .unwrap_or_else(|| self.as_ref().message());
         buf.extend_from_slice(b" \"");
         for ch in message.as_bytes() {
-            if [b'\"', b'\\'].contains(ch) {
+            if b"\"\\".contains(ch) {
                 buf.push(b'\\');
             }
             buf.push(*ch);

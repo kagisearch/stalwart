@@ -78,6 +78,7 @@ pub enum BroadcastEvent {
     CacheInvalidateAll,
     CacheInvalidateNegative,
     MtaQueueStatus { is_running: bool },
+    QueueRefresh,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -103,6 +104,7 @@ pub enum CacheInvalidation {
         domain_id: u32,
         local_part_hash: u32,
     },
+    DomainNegative,
 }
 
 #[derive(Debug)]

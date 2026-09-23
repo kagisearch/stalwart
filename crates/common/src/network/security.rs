@@ -36,7 +36,10 @@ pub struct Security {
     pub allowed_ip_addresses: AHashSet<IpWithTtl<IpAddr>>,
     pub allowed_ip_networks: Vec<IpWithTtl<IpAddrOrMask>>,
     pub has_allowed_networks: bool,
-    pub blocked_ip_expiration: Option<u64>,
+    pub auth_ban_period: Option<u64>,
+    pub abuse_ban_period: Option<u64>,
+    pub loiter_ban_period: Option<u64>,
+    pub scan_ban_period: Option<u64>,
 
     pub http_banned_paths: Vec<MatchType>,
     pub scanner_fail_rate: Option<Rate>,
@@ -158,22 +161,30 @@ impl Security {
             ));
         }
 
+        let is_recovery_mode = bp.registry.is_recovery_mode();
         let security = bp.setting_infallible::<structs::Security>().await;
         let auth = bp.setting_infallible::<structs::Authentication>().await;
         Security {
             has_allowed_networks: !allowed_ip_networks.is_empty(),
             allowed_ip_addresses,
             allowed_ip_networks,
-            blocked_ip_expiration: security.auth_ban_period.map(|v| v.as_secs()),
-            auth_fail_rate: security.auth_ban_rate,
-            rcpt_fail_rate: security.abuse_ban_rate,
-            loiter_fail_rate: security.loiter_ban_rate,
-            http_banned_paths: security
-                .scan_ban_paths
-                .iter()
-                .map(|pattern| MatchType::Matches(GlobPattern::compile(pattern, true)))
-                .collect(),
-            scanner_fail_rate: security.scan_ban_rate,
+            auth_ban_period: security.auth_ban_period.map(|v| v.as_secs()),
+            abuse_ban_period: security.abuse_ban_period.map(|v| v.as_secs()),
+            loiter_ban_period: security.loiter_ban_period.map(|v| v.as_secs()),
+            scan_ban_period: security.scan_ban_period.map(|v| v.as_secs()),
+            auth_fail_rate: security.auth_ban_rate.filter(|_| !is_recovery_mode),
+            rcpt_fail_rate: security.abuse_ban_rate.filter(|_| !is_recovery_mode),
+            loiter_fail_rate: security.loiter_ban_rate.filter(|_| !is_recovery_mode),
+            http_banned_paths: if is_recovery_mode {
+                Vec::new()
+            } else {
+                security
+                    .scan_ban_paths
+                    .iter()
+                    .map(|pattern| MatchType::Matches(GlobPattern::compile(pattern, true)))
+                    .collect()
+            },
+            scanner_fail_rate: security.scan_ban_rate.filter(|_| !is_recovery_mode),
             default_role_ids_user: auth.default_user_role_ids.into_inner(),
             default_role_ids_group: auth.default_group_role_ids.into_inner(),
             default_role_ids_tenant: auth.default_tenant_role_ids.into_inner(),
@@ -189,6 +200,16 @@ impl Security {
                 PasswordStrength::Four => Score::Four,
             },
             password_default_expiration: auth.password_default_expiry.map(|v| v.as_secs()),
+        }
+    }
+
+    fn ban_period(&self, reason: BlockReason) -> Option<u64> {
+        match reason {
+            BlockReason::RcptToFailure => self.abuse_ban_period,
+            BlockReason::AuthFailure => self.auth_ban_period,
+            BlockReason::Loitering => self.loiter_ban_period,
+            BlockReason::PortScanning => self.scan_ban_period,
+            BlockReason::Manual | BlockReason::Other => None,
         }
     }
 }
@@ -304,7 +325,7 @@ impl Server {
             .core
             .network
             .security
-            .blocked_ip_expiration
+            .ban_period(reason)
             .map(|v| now + v);
         self.inner
             .data

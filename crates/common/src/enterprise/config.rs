@@ -183,6 +183,9 @@ impl Enterprise {
                 timeout: api.timeout.into_inner(),
                 tls_allow_invalid_certs: api.allow_invalid_certs,
                 default_temperature: api.temperature.into_inner(),
+                client: utils::http::http_client_builder(api.allow_invalid_certs)
+                    .build()
+                    .unwrap_or_default(),
             });
             ai_apis.insert(api.id.clone(), api.clone());
             ai_apis_ids.insert(id.id().id(), api);
@@ -258,12 +261,6 @@ impl Enterprise {
                 ObjectType::CalendarScheduling.singleton(),
                 Property::EmailTemplate,
             ),
-            (
-                sched.http_rsvp_template,
-                &mut enterprise.template_scheduling_web,
-                ObjectType::CalendarScheduling.singleton(),
-                Property::HttpRsvpTemplate,
-            ),
         ] {
             if let Some(template) = template {
                 match Template::parse(&template) {
@@ -274,6 +271,13 @@ impl Enterprise {
                 }
             }
         }
+
+        enterprise.template_scheduling_web = sched
+            .http_rsvp_template
+            .as_deref()
+            .map(|page| page.trim())
+            .filter(|page| !page.is_empty())
+            .map(Arc::from);
 
         Some(enterprise)
     }

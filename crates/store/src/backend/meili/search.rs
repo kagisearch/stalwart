@@ -4,15 +4,19 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use ahash::AHashSet;
-use serde_json::{Map, Value, json};
-
 use crate::{
-    backend::meili::{MeiliSearchResponse, MeiliSearchStore, main::assert_success},
+    backend::meili::{
+        MeiliDocumentsResponse, MeiliSearchResponse, MeiliSearchStore,
+        main::{MAX_TOTAL_HITS, assert_success},
+    },
     search::*,
     write::SearchIndex,
 };
+use ahash::AHashSet;
+use serde_json::{Map, Value, json};
 use std::fmt::{Display, Write};
+
+const MAX_SEARCH_RESULTS: usize = 10_000;
 
 impl MeiliSearchStore {
     pub async fn index(&self, documents: Vec<IndexDocument>) -> trc::Result<()> {
@@ -75,9 +79,12 @@ impl MeiliSearchStore {
     ) -> trc::Result<Vec<R>> {
         let filter_group = build_query(filters);
 
+        if filter_group.q.is_empty() && sort.is_empty() {
+            return self.fetch_documents(index, &filter_group.filter).await;
+        }
+
         let mut body = Map::new();
-        body.insert("limit".to_string(), Value::from(10_000));
-        body.insert("offset".to_string(), Value::from(0));
+        body.insert("limit".to_string(), Value::from(MAX_SEARCH_RESULTS));
         body.insert(
             "attributesToRetrieve".to_string(),
             Value::Array(vec![Value::String("id".to_string())]),
@@ -89,6 +96,23 @@ impl MeiliSearchStore {
 
         if !filter_group.q.is_empty() {
             body.insert("q".to_string(), Value::String(filter_group.q));
+            body.insert(
+                "matchingStrategy".to_string(),
+                Value::String("all".to_string()),
+            );
+
+            if !filter_group.search_on.is_empty() {
+                body.insert(
+                    "attributesToSearchOn".to_string(),
+                    Value::Array(
+                        filter_group
+                            .search_on
+                            .into_iter()
+                            .map(|field| Value::String(field.to_string()))
+                            .collect(),
+                    ),
+                );
+            }
         }
 
         if !sort.is_empty() {
@@ -108,33 +132,117 @@ impl MeiliSearchStore {
             }
         }
 
-        let resp = assert_success(
-            self.client
-                .post(format!(
-                    "{}/indexes/{}/search",
-                    self.url,
-                    index.index_name()
-                ))
-                .body(Value::Object(body).to_string())
-                .send()
-                .await,
-        )
-        .await?;
+        let url = format!("{}/indexes/{}/search", self.url, index.index_name());
+        let mut results = Vec::new();
+        let mut offset = 0;
 
-        let text = resp
-            .text()
-            .await
-            .map_err(|err| trc::StoreEvent::MeilisearchError.reason(err))?;
+        loop {
+            body.insert("offset".to_string(), Value::from(offset));
 
-        serde_json::from_str::<MeiliSearchResponse>(&text)
-            .map(|results| {
-                results
-                    .hits
-                    .into_iter()
-                    .map(|hit| R::from_u64(hit.id))
-                    .collect()
-            })
-            .map_err(|err| trc::StoreEvent::MeilisearchError.reason(err).details(text))
+            let resp = assert_success(
+                self.client
+                    .post(&url)
+                    .body(Value::Object(body.clone()).to_string())
+                    .send()
+                    .await,
+            )
+            .await?;
+
+            let text = resp
+                .text()
+                .await
+                .map_err(|err| trc::StoreEvent::MeilisearchError.reason(err))?;
+
+            let hits = serde_json::from_str::<MeiliSearchResponse>(&text)
+                .map_err(|err| {
+                    trc::StoreEvent::MeilisearchError
+                        .reason(err)
+                        .details(text.clone())
+                })?
+                .hits;
+
+            let total = hits.len();
+            results.extend(hits.into_iter().map(|hit| R::from_u64(hit.id)));
+
+            if total < MAX_SEARCH_RESULTS {
+                break;
+            }
+
+            offset += total;
+
+            if offset >= MAX_TOTAL_HITS as usize {
+                trc::event!(
+                    Store(trc::StoreEvent::MeilisearchError),
+                    Reason = "Search results were truncated",
+                    Collection = index.index_name(),
+                    Total = offset,
+                );
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
+    async fn fetch_documents<R: SearchDocumentId>(
+        &self,
+        index: SearchIndex,
+        filter: &str,
+    ) -> trc::Result<Vec<R>> {
+        let url = format!(
+            "{}/indexes/{}/documents/fetch",
+            self.url,
+            index.index_name()
+        );
+        let mut results = Vec::new();
+        let mut offset = 0;
+
+        loop {
+            let mut body = Map::new();
+            body.insert("limit".to_string(), Value::from(MAX_SEARCH_RESULTS));
+            body.insert("offset".to_string(), Value::from(offset));
+            body.insert(
+                "fields".to_string(),
+                Value::Array(vec![Value::String("id".to_string())]),
+            );
+
+            if !filter.is_empty() {
+                body.insert("filter".to_string(), Value::String(filter.to_string()));
+            }
+
+            let resp = assert_success(
+                self.client
+                    .post(&url)
+                    .body(Value::Object(body).to_string())
+                    .send()
+                    .await,
+            )
+            .await?;
+
+            let text = resp
+                .text()
+                .await
+                .map_err(|err| trc::StoreEvent::MeilisearchError.reason(err))?;
+
+            let documents = serde_json::from_str::<MeiliDocumentsResponse>(&text)
+                .map_err(|err| {
+                    trc::StoreEvent::MeilisearchError
+                        .reason(err)
+                        .details(text.clone())
+                })?
+                .results;
+
+            let total = documents.len();
+            results.extend(documents.into_iter().map(|hit| R::from_u64(hit.id)));
+
+            if total < MAX_SEARCH_RESULTS {
+                break;
+            }
+
+            offset += total;
+        }
+
+        Ok(results)
     }
 
     pub async fn unindex(&self, filter: SearchQuery) -> trc::Result<u64> {
@@ -171,6 +279,7 @@ impl MeiliSearchStore {
 struct FilterGroup {
     q: String,
     filter: String,
+    search_on: AHashSet<&'static str>,
 }
 
 fn build_query(filters: &[SearchFilter]) -> FilterGroup {
@@ -182,6 +291,7 @@ fn build_query(filters: &[SearchFilter]) -> FilterGroup {
     let mut is_first = true;
     let mut filter = String::new();
     let mut queries = AHashSet::new();
+    let mut search_on = AHashSet::new();
 
     for f in filters {
         match f {
@@ -198,6 +308,8 @@ fn build_query(filters: &[SearchFilter]) -> FilterGroup {
                             ""
                         }
                     };
+
+                    search_on.insert(field.field_name());
 
                     if matches!(op, SearchOperator::Equal) {
                         queries.insert(format!("{value:?}"));
@@ -315,7 +427,11 @@ fn build_query(filters: &[SearchFilter]) -> FilterGroup {
         }
     }
 
-    FilterGroup { q, filter }
+    FilterGroup {
+        q,
+        filter,
+        search_on,
+    }
 }
 
 impl SearchOperator {

@@ -12,7 +12,7 @@ use crate::{
     utils::{dns::DnsCache, server::TestServerBuilder},
 };
 use common::{config::smtp::queue::QueueName, ipc::QueueEvent};
-use mail_auth::MX;
+use mail_auth::{DnssecStatus, MX};
 use registry::{
     schema::{
         enums::NetworkListenerProtocol,
@@ -224,6 +224,7 @@ async fn smtp_delivery() {
                 .into_boxed_slice(),
                 preference: 10,
             }],
+            DnssecStatus::Secure,
             Instant::now() + Duration::from_secs(10),
         );
         local.server.ipv4_add(

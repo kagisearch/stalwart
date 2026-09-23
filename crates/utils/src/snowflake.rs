@@ -21,6 +21,8 @@ const NODE_ID_LEN: u64 = 9;
 const SEQUENCE_MASK: u64 = (1 << SEQUENCE_LEN) - 1;
 const NODE_ID_MASK: u64 = (1 << NODE_ID_LEN) - 1;
 
+pub const MAX_NODE_ID: u16 = NODE_ID_MASK as u16;
+
 const DEFAULT_EPOCH: u64 = 1632280000; // 52 years after UNIX_EPOCH
 
 static mut NODE_ID: u64 = 1;
@@ -63,8 +65,9 @@ impl SnowflakeIdGenerator {
         (SystemTime::UNIX_EPOCH + Duration::from_secs(DEFAULT_EPOCH))
             .elapsed()
             .ok()
-            .and_then(|elapsed| elapsed.checked_sub(period))
-            .map(|elapsed| (elapsed.as_millis() as u64) << (SEQUENCE_LEN + NODE_ID_LEN))
+            .map(|elapsed| {
+                (elapsed.saturating_sub(period).as_millis() as u64) << (SEQUENCE_LEN + NODE_ID_LEN)
+            })
     }
 
     pub fn from_timestamp(timestamp: u64) -> Option<u64> {
@@ -99,11 +102,9 @@ impl SnowflakeIdGenerator {
 
     #[inline(always)]
     pub fn past_id(&self, period: Duration) -> Option<u64> {
-        self.epoch
-            .elapsed()
-            .ok()
-            .and_then(|elapsed| elapsed.checked_sub(period))
-            .map(|elapsed| (elapsed.as_millis() as u64) << (SEQUENCE_LEN + NODE_ID_LEN))
+        self.epoch.elapsed().ok().map(|elapsed| {
+            (elapsed.saturating_sub(period).as_millis() as u64) << (SEQUENCE_LEN + NODE_ID_LEN)
+        })
     }
 
     pub fn is_valid(&self) -> bool {

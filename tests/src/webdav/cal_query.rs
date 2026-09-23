@@ -13,6 +13,7 @@ use groupware::{
     calendar::{CalendarEventData, alarm::ExpandAlarm, expand::CalendarEventExpansion},
 };
 use hyper::StatusCode;
+use std::str::FromStr;
 use store::write::serialize::rkyv_unarchive;
 use types::TimeRange;
 
@@ -176,6 +177,37 @@ pub async fn test(test: &TestServer) {
         remove_dtstamp(REPORT_11_RESPONSE)
     );
 
+    // Test 12: JMAP-style event stored with an entry-less VCALENDAR wrapper
+    client
+        .request("PUT", &rfc_file_name(9), ICAL_JMAP_NO_VERSION)
+        .await
+        .with_status(StatusCode::CREATED);
+    let response = client
+        .request("REPORT", &cal_path, REPORT_12)
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .with_hrefs([rfc_file_name(9).as_str()])
+        .into_propfind_response(None);
+    response
+        .properties(&rfc_file_name(9))
+        .calendar_data()
+        .is_not_empty();
+
+    // Test 13: Unbounded yearly recurrences are visible far beyond their first instance
+    client
+        .request("PUT", &rfc_file_name(10), ICAL_UNBOUNDED_YEARLY_ICS)
+        .await
+        .with_status(StatusCode::CREATED);
+    client
+        .request("REPORT", &cal_path, REPORT_13)
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .with_hrefs([rfc_file_name(10).as_str()])
+        .into_propfind_response(None)
+        .properties(&rfc_file_name(10))
+        .calendar_data()
+        .is_not_empty();
+
     client.delete_default_containers().await;
     test.assert_is_empty().await;
 }
@@ -220,8 +252,7 @@ fn roundtrip_expansion(ics: &str, ignore_errors: bool) {
     let mut events = expanded
         .events
         .into_iter()
-        .enumerate()
-        .map(|(i, e)| {
+        .map(|e| {
             let e = e.try_into_date_time().unwrap();
             let start = e.start.timestamp();
             let end = e.end.timestamp();
@@ -251,9 +282,10 @@ fn roundtrip_expansion(ics: &str, ignore_errors: bool) {
             }
             CalendarEventExpansion {
                 comp_id: e.comp_id,
-                expansion_id: i as u32,
+                own_recurrence_id: None,
                 start,
                 end,
+                start_naive: 0,
             }
         })
         .collect::<Vec<_>>();
@@ -297,9 +329,9 @@ fn roundtrip_expansion(ics: &str, ignore_errors: bool) {
         events_archive,
         event_data
             .expand_from_ids(
-                &mut events
+                &mut events_archive
                     .iter()
-                    .map(|e| e.expansion_id)
+                    .filter_map(|e| e.recurrence_key())
                     .collect::<AHashSet<_>>(),
                 Tz::UTC
             )
@@ -320,11 +352,109 @@ fn roundtrip_expansion(ics: &str, ignore_errors: bool) {
         }
     });
     for event in events.iter_mut().chain(events_archive.iter_mut()) {
-        event.expansion_id = 0;
+        event.own_recurrence_id = None;
+        event.start_naive = 0;
     }
 
     assert_eq!(events, events_archive);
 }
+
+#[test]
+fn calendar_expand_dst_fallback() {
+    let akl = Tz::from_str("Pacific/Auckland").unwrap();
+    let ical = ICalendar::parse(ICAL_DST_FALLBACK_ICS).unwrap();
+    let event_data = CalendarEventData::new(ical, akl, 1000, &mut None);
+    let expanded_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&event_data).unwrap();
+    let archive = rkyv_unarchive::<CalendarEventData>(&expanded_bytes).unwrap();
+
+    let window = archive
+        .expand(
+            akl,
+            TimeRange {
+                start: 1782777600,
+                end: 1786579200,
+            },
+        )
+        .unwrap();
+    assert!(
+        !window.is_empty(),
+        "recurrence expansion aborted across the Pacific/Auckland DST fall-back overlap"
+    );
+
+    let across_overlap = archive
+        .expand(
+            akl,
+            TimeRange {
+                start: 1775260800,
+                end: 1775433600,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        across_overlap.len(),
+        1,
+        "the ambiguous fall-back occurrence must resolve to its earliest instant"
+    );
+}
+
+#[test]
+fn calendar_expand_beyond_indexable_span() {
+    let ical = ICalendar::parse(ICAL_UNBOUNDED_YEARLY_ICS).unwrap();
+    let event_data = CalendarEventData::new(ical, Tz::UTC, 3000, &mut None);
+    let expanded_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&event_data).unwrap();
+    let archive = rkyv_unarchive::<CalendarEventData>(&expanded_bytes).unwrap();
+
+    let instances = archive
+        .expand(
+            Tz::UTC,
+            TimeRange {
+                start: i64::MIN,
+                end: i64::MAX,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(instances.first().unwrap().start, FIRST_YEARLY_INSTANCE);
+    assert_eq!(instances.last().unwrap().start, LAST_YEARLY_INSTANCE);
+    assert_eq!(instances.len(), 137);
+    assert!(
+        instances.windows(2).all(|w| w[0].start < w[1].start),
+        "instance offsets wrapped around u32"
+    );
+
+    assert_eq!(event_data.event_range_start(), FIRST_YEARLY_INSTANCE);
+    assert!(
+        event_data.event_range_end() >= instances.last().unwrap().end,
+        "indexed range ends at {}, before its last instance at {}",
+        event_data.event_range_end(),
+        instances.last().unwrap().end
+    );
+
+    let in_2027 = archive
+        .expand(
+            Tz::UTC,
+            TimeRange {
+                start: JUNE_2027_START,
+                end: JUNE_2027_END,
+            },
+        )
+        .unwrap();
+    assert_eq!(in_2027.len(), 1);
+    assert_eq!(in_2027[0].start, JUNE_2027_INSTANCE);
+    assert!(
+        event_data.event_range_start() < JUNE_2027_END
+            && event_data.event_range_end() > JUNE_2027_START,
+        "indexed range {}..{} does not overlap June 2027",
+        event_data.event_range_start(),
+        event_data.event_range_end()
+    );
+}
+
+const FIRST_YEARLY_INSTANCE: i64 = 1527843600;
+const LAST_YEARLY_INSTANCE: i64 = 5819590800;
+const JUNE_2027_START: i64 = 1811808000;
+const JUNE_2027_END: i64 = 1814400000;
+const JUNE_2027_INSTANCE: i64 = 1811840400;
 
 fn rfc_file_name(num: usize) -> String {
     format!(
@@ -737,6 +867,35 @@ const REPORT_9: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
    </C:calendar-query>
 "#;
 
+const REPORT_12: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
+   <C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav">
+     <D:prop xmlns:D="DAV:">
+       <D:getetag/>
+       <C:calendar-data/>
+     </D:prop>
+     <C:filter>
+       <C:comp-filter name="VCALENDAR">
+         <C:comp-filter name="VEVENT">
+           <C:prop-filter name="UID">
+             <C:text-match collation="i;octet"
+             >JMAP-NO-VERSION-EVENT@example.com</C:text-match>
+           </C:prop-filter>
+         </C:comp-filter>
+       </C:comp-filter>
+     </C:filter>
+   </C:calendar-query>
+"#;
+
+const ICAL_JMAP_NO_VERSION: &str = r#"BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:JMAP-NO-VERSION-EVENT@example.com
+SUMMARY:JMAP created event
+DTSTART:20060107T120000Z
+DTEND:20060107T130000Z
+END:VEVENT
+END:VCALENDAR
+"#;
+
 const REPORT_10: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
    <C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">
      <C:time-range start="20060104T140000Z"
@@ -751,7 +910,8 @@ BEGIN:VFREEBUSY
 DTSTART:20060104T140000Z
 DTEND:20060105T220000Z
 FREEBUSY;FBTYPE=BUSY-TENTATIVE:20060104T150000Z/20060104T160000Z
-FREEBUSY;FBTYPE=BUSY:20060104T190000Z/20060104T200000Z,20060105T170000Z/20060105T180000Z
+FREEBUSY;FBTYPE=BUSY:20060104T190000Z/20060104T200000Z,20060105T170000Z/200
+ 60105T180000Z
 FREEBUSY;FBTYPE=BUSY-UNAVAILABLE:20060105T100000Z/20060105T120000Z
 END:VFREEBUSY
 END:VCALENDAR
@@ -772,9 +932,56 @@ DTSTART:20060101T000000Z
 DTEND:20060104T140000Z
 DTSTAMP:20250505T105255Z
 FREEBUSY;FBTYPE=BUSY-TENTATIVE:20060102T100000Z/20060102T120000Z
-FREEBUSY;FBTYPE=BUSY:20060102T150000Z/20060102T160000Z,20060102T170000Z/20060102T180000Z,
- 20060103T100000Z/20060103T120000Z,20060103T170000Z/20060103T180000Z,20060104T100000Z/20060104T120000Z
+FREEBUSY;FBTYPE=BUSY:20060102T150000Z/20060102T160000Z,20060102T170000Z/200
+ 60102T180000Z,20060103T100000Z/20060103T120000Z,20060103T170000Z/20060103T
+ 180000Z,20060104T100000Z/20060104T120000Z
 END:VFREEBUSY
+END:VCALENDAR
+"#;
+
+const REPORT_13: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
+   <C:calendar-query xmlns:D="DAV:"
+                     xmlns:C="urn:ietf:params:xml:ns:caldav">
+     <D:prop>
+       <D:getetag/>
+       <C:calendar-data/>
+     </D:prop>
+     <C:filter>
+       <C:comp-filter name="VCALENDAR">
+         <C:comp-filter name="VEVENT">
+           <C:time-range start="20270601T000000Z"
+                         end="20270701T000000Z"/>
+         </C:comp-filter>
+       </C:comp-filter>
+     </C:filter>
+   </C:calendar-query>
+"#;
+
+const ICAL_UNBOUNDED_YEARLY_ICS: &str = r#"BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Example Corp.//CalDAV Client//EN
+BEGIN:VEVENT
+DTSTAMP:20180601T000000Z
+DTSTART:20180601T090000Z
+DTEND:20180601T100000Z
+RRULE:FREQ=YEARLY
+SUMMARY:Unbounded yearly event
+UID:yearly-unbounded@example.com
+END:VEVENT
+END:VCALENDAR
+"#;
+
+const ICAL_DST_FALLBACK_ICS: &str = r#"BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Example Corp.//CalDAV Client//EN
+BEGIN:VEVENT
+DTSTAMP:20260108T000000Z
+DTSTART;TZID=Pacific/Auckland:20260108T022000
+DURATION:PT2H10M
+RRULE:FREQ=DAILY;INTERVAL=3
+SUMMARY:Auckland DST fall-back recurrence
+UID:auckland-dst-fallback@example.com
+END:VEVENT
 END:VCALENDAR
 "#;
 

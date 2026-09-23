@@ -10,6 +10,7 @@ use crate::{
 };
 use common::{config::smtp::session::Stage, network::SessionStream, scripts::ScriptModification};
 use mail_auth::{IprevOutput, IprevResult, SpfOutput, SpfResult, spf::verify::SpfParameters};
+use mail_parser::DateTime;
 use registry::schema::structs::Rate;
 use smtp_proto::{MAIL_BY_NOTIFY, MAIL_BY_RETURN, MAIL_REQUIRETLS, MailFrom, MtPriority};
 use std::{
@@ -358,39 +359,63 @@ impl<T: SessionStream> Session<T> {
                     .await;
             }
         }
-        if from.size > 0
-            && from.size
-                > self
-                    .server
-                    .eval_if(&config_data.max_message_size, self, self.data.session_id)
-                    .await
-                    .unwrap_or(25 * 1024 * 1024)
-        {
-            trc::event!(
-                Smtp(SmtpEvent::MessageTooLarge),
-                SpanId = self.data.session_id,
-                Size = from.size,
-            );
+        if from.size > 0 {
+            let max_message_size = self
+                .server
+                .eval_if::<usize, _>(&config_data.max_message_size, self, self.data.session_id)
+                .await
+                .unwrap_or(25 * 1024 * 1024);
 
-            self.data.mail_from = None;
-            return self
-                .write(b"552 5.3.4 Message too big for system.\r\n")
-                .await;
+            if max_message_size > 0 && from.size > max_message_size {
+                trc::event!(
+                    Smtp(SmtpEvent::MessageTooLarge),
+                    SpanId = self.data.session_id,
+                    Size = from.size,
+                    Limit = max_message_size,
+                );
+
+                self.data.mail_from = None;
+                return self
+                    .write(b"552 5.3.4 Message too big for system.\r\n")
+                    .await;
+            }
         }
+
         if from.hold_for != 0 || from.hold_until != 0 {
+            if from.hold_for != 0 && from.hold_until != 0 {
+                trc::event!(
+                    Smtp(SmtpEvent::FutureReleaseInvalid),
+                    SpanId = self.data.session_id,
+                    Details = "Both HOLDFOR and HOLDUNTIL were specified",
+                );
+                self.data.mail_from = None;
+                return self
+                    .write(b"501 5.5.4 Only one of HOLDFOR or HOLDUNTIL may be specified.\r\n")
+                    .await;
+            }
             if let Some(max_hold) = self
                 .server
                 .eval_if::<Duration, _>(&config.future_release, self, self.data.session_id)
                 .await
             {
                 let max_hold = max_hold.as_secs();
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
                 let hold_for = if from.hold_for != 0 {
                     from.hold_for
+                } else if from.hold_until > now {
+                    from.hold_until - now
                 } else {
-                    let now = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs());
-                    from.hold_until.saturating_sub(now)
+                    trc::event!(
+                        Smtp(SmtpEvent::FutureReleaseInvalid),
+                        SpanId = self.data.session_id,
+                        Details = from.hold_until,
+                    );
+                    self.data.mail_from = None;
+                    return self
+                        .write(b"501 5.5.4 HOLDUNTIL must be a date and time in the future.\r\n")
+                        .await;
                 };
                 if hold_for <= max_hold {
                     self.data.future_release = hold_for;
@@ -401,14 +426,17 @@ impl<T: SessionStream> Session<T> {
                         Details = hold_for,
                     );
                     self.data.mail_from = None;
-                    return self
-                        .write(
-                            format!(
-                                "501 5.5.4 Requested hold time exceeds maximum of {max_hold} seconds.\r\n"
-                            )
-                            .as_bytes(),
+                    let response = if from.hold_for != 0 {
+                        format!(
+                            "501 5.5.4 Requested hold time exceeds maximum of {max_hold} seconds.\r\n"
                         )
-                        .await;
+                    } else {
+                        format!(
+                            "501 5.5.4 Requested release time exceeds maximum of {}.\r\n",
+                            DateTime::from_timestamp((now + max_hold) as i64).to_rfc3339()
+                        )
+                    };
+                    return self.write(response.as_bytes()).await;
                 }
             } else {
                 trc::event!(

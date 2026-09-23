@@ -15,7 +15,7 @@ use std::{str::FromStr, time::Duration};
 use store::{
     IterateParams, Key, U32_LEN, ValueKey,
     ahash::AHashMap,
-    rand::Rng,
+    rand::RngExt,
     write::{
         AlignedBytes, Archive, BatchBuilder, IndexPropertyClass, MergeResult, Params, ValueClass,
         key::DeserializeBigEndian,

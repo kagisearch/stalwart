@@ -40,7 +40,7 @@ use managesieve::core::ManageSieveSessionManager;
 use pop3::Pop3SessionManager;
 use registry::{
     schema::{
-        enums::{DataStoreType, EventPolicy, NetworkListenerProtocol, TracingLevel},
+        enums::{EventPolicy, NetworkListenerProtocol, TracingLevel},
         prelude::{Object, ObjectType, SocketAddr},
         structs::{
             Authentication, Certificate, Domain, NetworkListener, PublicText, SecretKeyFile,
@@ -59,7 +59,7 @@ use smtp::{
     },
     reporting::scheduler::SpawnReport,
 };
-use std::{path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::VecDeque, path::PathBuf, str::FromStr, sync::Arc};
 use store::{
     RegistryStore, Store, ValueKey,
     registry::{RegistryQuery, bootstrap::Bootstrap, write::RegistryWrite},
@@ -74,6 +74,7 @@ pub struct TestServer {
     pub accounts: AHashMap<&'static str, Account>,
     pub temp_dir: TempDir,
     pub queue_rx: mpsc::Receiver<QueueEvent>,
+    pub queue_events: VecDeque<QueueEvent>,
     pub report_rx: mpsc::Receiver<ReportingEvent>,
     shutdown_tx: watch::Sender<bool>,
     reset: bool,
@@ -105,16 +106,11 @@ impl TestServerBuilder {
     ) -> Self {
         let temp_dir = TempDir::new(test_name, reset);
         let path = temp_dir.path.to_string_lossy().to_string();
-        let data_store = build_data_store(
-            std::env::var("STORE")
-                .map(|store| DataStoreType::parse(&store).expect("Invalid store type"))
-                .expect(concat!(
-                    "Missing or invalid store type. Try ",
-                    "running `STORE=<store_type> cargo test`"
-                )),
-            &path,
-        )
-        .await;
+        let store_type = std::env::var("STORE").expect(concat!(
+            "Missing or invalid store type. Try ",
+            "running `STORE=<store_type> cargo test`"
+        ));
+        let data_store = build_data_store(&store_type, &path).await;
         let store = Store::build(data_store).await.unwrap();
 
         store.create_tables().await.unwrap();
@@ -465,6 +461,7 @@ impl TestServerBuilder {
             temp_dir: self.temp_dir,
             accounts: AHashMap::from_iter([("admin", admin)]),
             queue_rx,
+            queue_events: VecDeque::new(),
             report_rx,
             shutdown_tx,
             reset: self.reset,

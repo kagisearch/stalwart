@@ -44,7 +44,7 @@ pub async fn test() {
             email: "john.doe@example.org".to_string(),
             email_aliases: vec![],
             secret: None,
-            groups: vec!["sales@example.org".to_string()],
+            groups: Some(vec!["sales@example.org".to_string()]),
             description: Some("John Doe".to_string())
         }
     );
@@ -66,7 +66,7 @@ pub async fn test() {
             email: "john.doe@example.org".to_string(),
             email_aliases: vec![],
             secret: None,
-            groups: vec!["sales@example.org".to_string()],
+            groups: Some(vec!["sales@example.org".to_string()]),
             description: Some("John Doe".to_string())
         }
     );
@@ -115,7 +115,7 @@ pub async fn test() {
             email: "john.doe@example.org".to_string(),
             email_aliases: vec![],
             secret: None,
-            groups: vec!["sales@example.org".to_string()],
+            groups: Some(vec!["sales@example.org".to_string()]),
             description: None,
         }
     );
@@ -135,6 +135,28 @@ pub async fn test() {
             })
             .await
             .is_err()
+    );
+
+    // A configured group claim that the provider does not emit must not assert an empty group list
+    let mut config_missing_groups = config.clone();
+    config_missing_groups.claim_groups = Some("not_a_real_claim".to_string());
+    assert_eq!(
+        OpenIdDirectory::open(config_missing_groups)
+            .await
+            .unwrap()
+            .authenticate(&Credentials::Bearer {
+                username: None,
+                token: token.clone(),
+            })
+            .await
+            .unwrap(),
+        Account {
+            email: "john.doe@example.org".to_string(),
+            email_aliases: vec![],
+            secret: None,
+            groups: None,
+            description: Some("John Doe".to_string())
+        }
     );
 
     // Not matching the required audience should fail
@@ -192,7 +214,7 @@ async fn get_token(username: &str, password: &str) -> String {
     .await
 }
 
-async fn get_token_for_client(
+pub(super) async fn get_token_for_client(
     client_id: &str,
     client_secret: &str,
     username: &str,

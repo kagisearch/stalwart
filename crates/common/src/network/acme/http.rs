@@ -21,18 +21,19 @@ pub(crate) async fn https(
     max_retries: u32,
 ) -> AcmeResult<Response> {
     let url = url.as_ref();
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .http1_only();
+
+    #[allow(unused_mut)]
+    #[allow(unused_assignments)]
+    let mut allow_invalid_certs = false;
 
     #[cfg(any(feature = "dev_mode", feature = "test_mode"))]
     {
-        builder = builder.danger_accept_invalid_certs(
-            url.starts_with("https://localhost") || url.starts_with("https://127.0.0.1"),
-        );
+        allow_invalid_certs =
+            url.starts_with("https://localhost") || url.starts_with("https://127.0.0.1");
     }
 
-    let mut request = builder
+    let mut request = utils::http::http1_client_builder(allow_invalid_certs)
+        .timeout(Duration::from_secs(30))
         .build()?
         .request(method, url)
         .header(USER_AGENT, crate::USER_AGENT);
@@ -50,10 +51,16 @@ pub(crate) async fn https(
         response.status(),
         StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
     ) {
-        Err(AcmeError::Backoff {
-            wait: parse_retry_after(&response),
-            max_retries,
-        })
+        let wait = parse_retry_after(&response);
+
+        trc::event!(
+            Acme(trc::AcmeEvent::RenewBackoff),
+            Url = url.to_string(),
+            Code = response.status().as_u16(),
+            Elapsed = wait.unwrap_or_default(),
+        );
+
+        Err(AcmeError::Backoff { wait, max_retries })
     } else {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();

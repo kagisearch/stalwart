@@ -30,6 +30,8 @@ impl DkimSignature {
         match self {
             DkimSignature::Dkim1Ed25519Sha256(signature) => &signature.private_key,
             DkimSignature::Dkim1RsaSha256(signature) => &signature.private_key,
+            DkimSignature::Dkim2Ed25519Sha256(signature) => &signature.private_key,
+            DkimSignature::Dkim2RsaSha256(signature) => &signature.private_key,
         }
     }
 
@@ -37,6 +39,8 @@ impl DkimSignature {
         match self {
             DkimSignature::Dkim1Ed25519Sha256(signature) => &mut signature.private_key,
             DkimSignature::Dkim1RsaSha256(signature) => &mut signature.private_key,
+            DkimSignature::Dkim2Ed25519Sha256(signature) => &mut signature.private_key,
+            DkimSignature::Dkim2RsaSha256(signature) => &mut signature.private_key,
         }
     }
 }

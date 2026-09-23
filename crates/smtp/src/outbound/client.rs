@@ -171,7 +171,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> SmtpClient<T> {
     pub async fn send_message(
         &mut self,
         message: &MessageWrapper,
-        bdat_cmd: &Option<String>,
+        rcpt_headers: Option<&[u8]>,
+        bdat_cmd: &mut Option<String>,
         params: &SessionParams<'_>,
     ) -> Result<(), Status<HostResponse<Box<str>>, ErrorDetails>> {
         match params
@@ -183,6 +184,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> SmtpClient<T> {
             Ok(Some(raw_message)) => {
                 tokio::time::timeout(params.conn_strategy.timeout_data, async {
                     if let Some(bdat_cmd) = bdat_cmd {
+                        *bdat_cmd = format!(
+                            "BDAT {} LAST\r\n",
+                            raw_message.len() + rcpt_headers.map(|h| h.len()).unwrap_or(0)
+                        );
+
                         trc::event!(
                             Delivery(DeliveryEvent::RawOutput),
                             SpanId = self.session_id,
@@ -190,8 +196,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> SmtpClient<T> {
                             Size = bdat_cmd.len()
                         );
 
-                        self.write_chunks(&[bdat_cmd.as_bytes(), &raw_message])
-                            .await
+                        let chunks = if let Some(rcpt_headers) = rcpt_headers {
+                            &[bdat_cmd.as_bytes(), rcpt_headers, &raw_message][..]
+                        } else {
+                            &[bdat_cmd.as_bytes(), &raw_message][..]
+                        };
+
+                        self.write_chunks(chunks).await
                     } else {
                         trc::event!(
                             Delivery(DeliveryEvent::RawOutput),
@@ -202,9 +213,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> SmtpClient<T> {
 
                         self.write_chunks(&[b"DATA\r\n"]).await?;
                         self.read().await?.assert_code(354)?;
-                        self.write_message(&raw_message)
-                            .await
-                            .map_err(ClientError::from)
+                        if let Some(rcpt_headers) = rcpt_headers
+                            && let Err(err) = self.write_chunks(&[rcpt_headers]).await
+                        {
+                            Err(err)
+                        } else {
+                            self.write_message(&raw_message)
+                                .await
+                                .map_err(ClientError::from)
+                        }
                     }
                 })
                 .await

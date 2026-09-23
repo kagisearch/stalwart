@@ -4,14 +4,17 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{Event, http::http_request};
+use super::{
+    Event,
+    http::{build_push_client, http_request},
+};
 use crate::state_manager::PushRegistration;
 use common::{
     BuildServer, IPC_CHANNEL_BUFFER, Inner, LONG_1Y_SLUMBER, Server,
     auth::BuildAccessToken,
     ipc::{PushEvent, PushNotification},
 };
-use email::push::PushSubscriptions;
+use email::push::{PushSubscription, PushSubscriptions, Urgency};
 use std::{
     collections::hash_map::Entry,
     sync::Arc,
@@ -37,6 +40,7 @@ pub fn spawn_push_manager(inner: Arc<Inner>) -> mpsc::Sender<Event> {
         let mut last_retry = Instant::now();
         let mut retry_timeout = LONG_1Y_SLUMBER;
         let mut retry_ids = AHashSet::default();
+        let push_client = build_push_client();
 
         // Load active subscriptions on startup
         {
@@ -89,6 +93,7 @@ pub fn spawn_push_manager(inner: Arc<Inner>) -> mpsc::Sender<Event> {
                                             notifications: Vec::new(),
                                             server: subscription.clone(),
                                             in_flight: false,
+                                            client: push_client.clone(),
                                         },
                                     );
                                 }
@@ -161,6 +166,7 @@ pub fn spawn_push_manager(inner: Arc<Inner>) -> mpsc::Sender<Event> {
 
                         // Process subscriptions
                         let current_time = now();
+                        let mut newest_unverified: Option<Arc<PushSubscription>> = None;
                         for subscription in subscriptions
                             .subscriptions
                             .into_iter()
@@ -190,57 +196,68 @@ pub fn spawn_push_manager(inner: Arc<Inner>) -> mpsc::Sender<Event> {
                                             notifications: Vec::new(),
                                             server: subscription.clone(),
                                             in_flight: false,
+                                            client: push_client.clone(),
                                         });
                                     }
                                 }
                             } else {
-                                let current_time = Instant::now();
-
-                                #[cfg(feature = "test_mode")]
-                                if subscription.url.contains("skip_checks") {
-                                    last_verify.insert(
-                                        account_id,
-                                        current_time
-                                            - (push_verify_timeout + Duration::from_millis(1)),
-                                    );
+                                match &newest_unverified {
+                                    Some(existing) if existing.id >= subscription.id => {}
+                                    _ => newest_unverified = Some(subscription),
                                 }
+                            }
+                        }
 
-                                if last_verify
-                                    .get(&account_id)
-                                    .map(|last_verify| {
-                                        current_time - *last_verify > push_verify_timeout
-                                    })
-                                    .unwrap_or(true)
-                                {
-                                    tokio::spawn(async move {
-                                        http_request(
-                                            &subscription,
-                                            format!(
-                                                concat!(
-                                                    "{{\"@type\":\"PushVerification\",",
-                                                    "\"pushSubscriptionId\":\"{}\",",
-                                                    "\"verificationCode\":\"{}\"}}"
-                                                ),
-                                                Id::from(subscription.id),
-                                                subscription.verification_code
+                        if let Some(subscription) = newest_unverified {
+                            let current_time = Instant::now();
+
+                            #[cfg(feature = "test_mode")]
+                            if subscription.url.contains("skip_checks") {
+                                last_verify.insert(
+                                    account_id,
+                                    current_time - (push_verify_timeout + Duration::from_millis(1)),
+                                );
+                            }
+
+                            if last_verify
+                                .get(&account_id)
+                                .map(|last_verify| {
+                                    current_time - *last_verify > push_verify_timeout
+                                })
+                                .unwrap_or(true)
+                            {
+                                let core = server.core.clone();
+                                let push_client = push_client.clone();
+                                tokio::spawn(async move {
+                                    http_request(
+                                        &push_client,
+                                        &subscription,
+                                        format!(
+                                            concat!(
+                                                "{{\"@type\":\"PushVerification\",",
+                                                "\"pushSubscriptionId\":\"{}\",",
+                                                "\"verificationCode\":\"{}\"}}"
                                             ),
-                                            push_timeout,
+                                            Id::from(subscription.id),
+                                            subscription.verification_code
                                         )
-                                        .await;
-                                    });
+                                        .into_bytes(),
+                                        push_timeout,
+                                        core.jmap.vapid.as_ref(),
+                                        Urgency::Normal,
+                                    )
+                                    .await;
+                                });
 
-                                    last_verify.insert(account_id, current_time);
-                                } else {
-                                    trc::event!(
-                                        PushSubscription(PushSubscriptionEvent::Error),
-                                        Details = "Failed to verify push subscription",
-                                        Url = subscription.url.clone(),
-                                        AccountId = account_id,
-                                        Reason = "Too many requests"
-                                    );
-
-                                    continue;
-                                }
+                                last_verify.insert(account_id, current_time);
+                            } else {
+                                trc::event!(
+                                    PushSubscription(PushSubscriptionEvent::Error),
+                                    Details = "Failed to verify push subscription",
+                                    Url = subscription.url.clone(),
+                                    AccountId = account_id,
+                                    Reason = "Too many requests"
+                                );
                             }
                         }
 
@@ -312,22 +329,17 @@ pub fn spawn_push_manager(inner: Arc<Inner>) -> mpsc::Sender<Event> {
                                         if let Some(mut notification) =
                                             notification.filter_types(&subscription.server.types)
                                         {
-                                            // Build email push notification
                                             if let PushNotification::EmailPush(email_push) =
                                                 &notification
-                                            {
-                                                if let Some(_email_push) = subscription
+                                                && !subscription
                                                     .server
                                                     .email_push
                                                     .iter()
-                                                    .find(|ep| ep.account_id == account_id)
-                                                {
-                                                    // TODO: Apply filters once RFC is finalized
-                                                } else {
-                                                    notification = PushNotification::StateChange(
-                                                        email_push.to_state_change(),
-                                                    );
-                                                }
+                                                    .any(|ep| ep.account_id == account_id)
+                                            {
+                                                notification = PushNotification::StateChange(
+                                                    email_push.to_state_change(),
+                                                );
                                             }
 
                                             subscription.notifications.push(notification);
@@ -344,6 +356,7 @@ pub fn spawn_push_manager(inner: Arc<Inner>) -> mpsc::Sender<Event> {
                                                     *id,
                                                     push_tx.clone(),
                                                     push_timeout,
+                                                    server.clone(),
                                                 );
                                                 retry_ids.remove(id);
                                             } else {
@@ -430,7 +443,12 @@ pub fn spawn_push_manager(inner: Arc<Inner>) -> mpsc::Sender<Event> {
                                         && last_request >= push_attempt_interval))
                             {
                                 if subscription.num_attempts < push_attempts_max {
-                                    subscription.send(*retry_id, push_tx.clone(), push_timeout);
+                                    subscription.send(
+                                        *retry_id,
+                                        push_tx.clone(),
+                                        push_timeout,
+                                        server.clone(),
+                                    );
                                 } else {
                                     trc::event!(
                                         PushSubscription(PushSubscriptionEvent::Error),

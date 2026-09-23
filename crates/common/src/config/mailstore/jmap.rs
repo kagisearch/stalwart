@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use crate::network::webpush::{Vapid, VapidKey};
 use jmap_proto::request::capability::BaseCapabilities;
-use registry::schema::structs::Jmap;
+use registry::schema::{prelude::ObjectType, structs::Jmap};
 use std::time::Duration;
 use store::registry::bootstrap::Bootstrap;
 
@@ -41,10 +42,13 @@ pub struct JmapConfig {
     pub push_verify_timeout: Duration,
     pub push_throttle: Duration,
     pub push_total_shards: u32,
+    pub push_max_size: usize,
 
     pub web_socket_throttle: Duration,
     pub web_socket_timeout: Duration,
     pub web_socket_heartbeat: Duration,
+
+    pub vapid: Option<Vapid>,
 
     pub capabilities: BaseCapabilities,
 }
@@ -52,6 +56,26 @@ pub struct JmapConfig {
 impl JmapConfig {
     pub async fn parse(bp: &mut Bootstrap) -> Self {
         let jmap = bp.setting_infallible::<Jmap>().await;
+        let web_push_key = jmap
+            .web_push_key
+            .secret()
+            .await
+            .map_err(|err| {
+                bp.build_error(
+                    ObjectType::Jmap.singleton(),
+                    format!("Unable to retrieve Web Push key: {err}"),
+                );
+            })
+            .unwrap_or_default()
+            .map(|k| k.into_owned());
+        let web_push_contact = jmap
+            .web_push_contact
+            .as_deref()
+            .and_then(crate::network::webpush::normalize_contact)
+            .or_else(|| {
+                let hostname = bp.registry.local_hostname();
+                (!hostname.is_empty()).then(|| format!("mailto:postmaster@{hostname}"))
+            });
 
         let mut jmap = JmapConfig {
             query_max_results: jmap.query_max_results as usize,
@@ -66,7 +90,7 @@ impl JmapConfig {
             upload_max_concurrent: jmap.max_concurrent_uploads,
             upload_tmp_quota_size: jmap.upload_quota as usize,
             upload_tmp_quota_amount: jmap.max_upload_count as usize,
-            upload_tmp_ttl: jmap.upload_ttl.into_inner().as_secs(),
+            upload_tmp_ttl: jmap.upload_ttl.into_inner().as_secs().max(1),
             mail_parse_max_items: jmap.parse_limit_email as usize,
             contact_parse_max_items: jmap.parse_limit_contact as usize,
             calendar_parse_max_items: jmap.parse_limit_event as usize,
@@ -81,8 +105,27 @@ impl JmapConfig {
             push_verify_timeout: jmap.push_verify_timeout.into_inner(),
             push_throttle: jmap.push_throttle.into_inner(),
             push_total_shards: jmap.push_shards_total as u32,
+            push_max_size: jmap.max_push_size as usize,
+            vapid: None,
             capabilities: BaseCapabilities::default(),
         };
+
+        // Enable Web Push VAPID only when a signing key is configured
+        jmap.vapid = web_push_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|pem| !pem.is_empty())
+            .and_then(|pem| match VapidKey::from_pkcs8_pem(pem) {
+                Ok(key) => Some(key),
+                Err(err) => {
+                    bp.build_error(
+                        ObjectType::Jmap.singleton(),
+                        format!("Invalid Web Push VAPID key: {err}"),
+                    );
+                    None
+                }
+            })
+            .map(|key| Vapid::new(key, web_push_contact));
 
         // Add capabilities
         jmap.add_capabilities(bp).await;

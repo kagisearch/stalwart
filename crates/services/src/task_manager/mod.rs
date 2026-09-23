@@ -77,6 +77,7 @@ pub(crate) enum TaskResult {
 pub(crate) enum TaskFailureType {
     Retry(u64),
     Temporary,
+    Perpetual,
     Permanent,
 }
 
@@ -125,4 +126,28 @@ impl TaskResult {
             max_attempts: None,
         }
     }
+
+    pub fn perpetual(message: impl Into<String>) -> Self {
+        TaskResult::Failure {
+            typ: TaskFailureType::Perpetual,
+            message: message.into(),
+            max_attempts: None,
+        }
+    }
+
+    pub fn deferred(retry_at: Option<u64>, message: impl Into<String>) -> Self {
+        match retry_at {
+            Some(retry_at) => TaskResult::Failure {
+                typ: TaskFailureType::Retry(retry_at),
+                message: message.into(),
+                max_attempts: None,
+            },
+            None => TaskResult::temporary(message),
+        }
+    }
+}
+
+pub(crate) fn deferred_retry_time(err: &trc::Error) -> Option<u64> {
+    err.value(trc::Key::NextRetry)
+        .and_then(|value| value.to_uint())
 }

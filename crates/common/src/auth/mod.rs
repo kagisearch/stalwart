@@ -70,6 +70,12 @@ pub struct DomainCache {
 pub const DOMAIN_FLAG_RELAY: u8 = 1;
 pub const DOMAIN_FLAG_SUB_ADDRESSING: u8 = 1 << 1;
 
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
+pub const DOMAIN_FLAG_SCIM_PROVISIONING: u8 = 1 << 2;
+// SPDX-SnippetEnd
+
 #[derive(Debug, Clone, Default)]
 pub struct AccountCache {
     pub name: Box<str>,
@@ -200,7 +206,11 @@ impl CacheItemWeight for EmailCache {
 impl CacheItemWeight for DomainCache {
     fn weight(&self) -> u64 {
         std::mem::size_of::<DomainCache>() as u64
-            + self.names.iter().map(|s| s.len() as u64).sum::<u64>()
+            + self
+                .names
+                .iter()
+                .map(|s| s.len() as u64 + std::mem::size_of::<Box<str>>() as u64)
+                .sum::<u64>()
             + self.catch_all.as_ref().map_or(0, |s| s.len() as u64)
             + self
                 .sub_addressing_custom
@@ -232,12 +242,18 @@ impl Hash for EmailAddressRef<'_> {
 impl CacheItemWeight for AccountCache {
     fn weight(&self) -> u64 {
         std::mem::size_of::<AccountCache>() as u64
+            + self.name.len() as u64
             + self
                 .addresses
                 .iter()
                 .map(|s| s.local_part.len() as u64 + std::mem::size_of::<EmailAddress>() as u64)
                 .sum::<u64>()
             + self.description.as_ref().map_or(0, |s| s.len() as u64)
+            + self.encryption_key.as_ref().map_or(0, |keys| {
+                keys.iter()
+                    .map(|k| k.len() as u64 + std::mem::size_of::<Box<[u8]>>() as u64)
+                    .sum::<u64>()
+            })
     }
 }
 
@@ -255,7 +271,11 @@ impl CacheItemWeight for MailingListCache {
                 .iter()
                 .map(|s| s.local_part.len() as u64 + std::mem::size_of::<EmailAddress>() as u64)
                 .sum::<u64>()
-            + self.recipients.iter().map(|s| s.len() as u64).sum::<u64>()
+            + self
+                .recipients
+                .iter()
+                .map(|s| s.len() as u64 + std::mem::size_of::<Box<str>>() as u64)
+                .sum::<u64>()
     }
 }
 
@@ -303,8 +323,23 @@ impl<'x> EmailAddressRef<'x> {
     }
 }
 
+impl AccountCache {
+    pub fn domain_id(&self) -> Option<u32> {
+        self.addresses.first().map(|address| address.domain_id)
+    }
+}
+
 impl DomainCache {
     pub fn name(&self) -> &str {
         self.names.first().map(|s| s.as_ref()).unwrap_or_default()
     }
+
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[inline]
+    pub fn allows_scim_provisioning(&self) -> bool {
+        (self.flags & DOMAIN_FLAG_SCIM_PROVISIONING) != 0
+    }
+    // SPDX-SnippetEnd
 }

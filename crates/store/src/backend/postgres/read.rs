@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{PostgresStore, into_error};
+use super::{PostgresStore, into_error, is_timeout_error};
 use crate::{
     Deserialize, IterateParams, Key, ValueKey, backend::postgres::into_pool_error,
     write::ValueClass,
@@ -84,31 +84,66 @@ impl PostgresStore {
                 }
             })
             .await.map_err(into_error)?;
-        let rows = conn
-            .query_raw(&s, &[&begin, &end])
-            .await
-            .map_err(into_error)?;
+        let mut from = begin;
+        let mut to = end;
+        let mut resume_key: Option<Vec<u8>> = None;
 
-        pin_mut!(rows);
+        loop {
+            let mut last_key = None;
+            let mut timed_out = false;
 
-        if params.values {
-            while let Some(row) = rows.try_next().await.map_err(into_error)? {
-                let key = row.try_get::<_, &[u8]>(0).map_err(into_error)?;
-                let value = row.try_get::<_, &[u8]>(1).map_err(into_error)?;
+            {
+                let rows = conn
+                    .query_raw(&s, &[&from, &to])
+                    .await
+                    .map_err(into_error)?;
 
-                if !cb(key, value)? {
-                    break;
+                pin_mut!(rows);
+
+                loop {
+                    match rows.try_next().await {
+                        Ok(Some(row)) => {
+                            let key = row.try_get::<_, &[u8]>(0).map_err(into_error)?;
+                            let value = if params.values {
+                                row.try_get::<_, &[u8]>(1).map_err(into_error)?
+                            } else {
+                                b"".as_slice()
+                            };
+
+                            if resume_key.take().is_some_and(|resumed| resumed == key) {
+                                continue;
+                            }
+
+                            if !cb(key, value)? {
+                                return Ok(());
+                            }
+
+                            last_key = Some(key.to_vec());
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            if params.first || last_key.is_none() || !is_timeout_error(&err) {
+                                return Err(into_error(err));
+                            }
+                            timed_out = true;
+                            break;
+                        }
+                    }
                 }
             }
-        } else {
-            while let Some(row) = rows.try_next().await.map_err(into_error)? {
-                if !cb(row.try_get::<_, &[u8]>(0).map_err(into_error)?, b"")? {
-                    break;
+
+            match last_key {
+                Some(last_key) if timed_out => {
+                    if params.ascending {
+                        from.clone_from(&last_key);
+                    } else {
+                        to.clone_from(&last_key);
+                    }
+                    resume_key = Some(last_key);
                 }
+                _ => return Ok(()),
             }
         }
-
-        Ok(())
     }
 
     pub(crate) async fn get_counter(

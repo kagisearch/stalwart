@@ -20,6 +20,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(180);
 static FOUNDATIONDB: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
 static POSTGRES: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
 static MYSQL: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
+static MARIADB: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
 static REDIS: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
 static NATS: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
 static MINIO: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
@@ -30,6 +31,19 @@ static OPENLDAP: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
 static CHALLTESTSRV: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
 static PEBBLE: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
 static POWERDNS: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
+static SCIM_TESTER: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
+
+const OPENLDAP_LDAPI_URL: &str = "ldapi://%2Fvar%2Frun%2Fslapd%2Fldapi/";
+
+const OPENLDAP_ALLOW_UNAUTHENTICATED_BIND: &str = r#"set -e
+ldapmodify -Y EXTERNAL -Q -H "$LDAPI" <<'EOF'
+dn: cn=config
+changetype: modify
+replace: olcAllows
+olcAllows: bind_anon_dn
+EOF
+test "$(ldapwhoami -x -H "$LDAPI" -D uid=john.doe,ou=users,dc=stalwart,dc=test -w '')" = anonymous
+"#;
 
 const POWERDNS_ZONE_INIT: &str = r#"set -e
 for i in $(seq 1 60); do
@@ -146,6 +160,25 @@ pub async fn ensure_mysql() {
         })
         .await;
     wait_for_tcp(3307).await;
+}
+
+pub async fn ensure_mariadb() {
+    MARIADB
+        .get_or_init(|| async {
+            GenericImage::new("mariadb", "11.4")
+                .with_wait_for(WaitFor::message_on_stderr("port: 3306  mariadb.org"))
+                .with_env_var("MARIADB_ROOT_PASSWORD", "password")
+                .with_env_var("MARIADB_DATABASE", "stalwart")
+                .with_mapped_port(3308, 3306.tcp())
+                .with_startup_timeout(READY_TIMEOUT)
+                .with_container_name("stalwart-test-mariadb")
+                .with_reuse(ReuseDirective::Always)
+                .start()
+                .await
+                .expect("Failed to start MariaDB container")
+        })
+        .await;
+    wait_for_tcp(3308).await;
 }
 
 pub async fn ensure_redis() {
@@ -269,6 +302,41 @@ pub async fn ensure_keycloak() {
     wait_for_http("http://localhost:9080/realms/stalwart/.well-known/openid-configuration").await;
 }
 
+pub async fn ensure_scim_tester() -> &'static ContainerAsync<GenericImage> {
+    SCIM_TESTER
+        .get_or_init(|| async {
+            let image = GenericBuildableImage::new("stalwart-test-scim-tester", "local")
+                .with_dockerfile_string(include_str!("../../docker/scim/Dockerfile"))
+                .build_image()
+                .await
+                .expect("Failed to build the SCIM tester image");
+            image
+                .with_host("host.docker.internal", Host::HostGateway)
+                .with_startup_timeout(READY_TIMEOUT)
+                .with_container_name("stalwart-test-scim-tester")
+                .with_reuse(ReuseDirective::Always)
+                .start()
+                .await
+                .expect("Failed to start the SCIM tester container")
+        })
+        .await
+}
+
+pub async fn scim_tester_exec(args: &[&str]) -> (String, String) {
+    let mut result = ensure_scim_tester()
+        .await
+        .exec(ExecCommand::new(args.iter().copied()).with_cmd_ready_condition(CmdWaitFor::exit()))
+        .await
+        .expect("Failed to exec the SCIM driver");
+    let stdout = result.stdout_to_vec().await.unwrap_or_default();
+    let stderr = result.stderr_to_vec().await.unwrap_or_default();
+
+    (
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+    )
+}
+
 pub async fn ensure_acme() {
     ensure_challtestsrv().await;
     ensure_pebble().await;
@@ -369,7 +437,7 @@ pub async fn ensure_powerdns() {
 
 pub async fn ensure_openldap() {
     const BOOTSTRAP_DIR: &str = "/container/service/slapd/assets/config/bootstrap/ldif/custom";
-    OPENLDAP
+    let container = OPENLDAP
         .get_or_init(|| async {
             GenericImage::new("osixia/openldap", "1.5.0")
                 .with_wait_for(WaitFor::message_on_stderr("slapd starting"))
@@ -396,6 +464,22 @@ pub async fn ensure_openldap() {
         })
         .await;
     wait_for_tcp(389).await;
+
+    let setup = format!("LDAPI={OPENLDAP_LDAPI_URL}\n{OPENLDAP_ALLOW_UNAUTHENTICATED_BIND}");
+    let mut result = container
+        .exec(
+            ExecCommand::new(["bash", "-c", setup.as_str()])
+                .with_cmd_ready_condition(CmdWaitFor::exit()),
+        )
+        .await
+        .expect("Failed to exec OpenLDAP unauthenticated bind setup");
+    if result.exit_code().await.ok().flatten() != Some(0) {
+        let stdout =
+            String::from_utf8_lossy(&result.stdout_to_vec().await.unwrap_or_default()).into_owned();
+        let stderr =
+            String::from_utf8_lossy(&result.stderr_to_vec().await.unwrap_or_default()).into_owned();
+        panic!("OpenLDAP unauthenticated bind setup failed:\n{stdout}\n{stderr}");
+    }
 }
 
 async fn create_minio_bucket() {

@@ -30,6 +30,7 @@ use crate::registry::{
 use common::{
     Server, auth::AccessToken, cache::invalidate::CacheInvalidationBuilder,
     expr::if_block::BootstrapExprExt, ipc::CacheInvalidation,
+    manager::application::WebApplicationManager,
 };
 use directory::core::secret::{hash_secret, is_password_hash};
 use http_proto::HttpSessionData;
@@ -430,10 +431,11 @@ impl RegistrySet for Server {
                     let mut tasks = Vec::new();
                     let result = match &mut new_object.inner {
                         ObjectInner::Account(account) => {
-                            validate_account(&set, account, modification.as_account()).await?
+                            validate_account(self, access_token, account, modification.as_account())
+                                .await?
                         }
                         ObjectInner::Role(role) => {
-                            validate_role(&set, role, modification.as_role()).await?
+                            validate_role(self, access_token, role, modification.as_role()).await?
                         }
                         // SPDX-SnippetBegin
                         // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
@@ -464,7 +466,12 @@ impl RegistrySet for Server {
                             validate_dns_server(&set, dns, modification.as_dns_server()).await?
                         }
                         ObjectInner::MailingList(_) if is_create => {
-                            validate_tenant_quota(&set, TenantStorageQuota::MaxMailingLists).await?
+                            validate_tenant_quota(
+                                self,
+                                access_token,
+                                TenantStorageQuota::MaxMailingLists,
+                            )
+                            .await?
                         }
                         ObjectInner::OAuthClient(client) => {
                             if let Some(secret) = client.secret.as_mut()
@@ -480,14 +487,23 @@ impl RegistrySet for Server {
                                 .caused_by(trc::location!())?;
                             }
                             if is_create {
-                                validate_tenant_quota(&set, TenantStorageQuota::MaxOauthClients)
-                                    .await?
+                                validate_tenant_quota(
+                                    self,
+                                    access_token,
+                                    TenantStorageQuota::MaxOauthClients,
+                                )
+                                .await?
                             } else {
                                 Ok(ObjectResponse::default())
                             }
                         }
                         ObjectInner::Directory(_) if is_create => {
-                            validate_tenant_quota(&set, TenantStorageQuota::MaxDirectories).await?
+                            validate_tenant_quota(
+                                self,
+                                access_token,
+                                TenantStorageQuota::MaxDirectories,
+                            )
+                            .await?
                         }
                         ObjectInner::AcmeProvider(provider) if is_create => {
                             validate_acme_provider(&set, provider, unpatched_properties).await?
@@ -588,6 +604,18 @@ impl RegistrySet for Server {
                     let object_id = match (modification, result) {
                         (Modification::Update { id, object }, RegistryWriteResult::Success(_)) => {
                             cache_invalidator.process_update(id, &object, &new_object);
+                            if let (
+                                ObjectInner::Application(previous),
+                                ObjectInner::Application(updated),
+                            ) = (&object.inner, &new_object.inner)
+                                && previous.resource_url != updated.resource_url
+                                && let Err(err) =
+                                    WebApplicationManager::delete_bundle(self, id).await
+                            {
+                                trc::error!(
+                                    err.details("Failed to delete cached application bundle")
+                                );
+                            }
                             set.response.updated.append(
                                 id,
                                 if !response.object.is_empty() {
@@ -684,6 +712,15 @@ impl RegistrySet for Server {
                                     schedule_account_destruction(set.server, id, account).await?;
                                 }
 
+                                if matches!(object.inner, ObjectInner::Application(_))
+                                    && let Err(err) =
+                                        WebApplicationManager::delete_bundle(self, id).await
+                                {
+                                    trc::error!(
+                                        err.details("Failed to delete cached application bundle")
+                                    );
+                                }
+
                                 cache_invalidator.process_delete(id, &object);
                                 set.response.destroyed.push(id);
                             }
@@ -732,7 +769,9 @@ impl RegistrySet for Server {
 
             ObjectType::Task => task_set(set).await.map(|set| set.into_response()),
 
-            ObjectType::Action => action_set(set).await.map(|set| set.into_response()),
+            ObjectType::Action => Box::pin(action_set(set))
+                .await
+                .map(|set| set.into_response()),
 
             ObjectType::Bootstrap => Box::pin(bootstrap_set(set))
                 .await

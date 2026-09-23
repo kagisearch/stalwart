@@ -8,7 +8,7 @@ use crate::{
     smtp::session::TestSession,
     utils::{dns::DnsCache, server::TestServerBuilder},
 };
-use mail_auth::MX;
+use mail_auth::{DnssecStatus, MX};
 use registry::{
     schema::{
         enums::MtaProtocol,
@@ -102,6 +102,7 @@ async fn fallback_relay() {
             exchanges: vec!["_dns_error.foobar.org".into()].into_boxed_slice(),
             preference: 10,
         }],
+        DnssecStatus::Secure,
         Instant::now() + Duration::from_secs(10),
     );
     local.server.ipv4_add(
@@ -126,7 +127,9 @@ async fn fallback_relay() {
     let next_due = now();
     let queue_id = retry.queue_id;
     retry.message.recipients[0].retry.due = next_due;
-    retry.save_changes(&local.server, prev_due.into()).await;
+    retry
+        .save_changes(&local.server, prev_due.into(), None)
+        .await;
     local
         .delivery_attempt(queue_id)
         .await

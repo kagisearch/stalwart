@@ -29,7 +29,7 @@ pub async fn test() {
             email: "john.doe@example.org".into(),
             email_aliases: vec!["john@example.org".into()],
             secret: Some("$app$8958830913002348890$".into()),
-            groups: vec!["sales@example.org".into()],
+            groups: Some(vec!["sales@example.org".into()]),
             description: Some("John Doe".into()),
         }
     );
@@ -45,7 +45,10 @@ pub async fn test() {
             email: "jane.smith@example.org".into(),
             email_aliases: vec![],
             secret: Some("$app$4096614298472586996$".into()),
-            groups: vec!["sales@example.org".into(), "corporate@example.org".into()],
+            groups: Some(vec![
+                "sales@example.org".into(),
+                "corporate@example.org".into()
+            ]),
             description: Some("Jane Smith".into()),
         }
     );
@@ -57,6 +60,16 @@ pub async fn test() {
         })
         .await
         .is_err()
+    );
+    assert!(
+        ldap.authenticate(&Credentials::Basic {
+            username: "jane.smith@example.org".into(),
+            secret: "".into(),
+            mfa_token: None,
+        })
+        .await
+        .is_err(),
+        "Empty password accepted during bind authentication"
     );
 
     // Test direct authentication (without bind)
@@ -76,7 +89,7 @@ pub async fn test() {
             email: "john.doe@example.org".into(),
             email_aliases: vec!["john@example.org".into()],
             secret: Some("this is John's LDAP password".into()),
-            groups: vec!["sales@example.org".into()],
+            groups: Some(vec!["sales@example.org".into()]),
             description: Some("John Doe".into()),
         }
     );
@@ -89,6 +102,16 @@ pub async fn test() {
         .await
         .is_err()
     );
+    assert!(
+        ldap.authenticate(&Credentials::Basic {
+            username: "john.doe@example.org".into(),
+            secret: "".into(),
+            mfa_token: None,
+        })
+        .await
+        .is_err(),
+        "Empty password accepted during direct authentication"
+    );
 
     // Test recipient lookup
     assert_eq!(
@@ -97,7 +120,7 @@ pub async fn test() {
             email: "john.doe@example.org".into(),
             email_aliases: vec!["john@example.org".into()],
             secret: Some("this is John's LDAP password".into()),
-            groups: vec!["sales@example.org".into()],
+            groups: Some(vec!["sales@example.org".into()]),
             description: Some("John Doe".into())
         })
     );
@@ -107,7 +130,10 @@ pub async fn test() {
             email: "jane.smith@example.org".into(),
             email_aliases: vec![],
             secret: Some("this is Jane's LDAP password".into()),
-            groups: vec!["sales@example.org".into(), "corporate@example.org".into()],
+            groups: Some(vec![
+                "sales@example.org".into(),
+                "corporate@example.org".into()
+            ]),
             description: Some("Jane Smith".into())
         })
     );
@@ -131,6 +157,59 @@ pub async fn test() {
         ldap.recipient("nonexistent@example.org").await.unwrap(),
         Recipient::Invalid
     );
+
+    const MULTI_MAIL: &[&str] = &[
+        "mm@example.org",
+        "multi.mail@example.org",
+        "multi@example.org",
+    ];
+    let mut config = ldap_test_directory();
+    config.attr_secret = Map::new(vec!["userPassword".to_string()]);
+    config.attr_secret_changed = Map::new(vec![]);
+    config.bind_authentication = false;
+    let ldap_dedicated_attr = LdapDirectory::open(config.clone()).await.unwrap();
+    config.attr_email_alias = Map::new(vec!["mail".to_string()]);
+    let ldap_overloaded_attr = LdapDirectory::open(config).await.unwrap();
+
+    for address in MULTI_MAIL {
+        let Recipient::Account(account) = ldap_dedicated_attr.recipient(address).await.unwrap()
+        else {
+            panic!("Expected an account for {address}");
+        };
+        assert!(
+            MULTI_MAIL.contains(&account.email.as_str()),
+            "Unexpected primary address {:?}",
+            account.email
+        );
+        assert!(
+            account.email_aliases.is_empty(),
+            "Expected no aliases, got {:?}",
+            account.email_aliases
+        );
+
+        let Recipient::Account(account) = ldap_overloaded_attr.recipient(address).await.unwrap()
+        else {
+            panic!("Expected an account for {address}");
+        };
+        assert_eq!(sorted_addresses(&account), MULTI_MAIL);
+    }
+
+    let account = ldap_overloaded_attr
+        .authenticate(&Credentials::Basic {
+            username: "mm@example.org".into(),
+            secret: "this is Multi's LDAP password".into(),
+            mfa_token: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(sorted_addresses(&account), MULTI_MAIL);
+}
+
+fn sorted_addresses(account: &Account) -> Vec<String> {
+    let mut addresses = account.email_aliases.clone();
+    addresses.push(account.email.clone());
+    addresses.sort_unstable();
+    addresses
 }
 
 pub fn ldap_test_directory() -> structs::LdapDirectory {

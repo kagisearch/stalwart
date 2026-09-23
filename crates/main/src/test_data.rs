@@ -12,8 +12,8 @@ use registry::{
     schema::{
         enums::{
             ArfAuthFailureType, ArfDeliveryResult, ArfFeedbackType, ArfIdentityAlignment,
-            DkimAuthResult, DmarcAlignment, DmarcDisposition, DmarcResult, SpfAuthResult,
-            SpfDomainScope, TlsPolicyType, TlsResultType,
+            DkimAuthResult, DmarcAlignment, DmarcDiscovery, DmarcDisposition, DmarcResult,
+            SpfAuthResult, SpfDomainScope, TlsPolicyType, TlsResultType,
         },
         prelude::ObjectType,
         structs::{
@@ -30,8 +30,8 @@ use registry::{
 use smtp::{
     queue::{
         Error, ErrorDetails, FROM_AUTHENTICATED, FROM_DSN, FROM_REPORT, HostResponse, Message,
-        MessageWrapper, RCPT_DSN_SENT, RCPT_SPAM_PAYLOAD, Recipient, Schedule, Status,
-        UnexpectedResponse,
+        MessageWrapper, RCPT_DSN_SENT, Recipient, Schedule, Status, UnexpectedResponse,
+        rcpt_spam_flag,
     },
     reporting::index::{ExternalReportIndex, InternalReportIndex},
 };
@@ -57,7 +57,7 @@ pub async fn insert_test_data(server: &Server) {
             server.inner.data.queue_id_gen.generate(),
             QueueName::default(),
         );
-        assert!(qm.save_changes(server, None).await);
+        assert!(qm.save_changes(server, None, None).await);
     }
 
     for report in sample_tls_internal_reports() {
@@ -163,7 +163,7 @@ fn sample_queued_messages(blob_hashes: Vec<BlobHash>) -> Vec<Message> {
                         },
                     }),
                     flags: RCPT_DSN_SENT,
-                    orcpt: Some("rfc822;bob@example.org".into()),
+                    orcpt: Some("bob@example.org".into()),
                 },
             ],
             received_from_ip: std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
@@ -172,7 +172,7 @@ fn sample_queued_messages(blob_hashes: Vec<BlobHash>) -> Vec<Message> {
             env_id: Some("env-001".into()),
             priority: 0,
             size: raw_messages[0].len() as u64,
-            quota_keys: Box::new([]),
+            metadata: Box::new([]),
         },
         // Message 2: DSN bounce message with a temporary failure recipient
         Message {
@@ -211,7 +211,7 @@ fn sample_queued_messages(blob_hashes: Vec<BlobHash>) -> Vec<Message> {
             env_id: None,
             priority: -5,
             size: raw_messages[1].len() as u64,
-            quota_keys: Box::new([]),
+            metadata: Box::new([]),
         },
         // Message 3: Report message with a temporary failure recipient
         Message {
@@ -234,7 +234,7 @@ fn sample_queued_messages(blob_hashes: Vec<BlobHash>) -> Vec<Message> {
                     entity: "mx.bigcorp.com".into(),
                     details: Error::ConnectionError("Rejected by policy".into()),
                 }),
-                flags: RCPT_SPAM_PAYLOAD,
+                flags: rcpt_spam_flag(72),
                 orcpt: None,
             }],
             received_from_ip: std::net::IpAddr::V4(Ipv4Addr::new(172, 16, 0, 5)),
@@ -243,7 +243,7 @@ fn sample_queued_messages(blob_hashes: Vec<BlobHash>) -> Vec<Message> {
             env_id: Some("env-report-99".into()),
             priority: 10,
             size: raw_messages[2].len() as u64,
-            quota_keys: Box::new([]),
+            metadata: Box::new([]),
         },
     ]
 }
@@ -508,6 +508,9 @@ fn sample_dmarc_internal_reports() -> Vec<DmarcInternalReport> {
                 }]),
                 report_id: "dmarc-int-001".to_string(),
                 version: Float::from(1.0),
+                generator: Some("My Mail Server".to_string()),
+                policy_np: DmarcDisposition::Quarantine,
+                policy_discovery_method: DmarcDiscovery::Psl,
             },
             rua: Map::new(vec!["mailto:dmarc-rua@trusted-sender.com".to_string()]),
         },
@@ -561,6 +564,9 @@ fn sample_dmarc_internal_reports() -> Vec<DmarcInternalReport> {
                 }]),
                 report_id: "dmarc-int-002".to_string(),
                 version: Float::from(1.0),
+                generator: Some("My Mail Server".to_string()),
+                policy_np: DmarcDisposition::Reject,
+                policy_discovery_method: DmarcDiscovery::Psl,
             },
             rua: Map::new(vec!["mailto:dmarc@strict-domain.org".to_string()]),
         },
@@ -640,6 +646,9 @@ fn sample_dmarc_internal_reports() -> Vec<DmarcInternalReport> {
                 ]),
                 report_id: "dmarc-int-003".to_string(),
                 version: Float::from(1.0),
+                generator: Some("My Mail Server".to_string()),
+                policy_np: DmarcDisposition::None,
+                policy_discovery_method: DmarcDiscovery::Treewalk,
             },
             rua: Map::new(vec![
                 "mailto:dmarc@new-policy.io".to_string(),
@@ -1007,6 +1016,9 @@ fn sample_dmarc_external_reports() -> Vec<DmarcExternalReport> {
                 ]),
                 report_id: "dmarc-ext-001-google".to_string(),
                 version: Float::from(1.0),
+                generator: Some("google.com".to_string()),
+                policy_np: DmarcDisposition::None,
+                policy_discovery_method: DmarcDiscovery::Psl,
             },
             subject: "Report domain: myserver.com Submitter: google.com".to_string(),
             to: Map::new(vec!["dmarc-rua@myserver.com".to_string()]),
@@ -1125,6 +1137,9 @@ fn sample_dmarc_external_reports() -> Vec<DmarcExternalReport> {
                 ]),
                 report_id: "dmarc-ext-002-yahoo".to_string(),
                 version: Float::from(1.0),
+                generator: Some("Yahoo! Inc.".to_string()),
+                policy_np: DmarcDisposition::Reject,
+                policy_discovery_method: DmarcDiscovery::Psl,
             },
             subject: "Report domain: myserver.com Submitter: yahoo.com".to_string(),
             to: Map::new(vec!["dmarc-rua@myserver.com".to_string()]),
@@ -1233,6 +1248,9 @@ fn sample_dmarc_external_reports() -> Vec<DmarcExternalReport> {
                 ]),
                 report_id: "dmarc-ext-003-msft".to_string(),
                 version: Float::from(1.0),
+                generator: Some("Microsoft Corporation".to_string()),
+                policy_np: DmarcDisposition::Quarantine,
+                policy_discovery_method: DmarcDiscovery::Treewalk,
             },
             subject: "Report domain: myserver.com Submitter: microsoft.com".to_string(),
             to: Map::new(vec!["dmarc-rua@myserver.com".to_string()]),

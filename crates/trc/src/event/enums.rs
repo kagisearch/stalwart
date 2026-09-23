@@ -6,8 +6,8 @@
 
 // This file is auto-generated. Do not edit directly.
 
-pub const TOTAL_EVENT_COUNT: usize = 610;
-pub const TOTAL_METRIC_COUNT: usize = 339;
+pub const TOTAL_EVENT_COUNT: usize = 642;
+pub const TOTAL_METRIC_COUNT: usize = 369;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventType {
@@ -157,6 +157,7 @@ pub enum DaneEvent {
     TlsaRecordNotFound = 75,
     TlsaRecordNotDnssecSigned = 74,
     TlsaRecordInvalid = 72,
+    BogusDnssecRecord = 605,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -229,6 +230,32 @@ pub enum DkimEvent {
     SignatureRetiring = 598,
     SignatureRetired = 599,
     SignatureDeleted = 600,
+    InstanceMissing = 606,
+    InstanceSyntax = 607,
+    InstanceTagMissing = 608,
+    InstanceNotSigned = 609,
+    InstanceAboveSignature = 610,
+    SignatureMissing = 611,
+    SignatureSyntax = 612,
+    SignatureTagMissing = 613,
+    SignatureTagUnexpected = 614,
+    SequenceGap = 615,
+    SequenceOverflow = 616,
+    ChainTooLong = 635,
+    MailFromMismatch = 617,
+    RcptToMismatch = 618,
+    MailFromDomainMismatch = 619,
+    NextDomainMismatch = 620,
+    CustodyBreak = 636,
+    PublicKeyFetch = 621,
+    PublicKeyMissing = 622,
+    PublicKeyMultiple = 623,
+    PublicKeySyntax = 624,
+    PublicKeyAlgorithmMismatch = 625,
+    NoValidAlgorithm = 626,
+    HeaderHashMismatch = 627,
+    Modified = 628,
+    Exploded = 629,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -311,6 +338,7 @@ pub enum ImapEvent {
     Subscribe = 192,
     Unsubscribe = 194,
     Thread = 193,
+    UidBatches = 634,
     GetQuota = 57,
     Error = 168,
     RawInput = 183,
@@ -667,6 +695,9 @@ pub enum SmtpEvent {
     LoopDetected = 443,
     DkimPass = 422,
     DkimFail = 421,
+    Dkim2Pass = 630,
+    Dkim2Fail = 631,
+    Dkim2DsnDiscarded = 632,
     ArcPass = 410,
     ArcFail = 409,
     SpfEhloPass = 474,
@@ -797,6 +828,7 @@ pub enum StoreEvent {
     CacheHit = 51,
     CacheStale = 52,
     CacheUpdate = 577,
+    CacheEntryTooLarge = 633,
     BlobMissingMarker = 507,
     DataWrite = 513,
     DataIterate = 512,
@@ -923,6 +955,7 @@ pub enum MetricType {
     DaneTlsaRecordNotFound = 61,
     DaneTlsaRecordNotDnssecSigned = 62,
     DaneTlsaRecordInvalid = 63,
+    DaneBogusDnssecRecord = 339,
     DeliveryTotalTime = 2,
     DeliveryAttemptTime = 3,
     DeliveryActiveConnections = 22,
@@ -968,6 +1001,32 @@ pub enum MetricType {
     DkimSignatureExpired = 103,
     DkimSignatureLength = 104,
     DkimSignerNotFound = 105,
+    DkimInstanceMissing = 340,
+    DkimInstanceSyntax = 341,
+    DkimInstanceTagMissing = 342,
+    DkimInstanceNotSigned = 343,
+    DkimInstanceAboveSignature = 344,
+    DkimSignatureMissing = 345,
+    DkimSignatureSyntax = 346,
+    DkimSignatureTagMissing = 347,
+    DkimSignatureTagUnexpected = 348,
+    DkimSequenceGap = 349,
+    DkimSequenceOverflow = 350,
+    DkimChainTooLong = 367,
+    DkimMailFromMismatch = 351,
+    DkimRcptToMismatch = 352,
+    DkimMailFromDomainMismatch = 353,
+    DkimNextDomainMismatch = 354,
+    DkimCustodyBreak = 368,
+    DkimPublicKeyFetch = 355,
+    DkimPublicKeyMissing = 356,
+    DkimPublicKeyMultiple = 357,
+    DkimPublicKeySyntax = 358,
+    DkimPublicKeyAlgorithmMismatch = 359,
+    DkimNoValidAlgorithm = 360,
+    DkimHeaderHashMismatch = 361,
+    DkimModified = 362,
+    DkimExploded = 363,
     DmarcPass = 106,
     DmarcFail = 107,
     DmarcPermError = 108,
@@ -1143,6 +1202,9 @@ pub enum MetricType {
     SmtpLoopDetected = 255,
     SmtpDkimPass = 256,
     SmtpDkimFail = 257,
+    SmtpDkim2Pass = 364,
+    SmtpDkim2Fail = 365,
+    SmtpDkim2DsnDiscarded = 366,
     SmtpArcPass = 258,
     SmtpArcFail = 259,
     SmtpSpfEhloPass = 260,

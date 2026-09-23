@@ -193,7 +193,7 @@ impl<T: SessionStream> Session<T> {
 
         match self
             .server
-            .rcpt_resolve(&rcpt.address_lcase, self.data.session_id)
+            .rcpt_resolve(&rcpt.address_lcase, true, self.data.session_id)
             .await
         {
             Ok(RcptResolution::Accept) => {}
@@ -202,8 +202,8 @@ impl<T: SessionStream> Session<T> {
                 let mut new_addr = SessionAddress::new(address);
 
                 if !self.data.rcpt_to.contains(&new_addr) {
-                    new_addr.dsn_info = format!("rfc822;{}", orig_addr.address_lcase).into();
                     new_addr.flags = orig_addr.flags;
+                    new_addr.dsn_info = orig_addr.address_lcase.into();
                     self.data.rcpt_to.push(new_addr);
                 } else {
                     trc::event!(
@@ -353,15 +353,52 @@ impl<T: SessionStream> Session<T> {
         // Expand list
         if let Some(members) = rcpt_members {
             let list_addr = self.data.rcpt_to.pop().unwrap();
-            let orcpt = format!("rfc822;{}", list_addr.address_lcase);
-            for member in self
-                .server
-                .expand_list_members(members, &list_addr.address_lcase, self.data.session_id)
-                .await
-            {
-                let mut member_addr = SessionAddress::new(member);
-                if !self.data.rcpt_to.contains(&member_addr) {
-                    member_addr.dsn_info = orcpt.clone().into();
+            for member in members.as_ref() {
+                let member_lcase = member.to_lowercase();
+                let is_local = match self
+                    .server
+                    .account_id_from_email(&member_lcase, false)
+                    .await
+                {
+                    Ok(account_id) => account_id.is_some(),
+                    Err(err) => {
+                        trc::error!(
+                            err.span_id(self.data.session_id)
+                                .caused_by(trc::location!())
+                                .details("Failed to look up mailing list member.")
+                                .ctx(trc::Key::To, member.to_string())
+                        );
+                        false
+                    }
+                };
+
+                let address = if is_local {
+                    member.to_string()
+                } else {
+                    match self
+                        .server
+                        .rcpt_resolve(&member_lcase, false, self.data.session_id)
+                        .await
+                    {
+                        Ok(RcptResolution::Rewrite(address)) => address,
+                        Ok(_) => member.to_string(),
+                        Err(err) => {
+                            trc::error!(
+                                err.span_id(self.data.session_id)
+                                    .caused_by(trc::location!())
+                                    .details("Failed to resolve mailing list member.")
+                                    .ctx(trc::Key::To, member.to_string())
+                            );
+                            member.to_string()
+                        }
+                    }
+                };
+
+                let mut member_addr = SessionAddress::new(address);
+                if !self.data.rcpt_to.contains(&member_addr)
+                    && member_addr.address_lcase != list_addr.address_lcase
+                {
+                    member_addr.dsn_info = list_addr.address_lcase.clone().into();
                     member_addr.flags = list_addr.flags;
                     self.data.rcpt_to.push(member_addr);
                 }

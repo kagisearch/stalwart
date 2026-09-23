@@ -154,7 +154,7 @@ async fn is_dnsbl(
 
                     entry
                 }
-                Err(Error::DnsRecordNotFound(_)) => {
+                Err(Error::Dns(mail_auth::DnsError::RecordNotFound(_))) => {
                     trc::event!(
                         Spam(SpamEvent::Dnsbl),
                         Hostname = zone.clone(),

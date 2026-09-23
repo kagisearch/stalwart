@@ -133,7 +133,7 @@ async fn store_maintenance(
 
                 #[cfg(not(feature = "test_mode"))]
                 let status =
-                    TaskStatus::at(now + rand::Rng::random_range(&mut rand::rng(), 0..=300));
+                    TaskStatus::at(now + rand::RngExt::random_range(&mut rand::rng(), 0..=300));
 
                 batch.schedule_task(Task::AccountMaintenance(TaskAccountMaintenance {
                     account_id: account_id.into(),
@@ -218,6 +218,12 @@ async fn store_maintenance(
             server
                 .in_memory_store()
                 .purge_in_memory_store()
+                .await
+                .caused_by(trc::location!())?;
+
+            server
+                .registry()
+                .purge_dead_nodes()
                 .await
                 .caused_by(trc::location!())?;
 
@@ -378,7 +384,7 @@ async fn store_maintenance(
 
                     #[cfg(not(feature = "test_mode"))]
                     let status =
-                        TaskStatus::at(now + rand::Rng::random_range(&mut rand::rng(), 0..=300));
+                        TaskStatus::at(now + rand::RngExt::random_range(&mut rand::rng(), 0..=300));
 
                     batch.schedule_task(Task::TenantMaintenance(TaskTenantMaintenance {
                         tenant_id: tenant_id.into(),

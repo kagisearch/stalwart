@@ -51,13 +51,19 @@ impl CalendarGet for Server {
             CalendarProperty::Name,
             CalendarProperty::Description,
             CalendarProperty::Color,
-            CalendarProperty::TimeZone,
             CalendarProperty::SortOrder,
-            CalendarProperty::IsDefault,
             CalendarProperty::IsSubscribed,
+            CalendarProperty::IsVisible,
+            CalendarProperty::IsDefault,
+            CalendarProperty::IncludeInAvailability,
+            CalendarProperty::DefaultAlertsWithTime,
+            CalendarProperty::DefaultAlertsWithoutTime,
+            CalendarProperty::TimeZone,
+            CalendarProperty::ShareWith,
             CalendarProperty::MyRights,
         ]);
         let account_id = request.account_id.document_id();
+        let personal_id = access_token.personal_id(account_id, Collection::Calendar);
         let cache = self
             .fetch_dav_resources(
                 access_token.account_id(),
@@ -81,13 +87,7 @@ impl CalendarGet for Server {
             })
             .await
             .caused_by(trc::location!())?
-            .or_else(|| {
-                if calendar_ids.len() == 1 {
-                    calendar_ids.iter().next()
-                } else {
-                    None
-                }
-            });
+            .or_else(|| cache.document_ids(true).min());
 
         let ids = if let Some(ids) = ids {
             ids
@@ -138,14 +138,14 @@ impl CalendarGet for Server {
                     CalendarProperty::Name => {
                         result.insert_unchecked(
                             CalendarProperty::Name,
-                            calendar.preferences(access_token).name.to_string(),
+                            calendar.preferences(personal_id).name.to_string(),
                         );
                     }
                     CalendarProperty::Description => {
                         result.insert_unchecked(
                             CalendarProperty::Description,
                             calendar
-                                .preferences(access_token)
+                                .preferences(personal_id)
                                 .description
                                 .as_ref()
                                 .map(|v| v.to_string()),
@@ -154,7 +154,7 @@ impl CalendarGet for Server {
                     CalendarProperty::SortOrder => {
                         result.insert_unchecked(
                             CalendarProperty::SortOrder,
-                            calendar.preferences(access_token).sort_order.to_native(),
+                            calendar.preferences(personal_id).sort_order.to_native(),
                         );
                     }
                     CalendarProperty::IsDefault => {
@@ -167,7 +167,7 @@ impl CalendarGet for Server {
                         result.insert_unchecked(
                             CalendarProperty::IsSubscribed,
                             Value::Bool(
-                                calendar.preferences(access_token).flags & CALENDAR_SUBSCRIBED != 0,
+                                calendar.preferences(personal_id).flags & CALENDAR_SUBSCRIBED != 0,
                             ),
                         );
                     }
@@ -175,7 +175,7 @@ impl CalendarGet for Server {
                         result.insert_unchecked(
                             CalendarProperty::Color,
                             calendar
-                                .preferences(access_token)
+                                .preferences(personal_id)
                                 .color
                                 .as_ref()
                                 .map(|c| c.to_string()),
@@ -185,7 +185,7 @@ impl CalendarGet for Server {
                         result.insert_unchecked(
                             CalendarProperty::IsVisible,
                             Value::Bool(
-                                calendar.preferences(access_token).flags & CALENDAR_INVISIBLE == 0,
+                                calendar.preferences(personal_id).flags & CALENDAR_INVISIBLE == 0,
                             ),
                         );
                     }
@@ -194,7 +194,7 @@ impl CalendarGet for Server {
                             CalendarProperty::IncludeInAvailability,
                             Value::Element(CalendarValue::IncludeInAvailability(
                                 IncludeInAvailability::from_flags(
-                                    calendar.preferences(access_token).flags.to_native(),
+                                    calendar.preferences(personal_id).flags.to_native(),
                                 )
                                 .unwrap_or(if is_owner {
                                     IncludeInAvailability::All
@@ -209,7 +209,7 @@ impl CalendarGet for Server {
                             CalendarProperty::DefaultAlertsWithTime,
                             Value::Object(Map::from_iter(
                                 calendar
-                                    .default_alerts(access_token, true)
+                                    .default_alerts(personal_id, true)
                                     .map(default_alarm_to_value),
                             )),
                         );
@@ -219,7 +219,7 @@ impl CalendarGet for Server {
                             CalendarProperty::DefaultAlertsWithoutTime,
                             Value::Object(Map::from_iter(
                                 calendar
-                                    .default_alerts(access_token, false)
+                                    .default_alerts(personal_id, false)
                                     .map(default_alarm_to_value),
                             )),
                         );
@@ -228,7 +228,7 @@ impl CalendarGet for Server {
                         result.insert_unchecked(
                             CalendarProperty::TimeZone,
                             calendar
-                                .preferences(access_token)
+                                .preferences(personal_id)
                                 .time_zone
                                 .tz()
                                 .map(|tz| Value::Element(CalendarValue::Timezone(tz)))

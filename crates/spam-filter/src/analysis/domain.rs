@@ -79,9 +79,7 @@ impl SpamFilterAnalyzeDomain for Server {
                         domains.insert(ElementLocation::new(mid_domain.fqdn, Location::HeaderMid));
                     }
                 }
-                (HeaderName::Other(name), _)
-                    if name.eq_ignore_ascii_case("Disposition-Notification-To") =>
-                {
+                (HeaderName::DispositionNotificationTo, _) => {
                     if let Some(address) = MessageStream::new(
                         ctx.input
                             .message
@@ -192,7 +190,7 @@ impl SpamFilterAnalyzeDomain for Server {
                 if let TokenType::Email(email) = token {
                     if !ctx.input.is_train && is_body && !ctx.result.has_tag("RCPT_IN_BODY") {
                         for rcpt in ctx.output.all_recipients() {
-                            if rcpt.email.address == email.address {
+                            if &rcpt.email == email {
                                 ctx.result.add_tag("RCPT_IN_BODY");
                                 break;
                             }

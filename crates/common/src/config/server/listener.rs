@@ -5,7 +5,7 @@
  */
 
 use super::{
-    Listener, Listeners, ServerProtocol, TcpListener,
+    DEFAULT_TLS_TIMEOUT, Listener, Listeners, ServerProtocol, TcpListener,
     tls::{TLS12_VERSION, TLS13_VERSION},
 };
 use crate::{
@@ -121,7 +121,9 @@ impl Listeners {
             } {
                 Ok(socket) => socket,
                 Err(err)
-                    if is_eafnosupport(&err) && addr.is_ipv6() && addr.ip().is_unspecified() =>
+                    if is_ipv6_unsupported(&err)
+                        && addr.is_ipv6()
+                        && addr.ip().is_unspecified() =>
                 {
                     let v4_addr =
                         StdSocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), addr.port());
@@ -149,6 +151,20 @@ impl Listeners {
                     return;
                 }
             };
+
+            #[cfg(windows)]
+            if addr.is_ipv6()
+                && addr.ip().is_unspecified()
+                && let Err(err) = socket2::SockRef::from(&socket).set_only_v6(false)
+            {
+                bp.build_warning(
+                    id,
+                    format!(
+                        "Failed to disable IPV6_V6ONLY on {addr} ({err}); \
+                         IPv4 clients will not be able to connect to this listener"
+                    ),
+                );
+            }
 
             if let Err(err) = socket.set_reuseaddr(listener.socket_reuse_address) {
                 bp.build_error(id, format!("Failed to set SO_REUSEADDR: {err}"));
@@ -195,6 +211,9 @@ impl Listeners {
 
         self.servers.push(Listener {
             max_connections: listener.max_connections.unwrap_or(system.max_connections),
+            tls_timeout: listener
+                .tls_timeout
+                .map_or(DEFAULT_TLS_TIMEOUT, |timeout| timeout.into_inner()),
             id: listener.name.clone(),
             registry_id: id,
             protocol,
@@ -313,15 +332,15 @@ impl Listeners {
     }
 }
 
-fn is_eafnosupport(err: &std::io::Error) -> bool {
+fn is_ipv6_unsupported(err: &std::io::Error) -> bool {
     let code = err.raw_os_error();
     #[cfg(unix)]
     {
-        code == Some(libc::EAFNOSUPPORT)
+        matches!(code, Some(libc::EAFNOSUPPORT) | Some(libc::EPROTONOSUPPORT))
     }
     #[cfg(windows)]
     {
-        code == Some(10047)
+        matches!(code, Some(10047) | Some(10043))
     }
     #[cfg(not(any(unix, windows)))]
     {

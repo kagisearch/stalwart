@@ -14,7 +14,7 @@ use jmap_proto::{
     object::vacation_response::{self, VacationResponseProperty, VacationResponseValue},
     references::resolve::ResolveCreatedReference,
     request::IntoValid,
-    types::date::UTCDate,
+    types::{date::UTCDate, state::State},
 };
 use jmap_tools::{Key, Map, Value};
 use mail_builder::MessageBuilder;
@@ -141,7 +141,7 @@ impl VacationResponseSet for Server {
             };
 
             // Parse properties
-            let mut is_active = false;
+            let mut is_active = document_id.is_some_and(|id| active_script_id == Some(id));
             let mut build_script = create_id.is_some();
             let vacation = sieve.vacation_response.as_mut().unwrap();
 
@@ -296,13 +296,12 @@ impl VacationResponseSet for Server {
 
             // Write changes
             if !batch.is_empty() {
-                response.new_state = Some(
+                response.new_state = Some(State::Exact(
                     self.commit_batch(batch)
                         .await
                         .and_then(|ids| ids.last_change_id(account_id))
-                        .caused_by(trc::location!())?
-                        .into(),
-                );
+                        .caused_by(trc::location!())?,
+                ));
             }
 
             // Add result
@@ -408,7 +407,7 @@ impl VacationResponseSet for Server {
 
         script.push(b'\"');
         for ch in message_body {
-            if [b'\\', b'\"'].contains(&ch) {
+            if b"\\\"".contains(&ch) {
                 script.push(b'\\');
             }
             script.push(ch);

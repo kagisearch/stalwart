@@ -116,6 +116,7 @@ impl BroadcastBatch<Vec<BroadcastEvent>> {
                                 let _ = serialized.write_leb128(*local_part_hash);
                                 continue;
                             }
+                            CacheInvalidation::DomainNegative => (11u8, 0),
                         };
 
                         serialized.push(marker);
@@ -134,6 +135,9 @@ impl BroadcastBatch<Vec<BroadcastEvent>> {
                     } else {
                         serialized.push(11u8);
                     }
+                }
+                BroadcastEvent::QueueRefresh => {
+                    serialized.push(12u8);
                 }
             }
         }
@@ -257,6 +261,7 @@ where
                                     local_part_hash,
                                 }
                             }
+                            11 => CacheInvalidation::DomainNegative,
                             _ => return Err(()),
                         });
                     }
@@ -266,6 +271,7 @@ where
                 9 => Ok(Some(BroadcastEvent::CacheInvalidateNegative)),
                 10 => Ok(Some(BroadcastEvent::MtaQueueStatus { is_running: true })),
                 11 => Ok(Some(BroadcastEvent::MtaQueueStatus { is_running: false })),
+                12 => Ok(Some(BroadcastEvent::QueueRefresh)),
                 _ => Err(()),
             }
         } else {

@@ -14,6 +14,7 @@ use jsonwebtoken::{
     jwk::{self, JwkSet},
 };
 use reqwest::Client;
+use serde_json::Value;
 use std::time::Instant;
 use std::{sync::Arc, time::Duration};
 use trc::AuthEvent;
@@ -21,6 +22,9 @@ use trc::AuthEvent;
 impl OpenIdDirectory {
     pub async fn authenticate(&self, credentials: &Credentials) -> trc::Result<Account> {
         match credentials {
+            Credentials::Bearer { token, .. } if token.is_empty() => {
+                Err(AuthEvent::Failed.into_err().reason("Empty token rejected"))
+            }
             Credentials::Bearer { token, .. } => if let Ok(header) = decode_header(token) {
                 self.authenticate_jwt(token, header).await
             } else {
@@ -77,12 +81,33 @@ impl OpenIdDirectory {
 
                     self.validate_scopes(&token_data.claims)?;
 
-                    let (email, claims) = if let Ok(email) = self.resolve_email(&token_data.claims)
-                    {
-                        (email, token_data.claims)
-                    } else {
-                        let claims = self.fetch_userinfo(token).await?;
-                        (self.resolve_email(&claims)?, claims)
+                    let mut claims = token_data.claims;
+                    let jwt_email = self.resolve_email(&claims).ok();
+                    let missing_profile =
+                        is_claim_missing(&claims, self.config.claim_name.as_ref())
+                            || is_claim_missing(&claims, self.config.claim_groups.as_ref());
+
+                    if jwt_email.is_none() || missing_profile {
+                        match self.fetch_userinfo(token).await {
+                            Ok(userinfo) => {
+                                if let (Some(base), Value::Object(extra)) =
+                                    (claims.as_object_mut(), userinfo)
+                                {
+                                    for (key, value) in extra {
+                                        if base.get(&key).is_none_or(Value::is_null) {
+                                            base.insert(key, value);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) if jwt_email.is_none() => return Err(err),
+                            Err(_) => {}
+                        }
+                    }
+
+                    let email = match jwt_email {
+                        Some(email) => email,
+                        None => self.resolve_email(&claims)?,
                     };
                     return self.build_account(email, &claims);
                 }
@@ -212,20 +237,23 @@ impl OpenIdDirectory {
                 .claim_groups
                 .as_ref()
                 .and_then(|groups_claim| claims.get(groups_claim))
-                .map(extract_string_list)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|group| match &self.config.default_domain {
-                    Some(domain) if !group.contains('@') => format!("{group}@{domain}"),
-                    _ => group,
-                })
-                .collect(),
+                .and_then(extract_string_list)
+                .map(|groups| {
+                    groups
+                        .into_iter()
+                        .map(|group| match &self.config.default_domain {
+                            Some(domain) if !group.contains('@') => format!("{group}@{domain}"),
+                            _ => group,
+                        })
+                        .collect()
+                }),
             description: self
                 .config
                 .claim_name
                 .as_ref()
                 .and_then(|name_claim| claims.get(name_claim))
                 .and_then(|v| v.as_str())
+                .filter(|name| !name.is_empty())
                 .map(|s| s.to_string()),
         })
     }
@@ -329,6 +357,17 @@ pub(super) async fn fetch_jwks_keys(
                 );
                 continue;
             }
+            _ => {
+                trc::event!(
+                    Auth(AuthEvent::Warning),
+                    Url = jwks_uri.to_string(),
+                    Reason = format!(
+                        "Unrecognised key type in JWKS (kid={:?}), skipping",
+                        key.common.key_id
+                    )
+                );
+                continue;
+            }
         };
 
         let decoding_key = match DecodingKey::from_jwk(key) {
@@ -377,13 +416,53 @@ fn extract_scopes(claims: &serde_json::Value) -> Vec<String> {
     }
 }
 
-fn extract_string_list(value: &serde_json::Value) -> Vec<String> {
+fn extract_string_list(value: &serde_json::Value) -> Option<Vec<String>> {
     match value {
-        serde_json::Value::Array(arr) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect(),
-        serde_json::Value::String(s) => s.split_whitespace().map(|s| s.to_string()).collect(),
-        _ => Vec::new(),
+        serde_json::Value::Array(arr) => Some(
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+        ),
+        serde_json::Value::String(s) => Some(s.split_whitespace().map(|s| s.to_string()).collect()),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn is_claim_missing(claims: &serde_json::Value, claim: Option<&String>) -> bool {
+    claim.is_some_and(|claim| claims.get(claim).is_none_or(serde_json::Value::is_null))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extract_string_list_distinguishes_absent_from_empty() {
+        assert_eq!(
+            extract_string_list(&json!(["sales", "support"])),
+            Some(vec!["sales".to_string(), "support".to_string()])
+        );
+        assert_eq!(
+            extract_string_list(&json!("sales support")),
+            Some(vec!["sales".to_string(), "support".to_string()])
+        );
+        assert_eq!(extract_string_list(&json!([])), Some(vec![]));
+        assert_eq!(extract_string_list(&json!("")), Some(vec![]));
+        assert_eq!(extract_string_list(&json!(null)), None);
+        assert_eq!(extract_string_list(&json!({"groups": []})), None);
+        assert_eq!(extract_string_list(&json!(42)), None);
+    }
+
+    #[test]
+    fn is_claim_missing_treats_null_as_absent() {
+        let claims = json!({"groups": null, "name": "John Doe", "roles": []});
+
+        assert!(is_claim_missing(&claims, Some(&"groups".to_string())));
+        assert!(is_claim_missing(&claims, Some(&"unknown".to_string())));
+        assert!(!is_claim_missing(&claims, Some(&"name".to_string())));
+        assert!(!is_claim_missing(&claims, Some(&"roles".to_string())));
+        assert!(!is_claim_missing(&claims, None));
     }
 }

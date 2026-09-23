@@ -18,8 +18,8 @@ impl Server {
             .mx_lookup(entry, Some(&self.inner.cache.dns_mx))
             .await
         {
-            Ok(result) => Ok(result.iter().any(|mx| !mx.exchanges.is_empty())),
-            Err(Error::DnsRecordNotFound(_)) => Ok(false),
+            Ok(result) => Ok(result.rrset.iter().any(|mx| !mx.exchanges.is_empty())),
+            Err(Error::Dns(mail_auth::DnsError::RecordNotFound(_))) => Ok(false),
             Err(err) => Err(err.into()),
         }
     }
@@ -40,7 +40,7 @@ impl Server {
             .await
         {
             Ok(result) => Ok(!result.is_empty()),
-            Err(Error::DnsRecordNotFound(_)) => Ok(false),
+            Err(Error::Dns(mail_auth::DnsError::RecordNotFound(_))) => Ok(false),
             Err(err) => Err(err.into()),
         }
     }
@@ -55,8 +55,8 @@ impl Server {
                 .ptr_lookup(addr, Some(&self.inner.cache.dns_ptr))
                 .await
             {
-                Ok(result) => Ok(!result.is_empty()),
-                Err(Error::DnsRecordNotFound(_)) => Ok(false),
+                Ok(result) => Ok(!result.rrset.is_empty()),
+                Err(Error::Dns(mail_auth::DnsError::RecordNotFound(_))) => Ok(false),
                 Err(err) => Err(err.into()),
             }
         } else {
@@ -73,8 +73,8 @@ impl Server {
             .ipv4_lookup(entry, Some(&self.inner.cache.dns_ipv4))
             .await
         {
-            Ok(result) => Ok(!result.is_empty()),
-            Err(Error::DnsRecordNotFound(_)) => Ok(false),
+            Ok(result) => Ok(!result.rrset.is_empty()),
+            Err(Error::Dns(mail_auth::DnsError::RecordNotFound(_))) => Ok(false),
             Err(err) => Err(err.into()),
         }
     }
@@ -88,8 +88,8 @@ impl Server {
             .ipv6_lookup(entry, Some(&self.inner.cache.dns_ipv6))
             .await
         {
-            Ok(result) => Ok(!result.is_empty()),
-            Err(Error::DnsRecordNotFound(_)) => Ok(false),
+            Ok(result) => Ok(!result.rrset.is_empty()),
+            Err(Error::Dns(mail_auth::DnsError::RecordNotFound(_))) => Ok(false),
             Err(err) => Err(err.into()),
         }
     }

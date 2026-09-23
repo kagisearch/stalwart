@@ -44,7 +44,7 @@ pub struct Enterprise {
     pub spam_filter_llm: Option<SpamFilterLlmConfig>,
     pub template_calendar_alarm: Option<Template<CalendarTemplateVariable>>,
     pub template_scheduling_email: Option<Template<CalendarTemplateVariable>>,
-    pub template_scheduling_web: Option<Template<CalendarTemplateVariable>>,
+    pub template_scheduling_web: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,7 +171,7 @@ impl Server {
         let mut domain_id = u32::MAX;
         let mut tenant_id = None;
         if let Some((d_id, t_id)) = self.domain(domain).await?.map(|d| (d.id, d.id_tenant))
-            && let Some(domain_record) = self.registry().object::<Domain>(domain_id.into()).await?
+            && let Some(domain_record) = self.registry().object::<Domain>(d_id.into()).await?
         {
             logo_url = domain_record.logo;
             domain_id = d_id;
@@ -203,10 +203,10 @@ impl Server {
 
         let mut logo = None;
         if let Some(logo_url) = logo_url {
-            let response = reqwest::Client::builder()
+            let response = utils::http::http_client_builder(false)
                 .user_agent(USER_AGENT)
                 .build()
-                .unwrap()
+                .unwrap_or_default()
                 .get(logo_url.as_str())
                 .send()
                 .await

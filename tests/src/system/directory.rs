@@ -72,6 +72,44 @@ pub async fn test(test: &TestServer) {
         .await
         .assert_type(SetErrorType::PrimaryKeyViolation);
 
+    // An alias matching another domain's name should not be allowed
+    account
+        .registry_create_object_expect_err(Domain {
+            name: "example.net".to_string(),
+            certificate_management: CertificateManagement::Manual,
+            dns_management: DnsManagement::Manual,
+            dkim_management: DkimManagement::Manual,
+            aliases: Map::new(vec!["example.com".to_string()]),
+            ..Default::default()
+        })
+        .await
+        .assert_type(SetErrorType::PrimaryKeyViolation);
+
+    // An alias matching another domain's alias should not be allowed
+    account
+        .registry_create_object_expect_err(Domain {
+            name: "example.net".to_string(),
+            certificate_management: CertificateManagement::Manual,
+            dns_management: DnsManagement::Manual,
+            dkim_management: DkimManagement::Manual,
+            aliases: Map::new(vec!["beispiel.de".to_string()]),
+            ..Default::default()
+        })
+        .await
+        .assert_type(SetErrorType::PrimaryKeyViolation);
+
+    // A domain name matching another domain's alias should not be allowed
+    account
+        .registry_create_object_expect_err(Domain {
+            name: "beispiel.de".to_string(),
+            certificate_management: CertificateManagement::Manual,
+            dns_management: DnsManagement::Manual,
+            dkim_management: DkimManagement::Manual,
+            ..Default::default()
+        })
+        .await
+        .assert_type(SetErrorType::PrimaryKeyViolation);
+
     // Invalid local part should not be allowed
     account
         .registry_create_object_expect_err(Account::User(UserAccount {
@@ -317,6 +355,29 @@ pub async fn test(test: &TestServer) {
         ]))
     );
 
+    // Verify that alias domains resolve without the primary name warming the cache
+    for address in [
+        "johndoe@beispiel.de",
+        "sales@beispiel.de",
+        "newsletter@beispiel.de",
+    ] {
+        test.server.invalidate_all_local_caches();
+        assert!(
+            test.server.domain("beispiel.de").await.unwrap().is_some(),
+            "Alias domain failed to resolve on a cold cache"
+        );
+
+        test.server.invalidate_all_local_caches();
+        assert!(
+            test.server
+                .rcpt_id_from_email(address)
+                .await
+                .unwrap()
+                .is_some(),
+            "Cold cache resolution failed for {address}"
+        );
+    }
+
     // Verify RCPT expansion
     for (address, expected) in [
         (
@@ -418,47 +479,47 @@ pub async fn test(test: &TestServer) {
         }))
         .await;
     assert_eq!(
-        test.server.rcpt_resolve("unknown", 0).await.unwrap(),
+        test.server.rcpt_resolve("unknown", true, 0).await.unwrap(),
         RcptResolution::UnknownDomain
     );
     assert_eq!(
         test.server
-            .rcpt_resolve("unknown@unknown.org", 0)
+            .rcpt_resolve("unknown@unknown.org", true, 0)
             .await
             .unwrap(),
         RcptResolution::UnknownDomain
     );
     assert_eq!(
         test.server
-            .rcpt_resolve("jdoe@example.com", 0)
+            .rcpt_resolve("jdoe@example.com", true, 0)
             .await
             .unwrap(),
         RcptResolution::Accept
     );
     assert_eq!(
         test.server
-            .rcpt_resolve("johndoe@beispiel.de", 0)
+            .rcpt_resolve("johndoe@beispiel.de", true, 0)
             .await
             .unwrap(),
         RcptResolution::Accept
     );
     assert_eq!(
         test.server
-            .rcpt_resolve("sales@example.com", 0)
+            .rcpt_resolve("sales@example.com", true, 0)
             .await
             .unwrap(),
         RcptResolution::Accept
     );
     assert_eq!(
         test.server
-            .rcpt_resolve("jdoe+promotions@example.com", 0)
+            .rcpt_resolve("jdoe+promotions@example.com", true, 0)
             .await
             .unwrap(),
         RcptResolution::Rewrite("jdoe@example.com".into())
     );
     assert_eq!(
         test.server
-            .rcpt_resolve("newsletter@example.com", 0)
+            .rcpt_resolve("newsletter@example.com", true, 0)
             .await
             .unwrap(),
         RcptResolution::Expand(Arc::from(Box::from_iter([
@@ -468,31 +529,93 @@ pub async fn test(test: &TestServer) {
     );
     assert_eq!(
         test.server
-            .rcpt_resolve("unknown@example.com", 0)
+            .rcpt_resolve("unknown@example.com", true, 0)
             .await
             .unwrap(),
         RcptResolution::Rewrite("catchy@example.com".into())
     );
     assert_eq!(
         test.server
-            .rcpt_resolve("subaddresser.ignoreme@another-example.com", 0)
-            .await
-            .unwrap(),
-        RcptResolution::Rewrite("subaddresser@another-example.com".into())
-    );
-    assert_eq!(
-        test.server
-            .rcpt_resolve("unknown@another-example.com", 0)
+            .rcpt_resolve("unknown@example.com", false, 0)
             .await
             .unwrap(),
         RcptResolution::UnknownRecipient
     );
     assert_eq!(
         test.server
-            .rcpt_resolve(masked_email.as_str(), 0)
+            .rcpt_resolve("jdoe+promotions@example.com", false, 0)
+            .await
+            .unwrap(),
+        RcptResolution::Rewrite("jdoe@example.com".into())
+    );
+    assert_eq!(
+        test.server
+            .rcpt_resolve("subaddresser.ignoreme@another-example.com", true, 0)
+            .await
+            .unwrap(),
+        RcptResolution::Rewrite("subaddresser@another-example.com".into())
+    );
+    assert_eq!(
+        test.server
+            .rcpt_resolve("unknown@another-example.com", true, 0)
+            .await
+            .unwrap(),
+        RcptResolution::UnknownRecipient
+    );
+    assert_eq!(
+        test.server
+            .rcpt_resolve(masked_email.as_str(), true, 0)
             .await
             .unwrap(),
         RcptResolution::Rewrite("johndoe@example.com".into())
+    );
+
+    // Catch-all addresses have to be resolved rather than accepted verbatim
+    let domain_3_id = account
+        .registry_create_object(Domain {
+            name: "list-catch-all.com".to_string(),
+            is_enabled: true,
+            certificate_management: CertificateManagement::Manual,
+            dns_management: DnsManagement::Manual,
+            dkim_management: DkimManagement::Manual,
+            catch_all_address: Some("newsletter@example.com".to_string()),
+            ..Default::default()
+        })
+        .await;
+    let domain_4_id = account
+        .registry_create_object(Domain {
+            name: "subaddress-catch-all.com".to_string(),
+            is_enabled: true,
+            certificate_management: CertificateManagement::Manual,
+            dns_management: DnsManagement::Manual,
+            dkim_management: DkimManagement::Manual,
+            catch_all_address: Some("jdoe+catchall@example.com".to_string()),
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(
+        test.server
+            .rcpt_resolve("unknown@list-catch-all.com", true, 0)
+            .await
+            .unwrap(),
+        RcptResolution::Expand(Arc::from(Box::from_iter([
+            "jdoe@example.com".into(),
+            "sales@example.com".into()
+        ])))
+    );
+    assert_eq!(
+        test.server
+            .rcpt_resolve("unknown@subaddress-catch-all.com", true, 0)
+            .await
+            .unwrap(),
+        RcptResolution::Rewrite("jdoe@example.com".into())
+    );
+    assert_eq!(
+        test.server
+            .rcpt_resolve("unknown@list-catch-all.com", false, 0)
+            .await
+            .unwrap(),
+        RcptResolution::UnknownRecipient
     );
 
     // Query tests
@@ -534,9 +657,12 @@ pub async fn test(test: &TestServer) {
         .await
         .assert_destroyed(&[group_id, account_id, account_2_id]);
     account
-        .registry_destroy(ObjectType::Domain, [domain_id, domain_2_id])
+        .registry_destroy(
+            ObjectType::Domain,
+            [domain_id, domain_2_id, domain_3_id, domain_4_id],
+        )
         .await
-        .assert_destroyed(&[domain_id, domain_2_id]);
+        .assert_destroyed(&[domain_id, domain_2_id, domain_3_id, domain_4_id]);
     assert!(
         test.server
             .try_list(list_id.document_id())

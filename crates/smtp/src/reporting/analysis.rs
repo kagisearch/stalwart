@@ -11,7 +11,7 @@ use mail_auth::{
     report::{Feedback, Report, tlsrpt::TlsReport},
     zip,
 };
-use mail_parser::{Message, MimeHeaders, PartType};
+use mail_parser::{Message, MessagePart, MimeHeaders, PartType};
 use registry::{
     schema::structs::{ArfExternalReport, DmarcExternalReport, TlsExternalReport},
     types::datetime::UTCDateTime,
@@ -38,10 +38,97 @@ enum Format<D, T, A> {
     Arf(A),
 }
 
-struct ReportData<'x> {
+pub(crate) struct ReportData<'x> {
     compression: Compression,
     format: Format<(), (), ()>,
     data: &'x [u8],
+}
+
+impl<'x> ReportData<'x> {
+    fn from_part(part: &'x MessagePart<'x>) -> Option<Self> {
+        match &part.body {
+            PartType::Text(report) => {
+                if part
+                    .content_type()
+                    .and_then(|ct| ct.subtype())
+                    .is_some_and(|t| t.eq_ignore_ascii_case("xml"))
+                    || part
+                        .attachment_name()
+                        .and_then(|n| n.rsplit_once('.'))
+                        .is_some_and(|(_, e)| e.eq_ignore_ascii_case("xml"))
+                {
+                    Some(ReportData {
+                        compression: Compression::None,
+                        format: Format::Dmarc(()),
+                        data: report.as_bytes(),
+                    })
+                } else if part.is_content_type("message", "feedback-report") {
+                    Some(ReportData {
+                        compression: Compression::None,
+                        format: Format::Arf(()),
+                        data: report.as_bytes(),
+                    })
+                } else {
+                    None
+                }
+            }
+            PartType::Binary(report) | PartType::InlineBinary(report) => {
+                if part.is_content_type("message", "feedback-report") {
+                    return Some(ReportData {
+                        compression: Compression::None,
+                        format: Format::Arf(()),
+                        data: report.as_ref(),
+                    });
+                }
+
+                let subtype = part
+                    .content_type()
+                    .and_then(|ct| ct.subtype())
+                    .unwrap_or("");
+                let attachment_name = part.attachment_name();
+                let ext = attachment_name
+                    .and_then(|f| f.rsplit_once('.'))
+                    .map_or("", |(_, e)| e);
+                let tls_parts = subtype.rsplit_once('+');
+                let compression = match (tls_parts.map(|(_, c)| c).unwrap_or(subtype), ext) {
+                    ("gzip", _) => Compression::Gzip,
+                    ("zip", _) => Compression::Zip,
+                    (_, "gz") => Compression::Gzip,
+                    (_, "zip") => Compression::Zip,
+                    _ => Compression::None,
+                };
+                let format = match (tls_parts.map(|(c, _)| c).unwrap_or(subtype), ext) {
+                    ("xml", _) => Format::Dmarc(()),
+                    ("tlsrpt", _) | (_, "json") => Format::Tls(()),
+                    _ => {
+                        if attachment_name.is_some_and(|n| n.contains(".xml") || n.contains('!')) {
+                            Format::Dmarc(())
+                        } else {
+                            return None;
+                        }
+                    }
+                };
+
+                Some(ReportData {
+                    compression,
+                    format,
+                    data: report.as_ref(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn extract(message: &'x Message<'x>) -> Vec<Self> {
+        message.parts.iter().filter_map(Self::from_part).collect()
+    }
+
+    pub(crate) fn is_present(message: &Message<'_>) -> bool {
+        message
+            .parts
+            .iter()
+            .any(|part| ReportData::from_part(part).is_some())
+    }
 }
 
 pub trait AnalyzeReport: Sync + Send {
@@ -65,102 +152,27 @@ impl AnalyzeReport for Server {
                     .collect()
             });
             let subject: String = message.subject().unwrap_or_default().into();
-            let mut reports = Vec::new();
-
-            for part in &message.parts {
-                match &part.body {
-                    PartType::Text(report) => {
-                        if part
-                            .content_type()
-                            .and_then(|ct| ct.subtype())
-                            .is_some_and(|t| t.eq_ignore_ascii_case("xml"))
-                            || part
-                                .attachment_name()
-                                .and_then(|n| n.rsplit_once('.'))
-                                .is_some_and(|(_, e)| e.eq_ignore_ascii_case("xml"))
-                        {
-                            reports.push(ReportData {
-                                compression: Compression::None,
-                                format: Format::Dmarc(()),
-                                data: report.as_bytes(),
-                            });
-                        } else if part.is_content_type("message", "feedback-report") {
-                            reports.push(ReportData {
-                                compression: Compression::None,
-                                format: Format::Arf(()),
-                                data: report.as_bytes(),
-                            });
-                        }
-                    }
-                    PartType::Binary(report) | PartType::InlineBinary(report) => {
-                        if part.is_content_type("message", "feedback-report") {
-                            reports.push(ReportData {
-                                compression: Compression::None,
-                                format: Format::Arf(()),
-                                data: report.as_ref(),
-                            });
-                            continue;
-                        }
-
-                        let subtype = part
-                            .content_type()
-                            .and_then(|ct| ct.subtype())
-                            .unwrap_or("");
-                        let attachment_name = part.attachment_name();
-                        let ext = attachment_name
-                            .and_then(|f| f.rsplit_once('.'))
-                            .map_or("", |(_, e)| e);
-                        let tls_parts = subtype.rsplit_once('+');
-                        let compression = match (tls_parts.map(|(_, c)| c).unwrap_or(subtype), ext)
-                        {
-                            ("gzip", _) => Compression::Gzip,
-                            ("zip", _) => Compression::Zip,
-                            (_, "gz") => Compression::Gzip,
-                            (_, "zip") => Compression::Zip,
-                            _ => Compression::None,
-                        };
-                        let format = match (tls_parts.map(|(c, _)| c).unwrap_or(subtype), ext) {
-                            ("xml", _) => Format::Dmarc(()),
-                            ("tlsrpt", _) | (_, "json") => Format::Tls(()),
-                            _ => {
-                                if attachment_name
-                                    .is_some_and(|n| n.contains(".xml") || n.contains('!'))
-                                {
-                                    Format::Dmarc(())
-                                } else {
-                                    continue;
-                                }
-                            }
-                        };
-
-                        reports.push(ReportData {
-                            compression,
-                            format,
-                            data: report.as_ref(),
-                        });
-                    }
-                    _ => (),
-                }
-            }
+            let reports = ReportData::extract(&message);
+            let max_size = core.core.smtp.report.analysis.max_size;
 
             for report in reports {
                 let data = match report.compression {
                     Compression::None => Cow::Borrowed(report.data),
                     Compression::Gzip => {
-                        let mut file = GzDecoder::new(report.data);
-                        let mut buf = Vec::new();
-                        if let Err(err) = file.read_to_end(&mut buf) {
-                            trc::event!(
-                                IncomingReport(IncomingReportEvent::DecompressError),
-                                SpanId = session_id,
-                                From = from.to_string(),
-                                Reason = err.to_string(),
-                                CausedBy = trc::location!()
-                            );
+                        match read_capped(GzDecoder::new(report.data), 0, max_size) {
+                            Ok(buf) => Cow::Owned(buf),
+                            Err(err) => {
+                                trc::event!(
+                                    IncomingReport(IncomingReportEvent::DecompressError),
+                                    SpanId = session_id,
+                                    From = from.to_string(),
+                                    Reason = err.to_string(),
+                                    CausedBy = trc::location!()
+                                );
 
-                            continue;
+                                continue;
+                            }
                         }
-                        Cow::Owned(buf)
                     }
                     Compression::Zip => {
                         let data = report.data.to_vec();
@@ -168,14 +180,13 @@ impl AnalyzeReport for Server {
                             move || -> Result<Vec<u8>, std::io::Error> {
                                 let mut archive = zip::ZipArchive::new(Cursor::new(data))
                                     .map_err(std::io::Error::other)?;
-                                let mut buf = Vec::new();
-                                if !archive.is_empty() {
-                                    let mut file =
-                                        archive.by_index(0).map_err(std::io::Error::other)?;
-                                    buf.reserve(file.compressed_size() as usize);
-                                    file.read_to_end(&mut buf)?;
+                                if archive.is_empty() {
+                                    return Ok(Vec::new());
                                 }
-                                Ok(buf)
+                                let mut file =
+                                    archive.by_index(0).map_err(std::io::Error::other)?;
+                                let size_hint = file.size();
+                                read_capped(&mut file, size_hint, max_size)
                             },
                         )
                         .await;
@@ -330,7 +341,9 @@ impl AnalyzeReport for Server {
                         }
                     }
 
-                    if let Err(err) = core.core.storage.data.write(batch.build_all()).await {
+                    if let Err(err) = core.core.storage.data.write(batch.build_all()).await
+                        && !err.is_assertion_failure()
+                    {
                         trc::error!(
                             err.span_id(session_id)
                                 .caused_by(trc::location!())
@@ -370,4 +383,30 @@ async fn tenant_ids(server: &Server, domains: AHashSet<&str>) -> Option<Id> {
     } else {
         None
     }
+}
+
+fn read_capped(
+    reader: impl Read,
+    size_hint: u64,
+    max_size: usize,
+) -> Result<Vec<u8>, std::io::Error> {
+    let max_size = max_size as u64;
+    if size_hint > max_size {
+        return Err(std::io::Error::other(format!(
+            "Report is larger than the {max_size} byte limit"
+        )));
+    }
+
+    let mut buf = Vec::with_capacity(size_hint.min(64 * 1024) as usize);
+    reader
+        .take(max_size.saturating_add(1))
+        .read_to_end(&mut buf)?;
+
+    if buf.len() as u64 > max_size {
+        return Err(std::io::Error::other(format!(
+            "Report is larger than the {max_size} byte limit"
+        )));
+    }
+
+    Ok(buf)
 }

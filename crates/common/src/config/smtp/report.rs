@@ -36,6 +36,7 @@ pub struct ReportAnalysis {
     pub addresses: Vec<AddressMatch>,
     pub forward: bool,
     pub store: Option<Duration>,
+    pub max_size: usize,
 }
 
 #[derive(Clone)]
@@ -96,6 +97,7 @@ impl ReportConfig {
                     .collect(),
                 forward: report.inbound_report_forwarding,
                 store: dr.hold_mta_reports_for.map(|d| d.into_inner()),
+                max_size: std::cmp::max(report.inbound_report_max_size, 1024) as usize,
             },
             dkim: Report {
                 name: bp.compile_expr(
@@ -238,6 +240,16 @@ impl<'x> TryFrom<Variable<'x>> for AggregateFrequency {
             Variable::Constant(ExpressionConstant::Weekly) => Ok(AggregateFrequency::Weekly),
             _ => Err(()),
         }
+    }
+}
+
+impl ReportAnalysis {
+    pub fn is_report_address(&self, address: &str) -> bool {
+        self.addresses.iter().any(|addr_match| match addr_match {
+            AddressMatch::StartsWith(prefix) => address.starts_with(prefix),
+            AddressMatch::EndsWith(suffix) => address.ends_with(suffix),
+            AddressMatch::Equals(value) => address == value,
+        })
     }
 }
 

@@ -22,7 +22,7 @@ use crate::task_manager::{
     TaskJob, TaskManagerIpc, TaskResult,
 };
 use common::BuildServer;
-use common::config::server::ServerProtocol;
+use common::config::server::{DEFAULT_TLS_TIMEOUT, ServerProtocol};
 use common::network::limiter::ConcurrencyLimiter;
 use common::network::{ServerInstance, TcpAcceptor};
 use common::{Inner, Server};
@@ -48,6 +48,8 @@ use trc::TaskManagerEvent;
 use utils::snowflake::SnowflakeIdGenerator;
 
 const TASK_QUEUE_BUFFER: usize = 10;
+const PERPETUAL_RETRY_MIN_DELAY: u64 = 3600;
+const PERPETUAL_RETRY_MAX_DELAY: u64 = 21600;
 
 pub fn spawn_task_manager(inner: Arc<Inner>) {
     let is_clustered = {
@@ -74,6 +76,7 @@ pub fn spawn_task_manager(inner: Arc<Inner>) {
         protocol: ServerProtocol::Smtp,
         acceptor: TcpAcceptor::Plain,
         limiter: ConcurrencyLimiter::new(100),
+        tls_timeout: DEFAULT_TLS_TIMEOUT,
         shutdown_rx: watch::channel(false).1,
         proxy_networks: vec![],
         span_id_gen: Arc::new(SnowflakeIdGenerator::new()),
@@ -517,8 +520,8 @@ async fn update_tasks(
                 message,
                 max_attempts,
             } => {
-                let (attempt_number, created_at) = match task.task.status() {
-                    TaskStatus::Pending(status) => (0, status.created_at),
+                let (attempt_number, retry_since) = match task.task.status() {
+                    TaskStatus::Pending(_) => (0, UTCDateTime::now()),
                     TaskStatus::Retry(status) => (status.attempt_number, status.created_at),
                     TaskStatus::Failed(status) => (status.failed_attempt_number, status.failed_at),
                 };
@@ -526,17 +529,22 @@ async fn update_tasks(
                     TaskFailureType::Retry(retry_at) => (attempt_number
                         < max_attempts.unwrap_or(server.core.network.task_manager.max_attempts)
                         && retry_at
-                            < retry_at.saturating_add(
+                            <= (retry_since.timestamp() as u64).saturating_add(
                                 server.core.network.task_manager.total_deadline.as_secs(),
                             ))
-                    .then_some(retry_at),
+                    .then_some(retry_at)
+                    .or_else(|| perpetual_retry_time(task.info.typ, attempt_number)),
                     TaskFailureType::Temporary => next_retry_time(
                         &server.core.network.task_manager,
                         max_attempts,
-                        created_at.timestamp() as u64,
+                        retry_since.timestamp() as u64,
                         attempt_number,
                         now(),
-                    ),
+                    )
+                    .or_else(|| perpetual_retry_time(task.info.typ, attempt_number)),
+                    TaskFailureType::Perpetual => {
+                        perpetual_retry_time(task.info.typ, attempt_number)
+                    }
                     TaskFailureType::Permanent => None,
                 };
 
@@ -553,7 +561,7 @@ async fn update_tasks(
                         due: UTCDateTime::from_timestamp(retry_at as i64),
                         attempt_number: attempt_number + 1,
                         failure_reason: message,
-                        created_at,
+                        created_at: retry_since,
                     }));
 
                     retry_at
@@ -569,7 +577,7 @@ async fn update_tasks(
                         failed_at: UTCDateTime::now(),
                         failed_attempt_number: attempt_number,
                         failure_reason: message,
-                        created_at,
+                        created_at: retry_since,
                     }));
                     u64::MAX
                 };
@@ -606,10 +614,28 @@ async fn update_tasks(
     }
 }
 
+pub fn perpetual_retry_time(typ: TaskType, attempt: u64) -> Option<u64> {
+    matches!(
+        typ,
+        TaskType::AcmeRenewal
+            | TaskType::DkimManagement
+            | TaskType::IndexDocument
+            | TaskType::UnindexDocument
+            | TaskType::DestroyAccount
+    )
+    .then(|| {
+        now().saturating_add(
+            PERPETUAL_RETRY_MIN_DELAY
+                .saturating_mul(1u64 << attempt.min(4))
+                .min(PERPETUAL_RETRY_MAX_DELAY),
+        )
+    })
+}
+
 pub fn next_retry_time(
     manager: &TaskManager,
     max_attempts_override: Option<u64>,
-    create_time: u64,
+    retry_since: u64,
     attempt: u64,
     now: u64,
 ) -> Option<u64> {
@@ -634,7 +660,7 @@ pub fn next_retry_time(
     };
 
     let next_time = now.saturating_add(delay_secs);
-    let deadline = create_time.saturating_add(manager.total_deadline.as_secs());
+    let deadline = retry_since.saturating_add(manager.total_deadline.as_secs());
     if next_time > deadline {
         return None;
     }
@@ -652,7 +678,9 @@ impl TaskResult {
             self,
             TaskResult::Update(_)
                 | TaskResult::Failure {
-                    typ: TaskFailureType::Temporary | TaskFailureType::Retry(_),
+                    typ: TaskFailureType::Temporary
+                        | TaskFailureType::Retry(_)
+                        | TaskFailureType::Perpetual,
                     ..
                 }
         )

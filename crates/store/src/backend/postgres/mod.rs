@@ -11,7 +11,9 @@ use crate::{
     },
     write::SearchIndex,
 };
+use ahash::AHashSet;
 use deadpool_postgres::Pool;
+use tokio_postgres::error::SqlState;
 
 pub mod blob;
 pub mod lookup;
@@ -23,11 +25,12 @@ pub mod write;
 
 pub struct PostgresStore {
     pub(crate) conn_pool: Pool,
+    pub(crate) ts_configs: AHashSet<&'static str>,
 }
 
 #[inline(always)]
 fn into_error(err: tokio_postgres::error::Error) -> trc::Error {
-    let mut local_err = trc::StoreEvent::PostgresqlError.reason(err.to_string());
+    let mut local_err = trc::StoreEvent::PostgresqlError.reason(error_chain(&err));
     if let Some(db_err) = err.as_db_error() {
         local_err = local_err.code(db_err.code().code().to_string());
         if let Some(detail) = db_err.detail() {
@@ -41,9 +44,38 @@ fn into_error(err: tokio_postgres::error::Error) -> trc::Error {
     local_err
 }
 
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let cause_message = cause.to_string();
+        if !cause_message.is_empty() && !message.ends_with(&cause_message) {
+            message.push_str(": ");
+            message.push_str(&cause_message);
+        }
+        source = cause.source();
+    }
+    message
+}
+
+pub(crate) const DELETE_CHUNK_SIZE: usize = 1000;
+pub(crate) const MIN_DELETE_CHUNK_SIZE: usize = 10;
+
+#[inline(always)]
+pub(crate) fn is_timeout_error(err: &tokio_postgres::Error) -> bool {
+    err.code().is_some_and(|code| {
+        *code == SqlState::QUERY_CANCELED
+            || *code == SqlState::IDLE_IN_TRANSACTION_SESSION_TIMEOUT
+            || *code == SqlState::LOCK_NOT_AVAILABLE
+    })
+}
+
 #[inline(always)]
 fn into_pool_error(err: deadpool_postgres::PoolError) -> trc::Error {
-    trc::StoreEvent::PostgresqlError.reason(err)
+    match err {
+        deadpool_postgres::PoolError::Backend(err) => into_error(err),
+        err => trc::StoreEvent::PostgresqlError.reason(error_chain(&err)),
+    }
 }
 
 impl SearchIndex {

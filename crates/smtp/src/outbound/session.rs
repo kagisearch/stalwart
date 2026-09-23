@@ -38,6 +38,7 @@ impl MessageWrapper {
         &self,
         mut smtp_client: SmtpClient<T>,
         rcpt_idxs: Vec<usize>,
+        rcpt_headers: Option<&[u8]>,
         statuses: &mut Vec<DeliveryResult>,
         mut params: SessionParams<'_>,
     ) {
@@ -246,11 +247,12 @@ impl MessageWrapper {
         // Send message
         if !accepted_rcpts.is_empty() {
             let time = Instant::now();
-            let bdat_cmd = capabilities
-                .has_capability(EXT_CHUNKING)
-                .then(|| format!("BDAT {} LAST\r\n", self.message.size));
+            let mut bdat_cmd = capabilities.has_capability(EXT_CHUNKING).then(String::new);
 
-            if let Err(status) = smtp_client.send_message(self, &bdat_cmd, &params).await {
+            if let Err(status) = smtp_client
+                .send_message(self, rcpt_headers, &mut bdat_cmd, &params)
+                .await
+            {
                 trc::event!(
                     Delivery(DeliveryEvent::MessageRejected),
                     SpanId = params.session_id,

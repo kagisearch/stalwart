@@ -6,7 +6,7 @@
 
 use crate::core::Session;
 use common::{config::mailstore::spamfilter::SpamFilterAction, network::SessionStream};
-use mail_auth::{ArcOutput, DkimOutput, DmarcResult, dmarc::Policy};
+use mail_auth::{ArcOutput, DkimOutput, DmarcResult, dkim2::Dkim2Output, dmarc::Policy};
 use mail_parser::Message;
 use spam_filter::{
     SpamFilterInput,
@@ -21,6 +21,7 @@ impl<T: SessionStream> Session<T> {
         &'x self,
         message: &'x Message<'x>,
         dkim_result: &'x [DkimOutput<'x>],
+        dkim2_result: Option<&'x Dkim2Output<'x>>,
         arc_result: Option<&'x ArcOutput<'x>>,
         dmarc_result: Option<&'x DmarcResult>,
         dmarc_policy: Option<&'x Policy>,
@@ -29,6 +30,7 @@ impl<T: SessionStream> Session<T> {
         let mut ctx = server.spam_filter_init(self.build_spam_input(
             message,
             dkim_result,
+            dkim2_result,
             arc_result,
             dmarc_result,
             dmarc_policy,
@@ -47,6 +49,7 @@ impl<T: SessionStream> Session<T> {
         &'x self,
         message: &'x Message<'x>,
         dkim_result: &'x [DkimOutput<'x>],
+        dkim2_result: Option<&'x Dkim2Output<'x>>,
         arc_result: Option<&'x ArcOutput>,
         dmarc_result: Option<&'x DmarcResult>,
         dmarc_policy: Option<&'x Policy>,
@@ -58,6 +61,7 @@ impl<T: SessionStream> Session<T> {
             spf_ehlo_result: self.data.spf_ehlo.as_ref(),
             spf_mail_from_result: self.data.spf_mail_from.as_ref(),
             dkim_result,
+            dkim2_result,
             dmarc_result,
             dmarc_policy,
             iprev_result: self.data.iprev.as_ref(),
@@ -85,17 +89,7 @@ impl<T: SessionStream> Session<T> {
                 .iter()
                 .map(|r| r.address_lcase.as_str())
                 .collect(),
-            env_rcpt_orig_to: self
-                .data
-                .rcpt_to
-                .iter()
-                .map(|r| {
-                    r.dsn_info
-                        .as_deref()
-                        .and_then(|info| info.strip_prefix("rfc822;"))
-                        .unwrap_or(r.address_lcase.as_str())
-                })
-                .collect(),
+            env_rcpt_orig_to: self.data.rcpt_to.iter().map(|r| r.orig_address()).collect(),
             is_test: false,
             is_train: false,
         }

@@ -28,12 +28,14 @@ use dav_proto::{
 };
 use groupware::{
     cache::GroupwareCache,
-    calendar::{CalendarEvent, CalendarEventData},
-    scheduling::{ItipMessages, event_create::itip_create, event_update::itip_update},
+    calendar::{CalendarEvent, CalendarEventData, itip::ItipSendStatus},
+    scheduling::{
+        ItipMessages, event_create::itip_create, event_update::itip_update,
+        itip::itip_set_unreachable_status,
+    },
 };
 use http_proto::HttpResponse;
 use hyper::StatusCode;
-use registry::schema::enums::Permission;
 use std::collections::HashSet;
 use store::write::{BatchBuilder, now};
 use store::{
@@ -112,8 +114,9 @@ impl CalendarUpdateRequestHandler for Server {
                 ));
             }
         };
+
         let account_info = self
-            .account_info(access_token.account_id())
+            .scheduling_account_info(access_token.account_id(), account_id)
             .await
             .caused_by(trc::location!())?;
 
@@ -221,11 +224,13 @@ impl CalendarUpdateRequestHandler for Server {
 
             // Scheduling
             let mut itip_messages = None;
-            if self.core.groupware.itip_enabled
-                && !account_info.addresses().is_empty()
-                && access_token.has_permission(Permission::CalendarSchedulingSend)
-                && new_event.data.event_range_end() > now
-            {
+            let itip_status = ItipSendStatus::resolve(
+                self,
+                access_token,
+                &account_info,
+                new_event.data.event_range_end(),
+            );
+            if itip_status.is_send() {
                 let result = if new_event.schedule_tag.is_some() {
                     itip_update(
                         &mut new_event.data.event,
@@ -276,13 +281,30 @@ impl CalendarUpdateRequestHandler for Server {
                             ));
                         }
 
+                        trc::event!(
+                            Calendar(trc::CalendarEvent::ItipMessageError),
+                            AccountId = account_id,
+                            DocumentId = document_id,
+                            Reason = err.to_string(),
+                        );
+
                         // Event changed, but there are no iTIP messages to send
                         if let Some(schedule_tag) = &mut new_event.schedule_tag {
                             *schedule_tag += 1;
                         }
                     }
                 }
+
+                itip_set_unreachable_status(&mut new_event.data.event, account_info.addresses());
+            } else if let Some(reason) = itip_status.reason() {
+                trc::event!(
+                    Calendar(trc::CalendarEvent::ItipMessageError),
+                    AccountId = account_id,
+                    DocumentId = document_id,
+                    Reason = reason,
+                );
             }
+
             // Validate quota
             let extra_bytes =
                 (bytes.len() as u64).saturating_sub(u32::from(event.inner.size) as u64);
@@ -384,11 +406,13 @@ impl CalendarUpdateRequestHandler for Server {
 
             // Scheduling
             let mut itip_messages = None;
-            if self.core.groupware.itip_enabled
-                && !account_info.addresses().is_empty()
-                && access_token.has_permission(Permission::CalendarSchedulingSend)
-                && event.data.event_range_end() > now() as i64
-            {
+            let itip_status = ItipSendStatus::resolve(
+                self,
+                access_token,
+                &account_info,
+                event.data.event_range_end(),
+            );
+            if itip_status.is_send() {
                 match itip_create(&mut event.data.event, account_info.addresses()) {
                     Ok(messages) => {
                         if messages.iter().map(|r| r.to.len()).sum::<usize>()
@@ -413,8 +437,22 @@ impl CalendarUpdateRequestHandler for Server {
                                 .with_details(err.to_string()),
                             ));
                         }
+
+                        trc::event!(
+                            Calendar(trc::CalendarEvent::ItipMessageError),
+                            AccountId = account_id,
+                            Reason = err.to_string(),
+                        );
                     }
                 }
+
+                itip_set_unreachable_status(&mut event.data.event, account_info.addresses());
+            } else if let Some(reason) = itip_status.reason() {
+                trc::event!(
+                    Calendar(trc::CalendarEvent::ItipMessageError),
+                    AccountId = account_id,
+                    Reason = reason,
+                );
             }
 
             // Validate quota

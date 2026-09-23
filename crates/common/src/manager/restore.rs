@@ -14,8 +14,12 @@ use std::{
     path::{Path, PathBuf},
 };
 use store::{
-    BlobStore, SUBSPACE_BLOBS, SUBSPACE_COUNTER, SUBSPACE_INDEXES, SUBSPACE_QUOTA, Store, U32_LEN,
-    write::{AnyClass, BatchBuilder, ValueClass, key::DeserializeBigEndian},
+    BlobStore, IterateParams, SUBSPACE_BLOBS, SUBSPACE_COUNTER, SUBSPACE_INDEXES, SUBSPACE_QUOTA,
+    SUBSPACE_REGISTRY_PK, Store, U32_LEN,
+    write::{
+        AnyClass, AnyKey, BatchBuilder, ValueClass,
+        key::{DeserializeBigEndian, is_node_id_key},
+    },
 };
 use types::{collection::Collection, field::Field};
 use utils::{UnwrapFailure, failed};
@@ -23,28 +27,83 @@ use utils::{UnwrapFailure, failed};
 impl Core {
     pub async fn restore(&self, src: PathBuf) {
         // Backup the core
-        if src.is_dir() {
-            // Iterate directory and spawn a task for each file
-            let mut tasks = Vec::new();
+        let paths = if src.is_dir() {
+            let mut paths = Vec::new();
             for entry in std::fs::read_dir(&src).failed("Failed to read directory") {
                 let entry = entry.failed("Failed to read entry");
                 let path = entry.path();
                 if path.is_file() {
-                    let storage = self.storage.clone();
-                    let blob_store = self.storage.blob.clone();
-                    tasks.push(tokio::spawn(async move {
-                        restore_file(storage.data, blob_store, &path).await;
-                    }));
+                    paths.push(path);
                 }
             }
-
-            for task in tasks {
-                task.await.failed("Failed to wait for task");
-            }
+            paths
         } else {
-            restore_file(self.storage.data.clone(), self.storage.blob.clone(), &src).await;
+            vec![src]
+        };
+
+        let mut conflicts = Vec::new();
+        for path in &paths {
+            let subspace = KeyValueReader::new(path).subspace;
+            if subspace_has_data(&self.storage.data, subspace).await {
+                conflicts.push(path.clone());
+            }
+        }
+
+        if !conflicts.is_empty() {
+            eprintln!(
+                "Cannot import: the target database already contains data in the key ranges being \
+                 imported. This usually means Stalwart was started before the import ran, which \
+                 can create duplicate entries. Import into a fresh, empty database and do not \
+                 start Stalwart before importing. Conflicting dumps:"
+            );
+            for path in conflicts {
+                eprintln!("  {}", path.display());
+            }
+            std::process::exit(1);
+        }
+
+        let mut tasks = Vec::new();
+        for path in paths {
+            let storage = self.storage.clone();
+            let blob_store = self.storage.blob.clone();
+            tasks.push(tokio::spawn(async move {
+                restore_file(storage.data, blob_store, &path).await;
+            }));
+        }
+
+        for task in tasks {
+            task.await.failed("Failed to wait for task");
         }
     }
+}
+
+async fn subspace_has_data(store: &Store, subspace: u8) -> bool {
+    let mut has_data = false;
+    store
+        .iterate(
+            IterateParams::new(
+                AnyKey {
+                    subspace,
+                    key: vec![0u8],
+                },
+                AnyKey {
+                    subspace,
+                    key: vec![u8::MAX; 32],
+                },
+            )
+            .no_values(),
+            |key, _| {
+                if subspace == SUBSPACE_REGISTRY_PK && is_node_id_key(key) {
+                    Ok(true)
+                } else {
+                    has_data = true;
+                    Ok(false)
+                }
+            },
+        )
+        .await
+        .failed("Failed to inspect target database");
+    has_data
 }
 
 async fn restore_file(store: Store, blob_store: BlobStore, path: &Path) {

@@ -67,12 +67,12 @@ impl MtaStsLookup for Server {
 
         // Fetch policy
         #[cfg(not(feature = "test_mode"))]
-        let bytes = reqwest::Client::builder()
-            .user_agent(common::USER_AGENT)
-            .timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?
+        let bytes = self
+            .core
+            .smtp
+            .mta_sts_client
             .get(format!("https://mta-sts.{domain}/.well-known/mta-sts.txt"))
+            .timeout(timeout)
             .send()
             .await?
             .bytes_with_limit(MAX_POLICY_SIZE)
@@ -114,10 +114,10 @@ impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Dns(err) => match err {
-                mail_auth::Error::DnsRecordNotFound(code) => {
+                mail_auth::Error::Dns(mail_auth::DnsError::RecordNotFound(code)) => {
                     write!(f, "Record not found: {code:?}")
                 }
-                mail_auth::Error::InvalidRecordType => {
+                mail_auth::Error::Dns(mail_auth::DnsError::InvalidRecordType) => {
                     f.write_str("Failed to parse MTA-STS DNS record.")
                 }
                 _ => write!(f, "DNS lookup error: {err}"),

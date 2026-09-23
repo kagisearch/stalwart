@@ -8,7 +8,6 @@ use crate::core::throttle::NewKey;
 use common::{
     KV_RATE_LIMIT_SMTP, Server, config::smtp::QueueRateLimiter, expr::functions::ResolveVariable,
 };
-use registry::schema::prelude::Property;
 use std::future::Future;
 use store::write::now;
 
@@ -30,13 +29,7 @@ impl IsAllowed for Server {
     ) -> Result<(), u64> {
         if throttle.expr.is_empty()
             || self
-                .eval_expr(
-                    &throttle.expr,
-                    envelope,
-                    throttle.id,
-                    Property::Match,
-                    session_id,
-                )
+                .eval_if(&throttle.expr, envelope, session_id)
                 .await
                 .unwrap_or(false)
         {

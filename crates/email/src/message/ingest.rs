@@ -256,7 +256,7 @@ impl EmailIngest for Server {
                 if self.core.smtp.session.data.add_delivered_to {
                     extra_headers = format!("Delivered-To: {deliver_to}\r\n");
                     extra_headers_parsed.push(Header {
-                        name: HeaderName::Other("Delivered-To".into()),
+                        name: HeaderName::DeliveredTo,
                         value: HeaderValue::Text(deliver_to.into()),
                         offset_field: 0,
                         offset_start: 13,
@@ -512,7 +512,9 @@ impl EmailIngest for Server {
         // Encrypt message
         let do_encrypt = match params.source {
             IngestSource::Jmap { .. } | IngestSource::Imap { .. } => {
-                self.core.email.encrypt && self.core.email.encrypt_append
+                self.core.email.encrypt
+                    && self.core.email.encrypt_append
+                    && account.flags.encrypt_on_append()
             }
             IngestSource::Smtp { .. } => self.core.email.encrypt,
             IngestSource::Restore => false,
@@ -862,7 +864,7 @@ impl EmailIngest for Server {
 
                                 if message_ids.len() == references.len() / CheekyHash::HASH_SIZE
                                     && references
-                                        .chunks_exact(CheekyHash::HASH_SIZE)
+                                        .as_chunks::<{ CheekyHash::HASH_SIZE }>().0.iter()
                                         .zip(message_ids.iter())
                                         .all(|(a, b)| a == b.as_raw_bytes())
                                 {

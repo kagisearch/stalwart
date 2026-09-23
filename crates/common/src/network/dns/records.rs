@@ -51,6 +51,9 @@ impl Server {
                         let Some(key) = self.registry().object::<DkimSignature>(id).await? else {
                             continue;
                         };
+                        if !key.is_published() {
+                            continue;
+                        }
                         records.push(generate_dkim_dns_record(&key, domain_name).await?);
                     }
                 }
@@ -59,11 +62,10 @@ impl Server {
                         records.push(NamedDnsRecord {
                             name: format!("{domain_name}."),
                             record: DnsRecord::MX(MXRecord {
-                                exchange: mx
-                                    .hostname
-                                    .as_deref()
-                                    .unwrap_or(default_host)
-                                    .to_string(),
+                                exchange: format!(
+                                    "{}.",
+                                    mx.hostname.as_deref().unwrap_or(default_host)
+                                ),
                                 priority: mx.priority as u16,
                             }),
                         });

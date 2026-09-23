@@ -28,7 +28,7 @@ pub(crate) fn sign(
     };
     let protected = Protected::encode("ES256", jwk, kid, nonce.into(), url)?;
     let payload = URL_SAFE_NO_PAD.encode(payload);
-    let combined = format!("{}.{}", &protected, &payload);
+    let combined = format!("{}.{}", protected, payload);
     let signature = key
         .sign(&SystemRandom::new(), combined.as_bytes())
         .map_err(|err| AcmeError::Crypto(format!("Failed to sign payload: {}", err)))?;
@@ -49,7 +49,7 @@ pub(crate) fn eab_sign(
 ) -> AcmeResult<Body> {
     let protected = Protected::encode("HS256", None, kid.into(), None, url)?;
     let payload = Jwk::new(key).base64()?;
-    let combined = format!("{}.{}", &protected, &payload);
+    let combined = format!("{}.{}", protected, payload);
 
     let key = hmac::Key::new(hmac::HMAC_SHA256, hmac_key);
     let tag = hmac::sign(&key, combined.as_bytes());

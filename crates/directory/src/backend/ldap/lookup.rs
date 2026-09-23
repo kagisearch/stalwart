@@ -18,6 +18,11 @@ impl LdapDirectory {
             } => (username, secret),
             Credentials::Bearer { token, .. } => (token, token),
         };
+        if secret.is_empty() {
+            return Err(trc::AuthEvent::Failed
+                .into_err()
+                .details("Empty secret rejected"));
+        }
         let mut conn = self.pool.get().await.map_err(|err| err.into_error())?;
 
         let mut result = if self.auth_bind {
@@ -120,11 +125,9 @@ impl LdapDirectory {
         conn: &mut Ldap,
         result: &mut LdapResult,
     ) -> trc::Result<()> {
-        if !result.account.groups.is_empty() {
-            for name in std::mem::take(&mut result.account.groups)
-                .into_iter()
-                .filter(|name| name.contains('='))
-            {
+        if let Some(group_dns) = result.account.groups.take() {
+            let mut groups = Vec::new();
+            for name in group_dns.into_iter().filter(|name| name.contains('=')) {
                 let (rs, _res) = conn
                     .search(
                         &name,
@@ -142,12 +145,17 @@ impl LdapDirectory {
                             && let Some(email) =
                                 value.first().map(|s| s.as_str()).and_then(sanitize_email)
                         {
-                            result.account.groups.push(email);
+                            groups.push(email);
                             break 'outer;
                         }
                     }
                 }
             }
+            result.account.groups = if groups.is_empty() {
+                None
+            } else {
+                Some(groups)
+            };
         } else if let Some(filter) = &self.mappings.filter_member_of {
             let filter = filter.build(&result.dn);
             let rs = conn
@@ -162,25 +170,31 @@ impl LdapDirectory {
                 .success()
                 .map_err(|err| err.into_error().caused_by(trc::location!()))?
                 .0;
+            let had_entries = !rs.is_empty();
+            let mut groups = Vec::new();
             for entry in rs {
                 for (attr, value) in SearchEntry::construct(entry).attrs {
                     if self.mappings.attr_email.contains(&attr.to_lowercase()) {
-                        result
-                            .account
-                            .groups
-                            .extend(value.into_iter().filter_map(|v| {
-                                sanitize_email(&v).or_else(|| {
-                                    trc::event!(
-                                        Store(trc::StoreEvent::LdapWarning),
-                                        Reason = "Group entry missing valid email attribute",
-                                        Details = v
-                                    );
-                                    None
-                                })
-                            }));
+                        groups.extend(value.into_iter().filter_map(|v| {
+                            sanitize_email(&v).or_else(|| {
+                                trc::event!(
+                                    Store(trc::StoreEvent::LdapWarning),
+                                    Reason = "Group entry missing valid email attribute",
+                                    Details = v
+                                );
+                                None
+                            })
+                        }));
                     }
                 }
             }
+            result.account.groups = if had_entries && groups.is_empty() {
+                None
+            } else {
+                Some(groups)
+            };
+        } else {
+            result.account.groups = (!self.mappings.attr_groups.is_empty()).then(Vec::new);
         }
 
         Ok(())
@@ -226,39 +240,52 @@ impl LdapMappings {
 
         for (attr, value) in entry.attrs {
             let attr = attr.to_lowercase();
-            if self.attr_email.contains(&attr) {
-                account.email = value
-                    .into_iter()
-                    .filter_map(|v| sanitize_email(&v))
-                    .next()
-                    .unwrap_or_default();
+            let is_email = self.attr_email.contains(&attr);
+            let is_email_alias = self.attr_email_alias.contains(&attr);
+            if is_email || is_email_alias {
+                let mut values = value.into_iter().filter_map(|v| sanitize_email(&v));
+                if is_email
+                    && account.email.is_empty()
+                    && let Some(email) = values.next()
+                {
+                    account.email = email;
+                }
+                if is_email_alias {
+                    account.email_aliases.extend(values);
+                }
             } else if self.attr_secret.contains(&attr) {
-                account.secret = value.into_iter().next();
+                account.secret = value.into_iter().find(|secret| !secret.is_empty());
             } else if self.attr_secret_changed.contains(&attr) {
                 // Create a disabled AppPassword, used to indicate that the password has been changed
                 // but cannot be used for authentication.
                 if account.secret.is_none() {
-                    account.secret = value.into_iter().next().map(|item| {
+                    account.secret = value.into_iter().find(|item| !item.is_empty()).map(|item| {
                         format!("$app${}$", xxhash_rust::xxh3::xxh3_64(item.as_bytes()))
                     });
                 }
-            } else if self.attr_email_alias.contains(&attr) {
-                for item in value.into_iter().filter_map(|v| sanitize_email(&v)) {
-                    account.email_aliases.push(item);
-                }
             } else if let Some(idx) = self.attr_description.iter().position(|a| a == &attr) {
                 if (account.description.is_none() || idx == 0)
-                    && let Some(desc) = value.into_iter().next()
+                    && let Some(desc) = value.into_iter().find(|desc| !desc.is_empty())
                 {
                     account.description = Some(desc);
                 }
             } else if self.attr_groups.contains(&attr) {
-                account.groups.extend(value);
+                account.groups.get_or_insert_default().extend(value);
             } else if self.attr_class.contains(&attr) {
                 for value in value {
                     is_group |= value.eq_ignore_ascii_case(&self.group_class);
                 }
             }
+        }
+
+        if !account.email_aliases.is_empty() {
+            let mut aliases = Vec::with_capacity(account.email_aliases.len());
+            for alias in std::mem::take(&mut account.email_aliases) {
+                if alias != account.email && !aliases.contains(&alias) {
+                    aliases.push(alias);
+                }
+            }
+            account.email_aliases = aliases;
         }
 
         LdapResult {

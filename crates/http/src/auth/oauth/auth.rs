@@ -12,10 +12,12 @@ use common::{
     KV_OAUTH, Server,
     auth::{
         AuthRequest,
+        authentication::UsernameParts,
         oauth::{
             CLIENT_ID_MAX_LEN, DEVICE_CODE_LEN, SUPPORTED_SCOPES, USER_CODE_ALPHABET,
             USER_CODE_LEN,
             client_id::{decode_client_id, scopes_to_mask},
+            registration::redirect_uri_matches,
         },
     },
 };
@@ -29,14 +31,13 @@ use store::{
 };
 use store::{
     rand::{
-        Rng,
+        RngExt,
         distr::{Alphanumeric, StandardUniform},
         rng,
     },
     write::AlignedBytes,
 };
 use trc::AddContext;
-use utils::DomainPart;
 
 #[derive(Debug, serde::Serialize)]
 pub struct ProtectedResourceMetadata {
@@ -142,8 +143,15 @@ impl OAuthApiHandler for Server {
         session: &HttpSessionData,
         account_name: &str,
     ) -> trc::Result<HttpResponse> {
-        let account_name = account_name.trim().to_lowercase();
-        if let Some(domain_name) = account_name.try_domain_part()
+        let username = UsernameParts::new(account_name.trim());
+        let auth_as = username.auth_as();
+        let is_recovery_admin = self
+            .registry()
+            .recovery_admin()
+            .is_some_and(|(user, _)| user.trim().eq_ignore_ascii_case(auth_as.address()));
+
+        if !is_recovery_admin
+            && let Some(domain_name) = auth_as.domain().filter(|domain| !domain.is_empty())
             && let Some(endpoint) = self
                 .get_directory_for_domain(domain_name)
                 .await?
@@ -224,10 +232,30 @@ impl OAuthApiHandler for Server {
 
                 // Validate Resource Indicators (RFC 8707)
                 for resource in &resource {
-                    if !is_known_resource(&self.core.network.http.url_https, resource) {
+                    if !is_known_resource(
+                        [self.core.network.server_name.as_str()]
+                            .into_iter()
+                            .chain(
+                                self.core
+                                    .network
+                                    .info
+                                    .services
+                                    .values()
+                                    .filter_map(|v| v.hostname.as_deref()),
+                            )
+                            .chain(
+                                self.core
+                                    .network
+                                    .info
+                                    .mxs
+                                    .iter()
+                                    .filter_map(|mx| mx.hostname.as_deref()),
+                            ),
+                        resource,
+                    ) {
                         return Err(trc::AuthEvent::Error
                             .into_err()
-                            .details("Unknown resource indicator."));
+                            .details(format!("Unknown resource indicator: {}", resource)));
                     }
                 }
 
@@ -569,27 +597,6 @@ impl OAuthApiHandler for Server {
     }
 }
 
-fn redirect_uri_matches(registered: &str, presented: &str) -> bool {
-    registered == presented || loopback_redirect_matches(registered, presented)
-}
-
-fn loopback_redirect_matches(registered: &str, presented: &str) -> bool {
-    for host in ["http://127.0.0.1", "http://[::1]"] {
-        if let (Some(reg_path), Some(pres_rest)) =
-            (registered.strip_prefix(host), presented.strip_prefix(host))
-            && let Some(after_port) = pres_rest.strip_prefix(':')
-            && let Some(slash) = after_port.find('/')
-        {
-            let (port, pres_path) = after_port.split_at(slash);
-            if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && pres_path == reg_path
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 fn grant_scope(requested: Option<&str>, registered_mask: u64) -> Option<String> {
     let mut granted = String::new();
     for scope in requested.unwrap_or_default().split_ascii_whitespace() {
@@ -605,8 +612,38 @@ fn grant_scope(requested: Option<&str>, registered_mask: u64) -> Option<String> 
     (!granted.is_empty()).then_some(granted)
 }
 
-fn is_known_resource(base_url: &str, uri: &str) -> bool {
-    let base = base_url.trim_end_matches('/');
-    uri.strip_prefix(base)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+fn is_known_resource<'x>(hostnames: impl IntoIterator<Item = &'x str>, uri: &str) -> bool {
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return false;
+    };
+    let supported = hashify::tiny_map!(scheme.as_bytes(),
+        b"http" => true,
+        b"https" => true,
+        b"smtp" => true,
+        b"smtps" => true,
+        b"imap" => true,
+        b"imaps" => true,
+        b"pop3" => true,
+        b"pop3s" => true,
+        b"caldav" => true,
+        b"caldavs" => true,
+        b"webdav" => true,
+        b"webdavs" => true,
+        b"carddav" => true,
+        b"carddavs" => true,
+        b"sieve" => true,
+        b"sieves" => true
+    )
+    .unwrap_or(false);
+
+    let authority = rest.split_once('/').map_or(rest, |(auth, _)| auth);
+    let host = authority
+        .rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.as_bytes().iter().all(|c| c.is_ascii_digit()))
+        .map_or(authority, |(host, _)| host);
+
+    supported
+        && hostnames
+            .into_iter()
+            .any(|hostname| host.eq_ignore_ascii_case(hostname))
 }

@@ -8,9 +8,7 @@ use argon2::Argon2;
 use argon2::PasswordHash;
 use argon2::PasswordHasher;
 use argon2::PasswordVerifier;
-use argon2::password_hash::SaltString;
-use argon2::password_hash::rand_core::OsRng;
-use mail_builder::encoders::base64::base64_encode;
+use mail_builder::encoders::Base64Encoder;
 use mail_parser::decoders::base64::base64_decode;
 use pbkdf2::Pbkdf2;
 use pwhash::{bcrypt, bsdi_crypt, md5_crypt, sha1_crypt, sha256_crypt, sha512_crypt, unix_crypt};
@@ -21,7 +19,7 @@ use sha1::Sha1;
 use sha2::Sha256;
 use sha2::Sha512;
 use tokio::sync::oneshot;
-use totp_rs::TOTP;
+use totp_rs::Totp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretVerificationResult {
@@ -39,14 +37,14 @@ pub async fn verify_mfa_secret_hash(
     if let Some(totp_uri) = totp_uri {
         if let Some(totp_token) = totp_token {
             let result = verify_secret_hash(hashed_secret, secret.as_bytes()).await?
-                && TOTP::from_url(totp_uri)
+                && Totp::from_url(totp_uri)
                     .map_err(|err| {
                         trc::AuthEvent::Error
                             .reason(err)
                             .details(totp_uri.to_string())
                     })?
                     .check_current(totp_token)
-                    .unwrap_or(false);
+                    .is_some();
             Ok(if result {
                 SecretVerificationResult::Valid
             } else {
@@ -89,9 +87,9 @@ async fn verify_hash_prefix(hashed_secret: &str, secret: &[u8]) -> trc::Result<b
                 let result = if is_argon {
                     Argon2::default().verify_password(&secret, &hash)
                 } else if is_pbkdf2 {
-                    Pbkdf2.verify_password(&secret, &hash)
+                    Pbkdf2::default().verify_password(&secret, &hash)
                 } else {
-                    Scrypt.verify_password(&secret, &hash)
+                    Scrypt::default().verify_password(&secret, &hash)
                 };
 
                 tx.send(Ok(result.is_ok())).ok();
@@ -148,13 +146,13 @@ pub async fn verify_secret_hash(hashed_secret: &str, secret: &[u8]) -> trc::Resu
                     // SHA-1
                     let mut hasher = Sha1::new();
                     hasher.update(secret);
-                    Ok(
-                        String::from_utf8(
-                            base64_encode(&hasher.finalize()[..]).unwrap_or_default(),
-                        )
-                        .unwrap()
-                            == hashed_secret,
+                    Ok(String::from_utf8(
+                        Base64Encoder::new()
+                            .encode(&hasher.finalize()[..])
+                            .unwrap_or_default(),
                     )
+                    .unwrap()
+                        == hashed_secret)
                 }
                 "SSHA" => {
                     // Salted SHA-1
@@ -170,13 +168,13 @@ pub async fn verify_secret_hash(hashed_secret: &str, secret: &[u8]) -> trc::Resu
                     // Verify hash
                     let mut hasher = Sha256::new();
                     hasher.update(secret);
-                    Ok(
-                        String::from_utf8(
-                            base64_encode(&hasher.finalize()[..]).unwrap_or_default(),
-                        )
-                        .unwrap()
-                            == hashed_secret,
+                    Ok(String::from_utf8(
+                        Base64Encoder::new()
+                            .encode(&hasher.finalize()[..])
+                            .unwrap_or_default(),
                     )
+                    .unwrap()
+                        == hashed_secret)
                 }
                 "SSHA256" => {
                     // Salted SHA-256
@@ -192,13 +190,13 @@ pub async fn verify_secret_hash(hashed_secret: &str, secret: &[u8]) -> trc::Resu
                     // SHA-512
                     let mut hasher = Sha512::new();
                     hasher.update(secret);
-                    Ok(
-                        String::from_utf8(
-                            base64_encode(&hasher.finalize()[..]).unwrap_or_default(),
-                        )
-                        .unwrap()
-                            == hashed_secret,
+                    Ok(String::from_utf8(
+                        Base64Encoder::new()
+                            .encode(&hasher.finalize()[..])
+                            .unwrap_or_default(),
                     )
+                    .unwrap()
+                        == hashed_secret)
                 }
                 "SSHA512" => {
                     // Salted SHA-512
@@ -213,10 +211,11 @@ pub async fn verify_secret_hash(hashed_secret: &str, secret: &[u8]) -> trc::Resu
                 "MD5" => {
                     // MD5
                     let digest = md5::compute(secret);
-                    Ok(
-                        String::from_utf8(base64_encode(&digest[..]).unwrap_or_default()).unwrap()
-                            == hashed_secret,
+                    Ok(String::from_utf8(
+                        Base64Encoder::new().encode(&digest[..]).unwrap_or_default(),
                     )
+                    .unwrap()
+                        == hashed_secret)
                 }
                 "CRYPT" => {
                     if hashed_secret.starts_with('$') {
@@ -247,13 +246,11 @@ pub async fn hash_secret(algorithm: PasswordHashAlgorithm, secret: Vec<u8>) -> t
     let (tx, rx) = oneshot::channel();
 
     tokio::task::spawn_blocking(move || {
-        let salt = SaltString::generate(&mut OsRng);
-
         let result = match algorithm {
             PasswordHashAlgorithm::Argon2id => {
                 let hasher = Argon2::default();
                 hasher
-                    .hash_password(secret.as_slice(), &salt)
+                    .hash_password(secret.as_slice())
                     .map(|h| h.to_string())
             }
             PasswordHashAlgorithm::Bcrypt => {
@@ -266,11 +263,11 @@ pub async fn hash_secret(algorithm: PasswordHashAlgorithm, secret: Vec<u8>) -> t
                     .ok()
                     .unwrap_or(());
             }
-            PasswordHashAlgorithm::Scrypt => Scrypt
-                .hash_password(secret.as_slice(), &salt)
+            PasswordHashAlgorithm::Scrypt => Scrypt::default()
+                .hash_password(secret.as_slice())
                 .map(|h| h.to_string()),
-            PasswordHashAlgorithm::Pbkdf2 => Pbkdf2
-                .hash_password(secret.as_slice(), &salt)
+            PasswordHashAlgorithm::Pbkdf2 => Pbkdf2::default()
+                .hash_password(secret.as_slice())
                 .map(|h| h.to_string()),
         };
 
@@ -447,23 +444,27 @@ mod tests {
     use super::*;
 
     fn b64(bytes: &[u8]) -> String {
-        String::from_utf8(base64_encode(bytes).unwrap()).unwrap()
+        String::from_utf8(Base64Encoder::new().encode(bytes).unwrap()).unwrap()
     }
 
     #[test]
     fn is_password_hash_detects_phc_strings() {
-        let salt = SaltString::generate(&mut OsRng);
-
         let argon = Argon2::default()
-            .hash_password(b"hello", &salt)
+            .hash_password(b"hello")
             .unwrap()
             .to_string();
         assert!(is_password_hash(&argon), "argon2 not detected: {argon}");
 
-        let pbkdf = Pbkdf2.hash_password(b"hello", &salt).unwrap().to_string();
+        let pbkdf = Pbkdf2::default()
+            .hash_password(b"hello")
+            .unwrap()
+            .to_string();
         assert!(is_password_hash(&pbkdf), "pbkdf2 not detected: {pbkdf}");
 
-        let scr = Scrypt.hash_password(b"hello", &salt).unwrap().to_string();
+        let scr = Scrypt::default()
+            .hash_password(b"hello")
+            .unwrap()
+            .to_string();
         assert!(is_password_hash(&scr), "scrypt not detected: {scr}");
     }
 
@@ -553,16 +554,18 @@ mod tests {
         assert!(is_password_hash("{CRYPT}abcdefghij012"));
         assert!(is_password_hash("{CRYPT}_J9..K0AyUubDkQmPLeM"));
 
-        let salt = SaltString::generate(&mut OsRng);
         let a = Argon2::default()
-            .hash_password(b"hello", &salt)
+            .hash_password(b"hello")
             .unwrap()
             .to_string();
         assert!(is_password_hash(&format!("{{ARGON2ID}}{a}")));
         assert!(is_password_hash(&format!("{{ARGON2}}{a}")));
         assert!(is_password_hash(&format!("{{ARGON2I}}{a}")));
 
-        let p = Pbkdf2.hash_password(b"hello", &salt).unwrap().to_string();
+        let p = Pbkdf2::default()
+            .hash_password(b"hello")
+            .unwrap()
+            .to_string();
         assert!(is_password_hash(&format!("{{PBKDF2}}{p}")));
 
         let mut h = Sha1::new();

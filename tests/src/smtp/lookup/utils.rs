@@ -11,7 +11,7 @@ use common::config::smtp::{
     report::AggregateFrequency,
     resolver::{Mode, MxPattern, Policy},
 };
-use mail_auth::{IpLookupStrategy, MX};
+use mail_auth::{DnssecStatus, IpLookupStrategy, MX, RecordSet};
 use mail_parser::DateTime;
 use registry::{
     schema::{
@@ -207,7 +207,7 @@ async fn strategies() {
         env_id: None,
         priority: 0,
         size: 978,
-        quota_keys: Default::default(),
+        metadata: Default::default(),
     };
 
     assert_eq!(
@@ -225,25 +225,28 @@ async fn strategies() {
 
 #[test]
 fn to_remote_hosts() {
-    let mx: Arc<[MX]> = Arc::from(vec![
-        MX {
-            exchanges: vec!["mx1".into(), "mx2".into()].into_boxed_slice(),
-            preference: 10,
-        },
-        MX {
-            exchanges: vec!["mx3".into(), "mx4".into(), "mx5".into(), "mx6".into()]
-                .into_boxed_slice(),
-            preference: 20,
-        },
-        MX {
-            exchanges: vec!["mx7".into(), "mx8".into()].into_boxed_slice(),
-            preference: 10,
-        },
-        MX {
-            exchanges: vec!["mx9".into(), "mxA".into()].into_boxed_slice(),
-            preference: 10,
-        },
-    ]);
+    let mx: RecordSet<MX> = RecordSet {
+        rrset: Arc::from(vec![
+            MX {
+                exchanges: vec!["mx1".into(), "mx2".into()].into_boxed_slice(),
+                preference: 10,
+            },
+            MX {
+                exchanges: vec!["mx3".into(), "mx4".into(), "mx5".into(), "mx6".into()]
+                    .into_boxed_slice(),
+                preference: 20,
+            },
+            MX {
+                exchanges: vec!["mx7".into(), "mx8".into()].into_boxed_slice(),
+                preference: 10,
+            },
+            MX {
+                exchanges: vec!["mx9".into(), "mxA".into()].into_boxed_slice(),
+                preference: 10,
+            },
+        ]),
+        dnssec_status: DnssecStatus::Indeterminate,
+    };
     let mx_config = MxConfig {
         max_mx: 7,
         max_multi_homed: 2,
@@ -256,10 +259,13 @@ fn to_remote_hosts() {
             assert!((*host.as_bytes().last().unwrap() - b'0') <= 8);
         }
     }
-    let mx: Arc<[MX]> = Arc::from(vec![MX {
-        exchanges: vec![".".into()].into_boxed_slice(),
-        preference: 0,
-    }]);
+    let mx: RecordSet<MX> = RecordSet {
+        rrset: Arc::from(vec![MX {
+            exchanges: vec![".".into()].into_boxed_slice(),
+            preference: 0,
+        }]),
+        dnssec_status: DnssecStatus::Indeterminate,
+    };
     assert!(mx.to_remote_hosts("domain", &mx_config).is_none());
 }
 

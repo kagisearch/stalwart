@@ -15,8 +15,9 @@ use registry::{
         structs::{
             BlobStore, DataStore, ElasticSearchStore, FileSystemStore, FoundationDbStore, HttpAuth,
             HttpAuthBasic, HttpAuthBearer, InMemoryStore, MeilisearchStore, MySqlStore,
-            PostgreSqlStore, RedisStore, RocksDbStore, S3Store, S3StoreCustomRegion, S3StoreRegion,
-            SearchStore, SecretKey, SecretKeyOptional, SecretKeyValue, SqliteStore,
+            PostgreSqlStore, PublicStringOptional, PublicStringValue, RedisStore, RocksDbStore,
+            S3Store, S3StoreCustomRegion, S3StoreRegion, SearchStore, SecretKey, SecretKeyOptional,
+            SecretKeyValue, SqliteStore,
         },
     },
     types::{EnumImpl, duration::Duration},
@@ -60,8 +61,24 @@ impl RegistryEnvStores for RegistryStore {
     }
 }
 
-pub async fn build_data_store(typ: DataStoreType, path: &str) -> DataStore {
-    match typ {
+pub async fn build_data_store(typ: &str, path: &str) -> DataStore {
+    if typ == "MariaDb" {
+        crate::utils::containers::ensure_mariadb().await;
+        return DataStore::MySql(MySqlStore {
+            host: "localhost".into(),
+            port: 3308,
+            auth_username: "root".to_string().into(),
+            auth_secret: SecretKeyOptional::Value(SecretKeyValue {
+                secret: "password".into(),
+            }),
+            database: "stalwart".into(),
+            use_tls: false,
+            allow_invalid_certs: true,
+            ..Default::default()
+        });
+    }
+
+    match DataStoreType::parse(typ).expect("Invalid store type") {
         DataStoreType::RocksDb => DataStore::RocksDb(RocksDbStore {
             path: format!("{path}/rocks.db"),
             ..Default::default()
@@ -112,7 +129,9 @@ async fn build_blob_store(typ: BlobStoreType, path: &str) -> BlobStore {
         BlobStoreType::S3 => {
             crate::utils::containers::ensure_minio().await;
             BlobStore::S3(S3Store {
-                access_key: "minioadmin".to_string().into(),
+                access_key: PublicStringOptional::Value(PublicStringValue {
+                    value: "minioadmin".into(),
+                }),
                 bucket: "stalwart".into(),
                 region: S3StoreRegion::Custom(S3StoreCustomRegion {
                     custom_endpoint: "http://localhost:9000".into(),

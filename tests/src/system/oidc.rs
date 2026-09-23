@@ -240,17 +240,27 @@ pub async fn test(test: &mut TestServer) {
         assert_eq!(body["error"], "invalid_redirect_uri", "for {bad_uri}");
     }
 
-    // A loopback redirect URI is accepted and registration returns 201 Created
-    let (status, _) = post_json_raw(
-        &metadata.registration_endpoint,
-        &ClientRegistrationRequest {
-            redirect_uris: vec!["http://127.0.0.1/cb".to_string()],
-            scope: Some(PROFILE_SCOPE.to_string()),
-            ..Default::default()
-        },
-    )
-    .await;
-    assert_eq!(status, 201, "registration should return 201 Created");
+    // A loopback redirect URI is accepted and registration returns 201 Created,
+    // including loopback URIs that specify an ephemeral port (RFC 8252 §7.3).
+    for good_uri in [
+        "http://127.0.0.1/cb",
+        "http://127.0.0.1:54321/cb",
+        "http://[::1]:8080/cb",
+    ] {
+        let (status, body) = post_json_raw(
+            &metadata.registration_endpoint,
+            &ClientRegistrationRequest {
+                redirect_uris: vec![good_uri.to_string()],
+                scope: Some(PROFILE_SCOPE.to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "registration should return 201 for {good_uri}: {body}"
+        );
+    }
 
     // Register the client used for the flow with a private-use scheme redirect URI
     let registration: ClientRegistrationResponse = post_json(
@@ -349,7 +359,7 @@ pub async fn test(test: &mut TestServer) {
                 code_challenge: Some(PKCE_CHALLENGE.to_string()),
                 code_challenge_method: Some("S256".to_string()),
                 state: None,
-                resource: vec!["https://127.0.0.1:8899/jmap/session".to_string()],
+                resource: vec!["https://mail.example.org/jmap/session".to_string()],
             },
         )
         .await

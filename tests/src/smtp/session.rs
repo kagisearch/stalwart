@@ -7,11 +7,12 @@
 use base64::{Engine, engine::general_purpose};
 use common::{
     Server,
-    config::server::ServerProtocol,
+    config::server::{DEFAULT_TLS_TIMEOUT, ServerProtocol},
     network::{ServerInstance, SessionStream, TcpAcceptor, limiter::ConcurrencyLimiter},
 };
 use rustls::{ServerConfig, server::ResolvesServerCert};
 use smtp::core::{Session, SessionAddress, SessionData, SessionParameters, State};
+use smtp::queue::MessageSource;
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -276,6 +277,7 @@ impl TestSession for Session<DummyIo> {
                         dsn_info: None,
                     },
                 ],
+                MessageSource::Authenticated,
                 self.server.inner.data.queue_id_gen.generate(),
                 0,
             )
@@ -368,6 +370,7 @@ impl TestServerInstance for ServerInstance {
                 implicit: false,
             },
             limiter: ConcurrencyLimiter::new(100),
+            tls_timeout: DEFAULT_TLS_TIMEOUT,
             shutdown_rx,
             proxy_networks: vec![],
             span_id_gen: Arc::new(SnowflakeIdGenerator::new()),

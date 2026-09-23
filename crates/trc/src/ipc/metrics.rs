@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 
 use atomics::{array::AtomicU32Array, gauge::AtomicGauge, histogram::AtomicHistogram};
 use ipc::{
-    collector::{Collector, EVENT_TYPES, GlobalInterests},
+    collector::{Collector, GlobalInterests},
     subscriber::Interests,
 };
 
@@ -216,7 +216,7 @@ impl Collector {
                 let value = value.load(Ordering::Relaxed);
                 if value > 0 {
                     Some(EventCounter {
-                        id: EVENT_TYPES[event_id],
+                        id: EventType::from_id(event_id as u16)?,
                         value,
                     })
                 } else {

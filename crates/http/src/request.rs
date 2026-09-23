@@ -6,7 +6,7 @@
 
 use crate::{
     HttpSessionManager,
-    api::{ManagementApi, ToManageHttpResponse},
+    api::{AuthChallenge, ManagementApi, ToManageHttpResponse},
     auth::{
         authenticate::{Authenticator, HttpHeaders},
         oauth::{
@@ -23,14 +23,14 @@ use common::{
     network::{SessionData, SessionManager, SessionStream},
 };
 use dav::{DavMethod, request::DavRequestHandler};
-use groupware::{DavResourceName, calendar::itip::ItipIngest};
+use groupware::DavResourceName;
 use http_proto::{
-    DownloadResponse, HtmlResponse, HttpContext, HttpRequest, HttpResponse, HttpResponseBody,
-    HttpSessionData, JsonProblemResponse, ToHttpResponse, form_urlencoded, request::fetch_body,
+    DownloadResponse, HttpContext, HttpRequest, HttpResponse, HttpResponseBody, HttpSessionData,
+    JsonProblemResponse, ToHttpResponse, form_urlencoded, request::fetch_body,
 };
 use hyper::{
     Method, StatusCode, body,
-    header::{self, CONTENT_TYPE},
+    header::{self, CONTENT_ENCODING, CONTENT_TYPE},
     server::conn::http1,
     service::service_fn,
 };
@@ -44,12 +44,28 @@ use jmap::{
     websocket::upgrade::WebSocketUpgrade,
 };
 use jmap_proto::request::{Request, capability::Session};
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
+#[cfg(feature = "enterprise")]
+use scim::request::ScimRequestHandler;
+// SPDX-SnippetEnd
 use percent_encoding::percent_decode_str;
 use registry::schema::enums::Permission;
 use std::{net::IpAddr, str::FromStr, sync::Arc};
 use store::dispatch::lookup::KeyValue;
 use trc::SecurityEvent;
 use types::{blob::BlobId, id::Id};
+
+static RSVP_PAGE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../resources/html-templates/calendar-rsvp.html.min.gz"
+));
+
+static LOGIN_PAGE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../resources/html-templates/login.html.min.gz"
+));
 
 pub trait ParseHttp: Sync + Send {
     fn parse_http_request(
@@ -426,13 +442,46 @@ impl ParseHttp for Server {
                 }
                 _ => (),
             },
+            // SPDX-SnippetBegin
+            // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+            // SPDX-License-Identifier: LicenseRef-SEL
+            #[cfg(feature = "enterprise")]
+            "scim" => {
+                let (_in_flight, access_token) = if req.authorization().is_some() {
+                    match self.authenticate_headers(&req, &session).await {
+                        Ok((in_flight, access_token)) => (in_flight, Some(access_token)),
+                        Err(err) => {
+                            let response =
+                                scim::error::Error::from(err).into_response(session.session_id);
+                            return Ok(response);
+                        }
+                    }
+                } else if let Err(err) = self
+                    .is_http_anonymous_request_allowed(session.remote_ip)
+                    .await
+                {
+                    return Ok(scim::error::Error::from(err).into_response(session.session_id));
+                } else {
+                    (None, None)
+                };
+
+                return Ok(self.handle_scim_request(req, session, access_token).await);
+            }
+            // SPDX-SnippetEnd
             "api" => {
                 // Allow CORS preflight requests
                 if req.method() == Method::OPTIONS {
                     return Ok(HttpResponse::new(StatusCode::NO_CONTENT));
                 }
 
-                return self.handle_api_request(&mut req, &session).await;
+                return Ok(match self.handle_api_request(&mut req, &session).await {
+                    Ok(response) => response,
+                    Err(err) => {
+                        let response = err.into_http_response(AuthChallenge::Bearer);
+                        trc::error!(err.span_id(session.session_id));
+                        response
+                    }
+                });
             }
             "mail" => {
                 if req.method() == Method::GET
@@ -457,24 +506,28 @@ impl ParseHttp for Server {
                     && req.method() == Method::GET
                     && path.next().unwrap_or_default() == "rsvp"
                 {
-                    return self
-                        .http_rsvp_handle(
-                            req.uri().query().unwrap_or_default(),
-                            req.headers()
-                                .get(header::ACCEPT_LANGUAGE)
-                                .and_then(|v| v.to_str().ok())
-                                .map(|lang| {
-                                    let lang = lang.split_once(',').map_or(lang, |(l, _)| l);
-                                    lang.split_once(';').map_or(lang, |(l, _)| l)
-                                })
-                                .unwrap_or("en"),
-                        )
-                        .await
-                        .map(|response| {
-                            HtmlResponse::new(response)
-                                .into_http_response()
-                                .with_no_store()
-                        });
+                    // SPDX-SnippetBegin
+                    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                    // SPDX-License-Identifier: LicenseRef-SEL
+                    #[cfg(feature = "enterprise")]
+                    if let Some(page) = self
+                        .core
+                        .enterprise
+                        .as_ref()
+                        .and_then(|e| e.template_scheduling_web.as_ref())
+                    {
+                        return Ok(HttpResponse::new(StatusCode::OK)
+                            .with_content_type("text/html; charset=utf-8")
+                            .with_text_body(page.to_string())
+                            .with_no_store());
+                    }
+                    // SPDX-SnippetEnd
+
+                    return Ok(HttpResponse::new(StatusCode::OK)
+                        .with_content_type("text/html; charset=utf-8")
+                        .with_header(CONTENT_ENCODING, "gzip")
+                        .with_binary_body(RSVP_PAGE)
+                        .with_no_store());
                 }
             }
             "autodiscover" | "Autodiscover" | "AutoDiscover" => {
@@ -575,14 +628,23 @@ impl ParseHttp for Server {
             // SPDX-License-Identifier: LicenseRef-SEL
             #[cfg(feature = "enterprise")]
             "logo" if self.is_enterprise_edition() => {
-                match self
-                    .logo_resource(
+                let domain_hint = req
+                    .uri()
+                    .query()
+                    .and_then(|q| {
+                        form_urlencoded::parse(q.as_bytes())
+                            .find(|(k, v)| k == "domain" && !v.is_empty())
+                            .map(|(_, v)| v)
+                    })
+                    .or_else(|| {
                         req.headers()
                             .get(header::HOST)
                             .and_then(|h| h.to_str().ok())
                             .map(|h| h.rsplit_once(':').map_or(h, |(h, _)| h))
-                            .unwrap_or_default(),
-                    )
+                            .map(std::borrow::Cow::Borrowed)
+                    });
+                match self
+                    .logo_resource(domain_hint.as_deref().unwrap_or_default())
                     .await
                 {
                     Ok(Some(resource)) => {
@@ -618,12 +680,10 @@ impl ParseHttp for Server {
                 }
             }
             "login" | "device" => {
-                let page = include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../resources/html-templates/login.html.min"
-                ));
-
-                return Ok(HtmlResponse::new(page.to_string()).into_http_response());
+                return Ok(HttpResponse::new(StatusCode::OK)
+                    .with_content_type("text/html; charset=utf-8")
+                    .with_header(CONTENT_ENCODING, "gzip")
+                    .with_binary_body(LOGIN_PAGE));
             }
             external => {
                 if path.next().is_none() {
@@ -780,7 +840,7 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                     {
                         Ok(response) => response,
                         Err(err) => {
-                            let response = err.into_http_response();
+                            let response = err.into_http_response(AuthChallenge::BearerAndBasic);
                             trc::error!(err.span_id(session.session_id));
                             response
                         }
@@ -861,6 +921,46 @@ impl SessionManager for HttpSessionManager {
     fn shutdown(&self) -> impl std::future::Future<Output = ()> + Send {
         async {
             let _ = self.inner.ipc.push_tx.send(PushEvent::Stop).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    const PAGES: [(&str, &[u8], &str); 2] = [
+        (
+            "calendar-rsvp.html",
+            super::RSVP_PAGE,
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../resources/html-templates/calendar-rsvp.html.min"
+            )),
+        ),
+        (
+            "login.html",
+            super::LOGIN_PAGE,
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../resources/html-templates/login.html.min"
+            )),
+        ),
+    ];
+
+    #[test]
+    fn gzipped_static_pages_are_in_sync() {
+        for (name, gzipped, minified) in PAGES {
+            let mut decoded = String::new();
+            GzDecoder::new(gzipped)
+                .read_to_string(&mut decoded)
+                .unwrap_or_else(|err| panic!("{name}.min.gz failed to decompress: {err}"));
+
+            assert_eq!(
+                decoded, minified,
+                "{name}.min.gz is stale, re-run resources/scripts/minify_html.sh --gzip"
+            );
         }
     }
 }

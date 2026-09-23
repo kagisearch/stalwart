@@ -8,7 +8,7 @@ pub mod index;
 pub mod storage;
 
 use calcard::vcard::VCard;
-use common::{DavName, auth::AccessToken};
+use common::DavName;
 use types::{acl::AclGrant, dead_property::DeadProperty};
 
 #[derive(

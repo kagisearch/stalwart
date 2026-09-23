@@ -16,16 +16,16 @@
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL_v3-blue.svg?label=license&style=flat-square" alt="License: AGPL v3"></a>
   &nbsp;
   <a href="https://stalw.art/docs/install/get-started"><img src="https://img.shields.io/badge/read_the-docs-red?style=flat-square" alt="Documentation"></a>
+  &nbsp;
+  <a href="https://github.com/stalwartlabs/stalwart/releases"><img src="https://img.shields.io/github/downloads/stalwartlabs/stalwart/total?style=flat-square" alt="downloads"></a
 </p>
 <p align="center">
-  <a href="https://mastodon.social/@stalwartlabs"><img src="https://img.shields.io/mastodon/follow/109929667531941122?style=flat-square&logo=mastodon&color=%236364ff&label=Follow%20on%20Mastodon" alt="Mastodon"></a>
+  <a href="https://mastodon.social/@stalwartlabs"><img src="https://img.shields.io/mastodon/follow/109929667531941122?style=flat-square&logo=mastodon&color=%236364ff&label=Mastodon" alt="Mastodon"></a>
   &nbsp;
-  <a href="https://twitter.com/stalwartlabs"><img src="https://img.shields.io/twitter/follow/stalwartlabs?style=flat-square&logo=x&label=Follow%20on%20Twitter" alt="Twitter"></a>
-</p>
-<p align="center">
-  <a href="https://discord.com/servers/stalwart-923615863037390889"><img src="https://img.shields.io/discord/923615863037390889?label=Join%20Discord&logo=discord&style=flat-square" alt="Discord"></a>
+  <a href="https://twitter.com/stalwartlabs"><img src="https://img.shields.io/twitter/follow/stalwartlabs?style=flat-square&logo=x&label=Twitter" alt="Twitter"></a>
+  <a href="https://discord.gg/vhqRgdhguq"><img src="https://img.shields.io/discord/923615863037390889?label=Discord&logo=discord&style=flat-square" alt="Discord"></a>
   &nbsp;
-  <a href="https://www.reddit.com/r/stalwartlabs/"><img src="https://img.shields.io/reddit/subreddit-subscribers/stalwartlabs?label=Join%20%2Fr%2Fstalwartlabs&logo=reddit&style=flat-square" alt="Reddit"></a>
+  <a href="https://www.reddit.com/r/stalwartlabs/"><img src="https://img.shields.io/reddit/subreddit-subscribers/stalwartlabs?label=%2Fr%2Fstalwartlabs&logo=reddit&style=flat-square" alt="Reddit"></a>
 </p>
 
 ## Features
@@ -47,7 +47,7 @@ Key features:
     - [POP3](https://datatracker.ietf.org/doc/html/rfc1939) server.
     - [STLS](https://datatracker.ietf.org/doc/html/rfc2595) and [SASL](https://datatracker.ietf.org/doc/html/rfc5034) support as well as other [extensions](https://datatracker.ietf.org/doc/html/rfc2449).
   - SMTP:
-    * SMTP server with built-in [DMARC](https://datatracker.ietf.org/doc/html/rfc7489), [DKIM](https://datatracker.ietf.org/doc/html/rfc6376), [SPF](https://datatracker.ietf.org/doc/html/rfc7208) and [ARC](https://datatracker.ietf.org/doc/html/rfc8617) support for message authentication.
+    * SMTP server with built-in [DMARC](https://datatracker.ietf.org/doc/html/rfc7489), [DKIMv2](https://datatracker.ietf.org/doc/draft-ietf-dkim-dkim2-spec/), [DKIMv1](https://datatracker.ietf.org/doc/html/rfc6376), [SPF](https://datatracker.ietf.org/doc/html/rfc7208) and [ARC](https://datatracker.ietf.org/doc/html/rfc8617) support for message authentication.
     * Strong transport security through [DANE](https://datatracker.ietf.org/doc/html/rfc6698), [MTA-STS](https://datatracker.ietf.org/doc/html/rfc8461) and [SMTP TLS](https://datatracker.ietf.org/doc/html/rfc8460) reporting.
     * Automated DKIM key rotation and management.
     * Inbound throttling and filtering with granular configuration rules, sieve scripting, MTA hooks and milter integration.
@@ -83,7 +83,7 @@ Key features:
   - Sieve scripting language with support for all [registered extensions](https://www.iana.org/assignments/sieve-extensions/sieve-extensions.xhtml).
   - Email aliases, mailing lists, subaddressing and catch-all addresses support.
   - Automated DNS management.
-  - Automatic account configuration and discovery with [autoconfig](https://www.ietf.org/id/draft-bucksch-autoconfig-02.html) and [autodiscover](https://learn.microsoft.com/en-us/exchange/architecture/client-access/autodiscover?view=exchserver-2019). 
+  - Automatic account configuration and discovery with [PACC](https://datatracker.ietf.org/doc/draft-ietf-mailmaint-pacc/), [autoconfig](https://datatracker.ietf.org/doc/draft-ietf-mailmaint-autoconfig/) and [autodiscover](https://learn.microsoft.com/en-us/exchange/architecture/client-access/autodiscover?view=exchserver-2019). 
   - Multi-tenancy support with domain and tenant isolation.
   - Disk quotas per user and tenant.
 - **Secure and robust**:
@@ -103,6 +103,7 @@ Key features:
   - **OpenID Connect** authentication.
   - OAuth 2.0 authorization with [authorization code](https://www.rfc-editor.org/rfc/rfc8628) and [device authorization](https://www.rfc-editor.org/rfc/rfc8628) flows.
   - **LDAP**, **OIDC**, **SQL** or built-in authentication backend support.
+  - System for Cross-domain Identity Management ([SCIM](https://www.rfc-editor.org/info/rfc7643/)) v2 for automated provisioning.
   - Two-factor authentication with Time-based One-Time Passwords (`2FA-TOTP`) 
   - Application passwords (App Passwords).
   - Roles and permissions.
@@ -134,7 +135,7 @@ Key features:
 
 Install Stalwart on your server by following the instructions for your platform:
 
-- [Linux / MacOS](https://stalw.art/docs/install/platform/linux)
+- [Linux / MacOS / FreeBSD](https://stalw.art/docs/install/platform/linux)
 - [Windows](https://stalw.art/docs/install/platform/windows)
 - [Docker](https://stalw.art/docs/install/platform/docker)
 
@@ -144,6 +145,11 @@ All documentation is available at [stalw.art/docs](https://stalw.art/docs/instal
 
 If you are having problems running Stalwart, found a bug, or just have a question, please head to the [Stalwart Support Portal](https://support.stalw.art) at [support.stalw.art](https://support.stalw.art). 
 Additionally, you may purchase an [Enterprise License](https://stalw.art/enterprise) to obtain priority support from Stalwart Labs LLC, including response-time commitments and a private Priority Support area on the portal.
+
+## Contributing
+
+We welcome contributions, but to keep the project maintainable there are a few things to know before opening a pull request. Because of the high volume of low-quality, AI-generated submissions, pull requests are limited to a list of vouched contributors; to be added, post at [support.stalw.art](https://support.stalw.art) describing the change you would like to submit, together with a link to the proposed change. At this stage only bug fixes and translations are accepted, and new features are not, unless they involve just a few lines of code.
+For the full guidelines, please read [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Roadmap
 

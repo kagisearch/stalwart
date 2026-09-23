@@ -5,10 +5,10 @@
  */
 
 use crate::{
-    smtp::{inbound::TestQueueEvent, session::TestSession},
+    smtp::session::TestSession,
     utils::{dns::DnsCache, server::TestServerBuilder},
 };
-use mail_auth::MX;
+use mail_auth::{DnssecStatus, MX};
 use registry::{
     schema::{
         enums::MtaIpStrategy,
@@ -84,6 +84,7 @@ async fn ip_lookup_strategy() {
                 exchanges: vec!["mx.foobar.org".into()].into_boxed_slice(),
                 preference: 10,
             }],
+            DnssecStatus::Secure,
             Instant::now() + Duration::from_secs(10),
         );
         if matches!(strategy, MtaIpStrategy::V6ThenV4) {
@@ -122,7 +123,7 @@ async fn ip_lookup_strategy() {
                 "Message: {:?}",
                 message
             );
-            local.read_event().await.assert_refresh();
+            local.expect_refresh().await;
         }
     }
 }

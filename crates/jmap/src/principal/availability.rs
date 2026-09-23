@@ -20,7 +20,8 @@ use common::{
 };
 use groupware::{
     cache::GroupwareCache,
-    calendar::{CALENDAR_SUBSCRIBED, CalendarEvent},
+    calendar::{CALENDAR_SUBSCRIBED, CalendarEvent, expand::RecurrenceKey},
+    strip_mailto_scheme,
 };
 use jmap_proto::{
     method::availability::{
@@ -258,9 +259,7 @@ impl PrincipalGetAvailability for Server {
                                 if include_in_availability == IncludeInAvailability::Attending =>
                             {
                                 if let Some(attendee) = value.as_text().and_then(|attendee| {
-                                    sanitize_email(
-                                        attendee.strip_prefix("mailto:").unwrap_or(attendee),
-                                    )
+                                    sanitize_email(strip_mailto_scheme(attendee))
                                 }) {
                                     // Condition: the Principal is a participant of the event, and has a "participationStatus" of "accepted" or "tentative".
                                     if principal_account.addresses().contains(&attendee) {
@@ -322,12 +321,15 @@ impl PrincipalGetAvailability for Server {
                     let Some(busy_status) = matching_component_ids.get(&expansion.comp_id) else {
                         continue;
                     };
+                    let Some(recurrence_key) = expansion.recurrence_key() else {
+                        continue;
+                    };
                     if periods.len() < max_instances {
                         periods.push(FreeBusyResult {
                             utc_start: expansion.start,
                             utc_end: expansion.end,
                             busy_status: *busy_status,
-                            expansion_id: expansion.comp_id,
+                            recurrence_key,
                             document_id,
                         });
                     } else {
@@ -396,7 +398,7 @@ struct FreeBusyResult {
     utc_start: i64,
     utc_end: i64,
     busy_status: BusyStatus,
-    expansion_id: u32,
+    recurrence_key: RecurrenceKey,
     document_id: u32,
 }
 
@@ -410,7 +412,7 @@ impl From<FreeBusyResult> for BusyPeriod {
                 (
                     Key::Property(JSCalendarProperty::Id),
                     Value::Element(JSCalendarValue::Id(<Id as CalendarSyntheticId>::new(
-                        value.expansion_id,
+                        value.recurrence_key,
                         value.document_id,
                     ))),
                 ),

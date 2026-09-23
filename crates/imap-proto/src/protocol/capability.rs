@@ -54,6 +54,10 @@ pub enum Capability {
     QuotaResource(QuotaResourceName),
     QuotaSet,
     JmapAccess,
+    UidOnly,
+    UidBatches,
+    MessageLimit(u32),
+    SaveLimit(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,10 +125,28 @@ impl Capability {
             }
             Capability::QuotaSet => b"QUOTA=SET",
             Capability::JmapAccess => b"JMAPACCESS",
+            Capability::UidOnly => b"UIDONLY",
+            Capability::UidBatches => b"UIDBATCHES",
+            Capability::MessageLimit(limit) => {
+                buf.extend_from_slice(b"MESSAGELIMIT=");
+                buf.extend_from_slice(limit.to_string().as_bytes());
+                return;
+            }
+            Capability::SaveLimit(limit) => {
+                buf.extend_from_slice(b"SAVELIMIT=");
+                buf.extend_from_slice(limit.to_string().as_bytes());
+                return;
+            }
         });
     }
 
-    pub fn all_capabilities(is_authenticated: bool, offer_tls: bool) -> Vec<Capability> {
+    pub fn all_capabilities(
+        is_authenticated: bool,
+        offer_tls: bool,
+        allow_auth: bool,
+        message_limit: u32,
+        save_limit: u32,
+    ) -> Vec<Capability> {
         let mut capabilities = vec![
             Capability::IMAP4rev2,
             Capability::IMAP4rev1,
@@ -167,13 +189,19 @@ impl Capability {
                 Capability::Rights,
                 Capability::Quota,
                 Capability::QuotaResource(QuotaResourceName::Storage),
+                Capability::UidOnly,
+                Capability::UidBatches,
+                Capability::MessageLimit(message_limit),
+                Capability::SaveLimit(save_limit),
             ]);
-        } else {
+        } else if allow_auth {
             capabilities.extend([
                 Capability::Auth(Mechanism::Plain),
                 Capability::Auth(Mechanism::OAuthBearer),
                 Capability::Auth(Mechanism::XOauth2),
             ]);
+        } else {
+            capabilities.push(Capability::LoginDisabled);
         }
         if offer_tls {
             capabilities.push(Capability::StartTLS);

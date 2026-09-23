@@ -60,6 +60,26 @@ impl From<Disposition> for enums::DmarcDisposition {
     }
 }
 
+impl From<enums::DmarcDiscovery> for Discovery {
+    fn from(value: enums::DmarcDiscovery) -> Self {
+        match value {
+            enums::DmarcDiscovery::Psl => Discovery::Psl,
+            enums::DmarcDiscovery::Treewalk => Discovery::Treewalk,
+            enums::DmarcDiscovery::Unspecified => Discovery::Unspecified,
+        }
+    }
+}
+
+impl From<Discovery> for enums::DmarcDiscovery {
+    fn from(value: Discovery) -> Self {
+        match value {
+            Discovery::Psl => enums::DmarcDiscovery::Psl,
+            Discovery::Treewalk => enums::DmarcDiscovery::Treewalk,
+            Discovery::Unspecified => enums::DmarcDiscovery::Unspecified,
+        }
+    }
+}
+
 impl From<enums::DmarcActionDisposition> for ActionDisposition {
     fn from(value: enums::DmarcActionDisposition) -> Self {
         match value {
@@ -107,12 +127,15 @@ impl From<DmarcResult> for enums::DmarcResult {
 impl From<enums::DmarcPolicyOverride> for PolicyOverride {
     fn from(value: enums::DmarcPolicyOverride) -> Self {
         match value {
-            enums::DmarcPolicyOverride::Forwarded => PolicyOverride::Forwarded,
-            enums::DmarcPolicyOverride::SampledOut => PolicyOverride::SampledOut,
             enums::DmarcPolicyOverride::TrustedForwarder => PolicyOverride::TrustedForwarder,
             enums::DmarcPolicyOverride::MailingList => PolicyOverride::MailingList,
             enums::DmarcPolicyOverride::LocalPolicy => PolicyOverride::LocalPolicy,
-            enums::DmarcPolicyOverride::Other => PolicyOverride::Other,
+            enums::DmarcPolicyOverride::PolicyTestMode => PolicyOverride::PolicyTestMode,
+            // "forwarded" and "sampled_out" were removed in RFC 9990; map any
+            // legacy stored value to the closest surviving override type.
+            enums::DmarcPolicyOverride::Forwarded
+            | enums::DmarcPolicyOverride::SampledOut
+            | enums::DmarcPolicyOverride::Other => PolicyOverride::Other,
         }
     }
 }
@@ -120,11 +143,10 @@ impl From<enums::DmarcPolicyOverride> for PolicyOverride {
 impl From<PolicyOverride> for enums::DmarcPolicyOverride {
     fn from(value: PolicyOverride) -> Self {
         match value {
-            PolicyOverride::Forwarded => enums::DmarcPolicyOverride::Forwarded,
-            PolicyOverride::SampledOut => enums::DmarcPolicyOverride::SampledOut,
             PolicyOverride::TrustedForwarder => enums::DmarcPolicyOverride::TrustedForwarder,
             PolicyOverride::MailingList => enums::DmarcPolicyOverride::MailingList,
             PolicyOverride::LocalPolicy => enums::DmarcPolicyOverride::LocalPolicy,
+            PolicyOverride::PolicyTestMode => enums::DmarcPolicyOverride::PolicyTestMode,
             PolicyOverride::Other => enums::DmarcPolicyOverride::Other,
         }
     }
@@ -357,6 +379,7 @@ impl From<structs::DmarcReport> for Report {
                     end: value.date_range_end.timestamp() as u64,
                 },
                 error: value.errors.into_inner(),
+                generator: value.generator,
             },
             policy_published: PolicyPublished {
                 domain: value.policy_domain,
@@ -365,6 +388,8 @@ impl From<structs::DmarcReport> for Report {
                 aspf: value.policy_aspf.into(),
                 p: value.policy_disposition.into(),
                 sp: value.policy_subdomain_disposition.into(),
+                np: value.policy_np.into(),
+                discovery_method: value.policy_discovery_method.into(),
                 testing: value.policy_testing_mode,
                 fo: failure_reporting_options_to_fo(
                     value.policy_failure_reporting_options.as_slice(),
@@ -390,15 +415,18 @@ impl From<Report> for structs::DmarcReport {
             errors: value.report_metadata.error.into(),
             extensions: List::from_iter(value.extensions.into_iter().map(Into::into)),
             extra_contact_info: value.report_metadata.extra_contact_info,
+            generator: value.report_metadata.generator,
             org_name: value.report_metadata.org_name,
             policy_adkim: value.policy_published.adkim.into(),
             policy_aspf: value.policy_published.aspf.into(),
+            policy_discovery_method: value.policy_published.discovery_method.into(),
             policy_disposition: value.policy_published.p.into(),
             policy_domain: value.policy_published.domain,
             policy_failure_reporting_options: fo_to_failure_reporting_options(
                 &value.policy_published.fo,
             )
             .into(),
+            policy_np: value.policy_published.np.into(),
             policy_subdomain_disposition: value.policy_published.sp.into(),
             policy_testing_mode: value.policy_published.testing,
             policy_version: value
@@ -893,6 +921,30 @@ impl From<&mail_auth::DkimResult> for structs::DmarcTroubleshootAuthResult {
                 })
             }
             mail_auth::DkimResult::None => structs::DmarcTroubleshootAuthResult::None,
+        }
+    }
+}
+
+impl From<&mail_auth::Dkim2Result> for structs::DmarcTroubleshootAuthResult {
+    fn from(value: &mail_auth::Dkim2Result) -> Self {
+        match value {
+            mail_auth::Dkim2Result::Pass => structs::DmarcTroubleshootAuthResult::Pass,
+            mail_auth::Dkim2Result::Fail(error) => {
+                structs::DmarcTroubleshootAuthResult::Fail(structs::DmarcTroubleshootDetails {
+                    details: error.to_string().into(),
+                })
+            }
+            mail_auth::Dkim2Result::PermError(error) => {
+                structs::DmarcTroubleshootAuthResult::PermError(structs::DmarcTroubleshootDetails {
+                    details: error.to_string().into(),
+                })
+            }
+            mail_auth::Dkim2Result::TempError(error) => {
+                structs::DmarcTroubleshootAuthResult::TempError(structs::DmarcTroubleshootDetails {
+                    details: error.to_string().into(),
+                })
+            }
+            mail_auth::Dkim2Result::None => structs::DmarcTroubleshootAuthResult::None,
         }
     }
 }

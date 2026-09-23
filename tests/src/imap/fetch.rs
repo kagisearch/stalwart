@@ -7,7 +7,7 @@
 use super::{AssertResult, ImapConnection, Type};
 use imap_proto::ResponseType;
 
-pub async fn test(imap: &mut ImapConnection, _imap_check: &mut ImapConnection) {
+pub async fn test(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
     println!("Running FETCH tests...");
 
     // Examine INBOX
@@ -63,6 +63,18 @@ pub async fn test(imap: &mut ImapConnection, _imap_check: &mut ImapConnection) {
             " 0 \"cdb0382a03a15601fb1b3c7422521620\" NIL NIL NIL) ",
             "\"mixed\" (\"boundary\" \"festivus\") NIL NIL NIL)"
         ));
+
+    imap_check.send("EXAMINE INBOX").await;
+    imap_check.assert_read(Type::Tagged, ResponseType::Ok).await;
+    imap_check.send("FETCH 10 (ENVELOPE BODYSTRUCTURE)").await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains(
+            "\"=?utf-8?B?V2h5IG5vdCBib3RoIGltcG9ydGluZyBBTkQgZXhwb3J0aW5nPyDimLo=?=\" ",
+        )
+        .assert_contains("(\"=?utf-8?B?Sm9obiBTbcOudGg=?=\" NIL \"john\" \"example.com\")")
+        .assert_contains("(\"name\" \"=?utf-8?B?Qm9vayBhYm91dCDimJUgdGFibGVzLmdpZg==?=\")");
 
     // Fetch bodyparts
     imap.send(concat!(
@@ -157,4 +169,15 @@ pub async fn test(imap: &mut ImapConnection, _imap_check: &mut ImapConnection) {
         .assert_contains("Some text appears here")
         .assert_contains("plain text version of message goes here")
         .assert_contains("This is implicitly typed plain US-ASCII text.");
+
+    // A failing command in a pipelined batch does not swallow the tagged completion of the commands queued behind it
+    imap.send_raw(concat!(
+        "_p UID FETCH 1:* (UID) (CHANGEDSINCE 1 VANISHED)\r\n",
+        "_x FETCH 1 (UID)\r\n"
+    ))
+    .await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("_p BAD")
+        .assert_contains("* 1 FETCH (UID 1");
 }

@@ -91,6 +91,10 @@ pub enum Capability {
     MailShare = 1 << 16,
     #[serde(rename(serialize = "urn:stalwart:jmap"))]
     Stalwart = 1 << 17,
+    #[serde(rename(serialize = "urn:ietf:params:jmap:webpush-vapid"))]
+    WebPushVapid = 1 << 18,
+    #[serde(rename(serialize = "urn:ietf:params:jmap:emailpush"))]
+    EmailPush = 1 << 19,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -119,6 +123,7 @@ pub enum Capabilities {
     PrincipalsAvailability(PrincipalAvailabilityCapabilities),
     Calendar(CalendarCapabilities),
     FileNode(FileNodeCapabilities),
+    WebPush(WebPushCapabilities),
     Empty(EmptyCapabilities),
 }
 
@@ -291,6 +296,12 @@ pub struct FileNodeCapabilities {
     pub web_write_url_template: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WebPushCapabilities {
+    #[serde(rename(serialize = "applicationServerKey"))]
+    pub application_server_key: String,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct EmptyCapabilities {}
 
@@ -321,6 +332,8 @@ impl Capability {
             Capability::FileNode => "urn:ietf:params:jmap:filenode",
             Capability::MailShare => "urn:ietf:params:jmap:mail:share",
             Capability::Stalwart => "urn:stalwart:jmap",
+            Capability::WebPushVapid => "urn:ietf:params:jmap:webpush-vapid",
+            Capability::EmailPush => "urn:ietf:params:jmap:emailpush",
         }
     }
 
@@ -343,6 +356,8 @@ impl Capability {
             Capability::FileNode,
             Capability::MailShare,
             Capability::Stalwart,
+            Capability::WebPushVapid,
+            Capability::EmailPush,
         ]
     }
 }
@@ -463,6 +478,8 @@ impl Capability {
             "urn:ietf:params:jmap:calendars:parse" => Capability::CalendarsParse,
             "urn:ietf:params:jmap:mail:share" => Capability::MailShare,
             "urn:stalwart:jmap" => Capability::Stalwart,
+            "urn:ietf:params:jmap:webpush-vapid" => Capability::WebPushVapid,
+            "urn:ietf:params:jmap:emailpush" => Capability::EmailPush,
         )
     }
 }
@@ -487,10 +504,13 @@ impl<'de> Deserialize<'de> for CapabilityIds {
             {
                 let mut capability_flags = 0u32;
 
-                while let Some(capability_str) = seq.next_element::<&str>()? {
-                    let capability = Capability::parse(capability_str).ok_or_else(|| {
-                        serde::de::Error::custom(format!("Unknown capability: {capability_str:?}"))
-                    })?;
+                while let Some(capability_str) = seq.next_element::<std::borrow::Cow<str>>()? {
+                    let capability =
+                        Capability::parse(capability_str.as_ref()).ok_or_else(|| {
+                            serde::de::Error::custom(format!(
+                                "Unknown capability: {capability_str:?}"
+                            ))
+                        })?;
 
                     capability_flags |= capability as u32;
                 }

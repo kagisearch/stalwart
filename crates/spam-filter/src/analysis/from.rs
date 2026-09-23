@@ -36,18 +36,17 @@ impl SpamFilterAnalyzeFrom for Server {
                         .get(header.offset_start as usize..header.offset_end as usize)
                         .unwrap_or_default();
                 }
-                HeaderName::Other(name) => {
-                    if name.eq_ignore_ascii_case("X-Confirm-Reading-To") {
-                        crt = ctx
-                            .input
-                            .header_as_address(header)
-                            .map(|s| s.to_lowercase());
-                    } else if name.eq_ignore_ascii_case("Disposition-Notification-To") {
-                        dnt = ctx
-                            .input
-                            .header_as_address(header)
-                            .map(|s| s.to_lowercase());
-                    }
+                HeaderName::DispositionNotificationTo => {
+                    dnt = ctx
+                        .input
+                        .header_as_address(header)
+                        .map(|s| Email::new(s.as_ref()));
+                }
+                HeaderName::Other(name) if name.eq_ignore_ascii_case("X-Confirm-Reading-To") => {
+                    crt = ctx
+                        .input
+                        .header_as_address(header)
+                        .map(|s| Email::new(s.as_ref()));
                 }
                 _ => {}
             }
@@ -119,7 +118,7 @@ impl SpamFilterAnalyzeFrom for Server {
                 ctx.result.add_tag("FROM_BOUNCE");
             }
 
-            if !env_from_empty && ctx.output.env_from_addr.address == from_addr.address {
+            if !env_from_empty && ctx.output.env_from_addr == *from_addr {
                 ctx.result.add_tag("FROM_EQ_ENV_FROM");
             } else if from_addr_is_valid {
                 if from_addr.domain_part.sld == ctx.output.ehlo_host.sld {
@@ -138,7 +137,7 @@ impl SpamFilterAnalyzeFrom for Server {
                     .first()
                     .or_else(|| ctx.output.recipients_cc.first())
                     .unwrap();
-                if rcpt.email.address == from_addr.address {
+                if rcpt.email == *from_addr {
                     ctx.result.add_tag("TO_EQ_FROM");
                 } else if rcpt.email.domain_part.fqdn == from_addr.domain_part.fqdn {
                     ctx.result.add_tag("TO_DOM_EQ_FROM_DOM");
@@ -190,8 +189,8 @@ impl SpamFilterAnalyzeFrom for Server {
             }
 
             // Check whether read confirmation address is different to from address
-            if let Some(crt) = crt
-                && crt != from_addr.address
+            if let Some(crt) = &crt
+                && crt != from_addr
             {
                 ctx.result.add_tag("HEADER_RCONFIRM_MISMATCH");
             }
@@ -218,8 +217,8 @@ impl SpamFilterAnalyzeFrom for Server {
             }
 
             // Check whether disposition notification address is different to return path
-            if let Some(dnt) = dnt
-                && dnt != ctx.output.env_from_addr.address
+            if let Some(dnt) = &dnt
+                && *dnt != ctx.output.env_from_addr
             {
                 ctx.result.add_tag("HEADER_FORGED_MDN");
             }

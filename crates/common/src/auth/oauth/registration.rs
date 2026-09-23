@@ -207,6 +207,36 @@ impl ClientRegistrationError {
     }
 }
 
+pub fn loopback_redirect_parts(uri: &str) -> Option<(&str, &str)> {
+    let uri = uri.strip_prefix("http://")?;
+
+    for host in ["127.0.0.1", "[::1]"] {
+        if let Some(rest) = uri.strip_prefix(host) {
+            if let Some(path) = rest.strip_prefix('/') {
+                return Some((host, path));
+            } else if let Some(after_colon) = rest.strip_prefix(':')
+                && let Some((port, path)) = after_colon.split_once('/')
+                && !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Some((host, path));
+            }
+        }
+    }
+    None
+}
+
+pub fn redirect_uri_matches(registered: &str, presented: &str) -> bool {
+    registered == presented
+        || matches!(
+            (
+                loopback_redirect_parts(registered),
+                loopback_redirect_parts(presented),
+            ),
+            (Some(reg), Some(pres)) if reg == pres
+        )
+}
+
 pub fn validate_redirect_uri(uri: &str) -> Result<(), ClientRegistrationError> {
     if uri.contains('#') {
         return Err(ClientRegistrationError::invalid_redirect_uri(
@@ -216,10 +246,7 @@ pub fn validate_redirect_uri(uri: &str) -> Result<(), ClientRegistrationError> {
         return Err(ClientRegistrationError::invalid_redirect_uri(
             "Redirect URI must not contain consecutive dots.",
         ));
-    } else if uri.starts_with("http://127.0.0.1/")
-        || uri.starts_with("http://[::1]/")
-        || uri.starts_with("https://")
-    {
+    } else if uri.starts_with("https://") || loopback_redirect_parts(uri).is_some() {
         return Ok(());
     } else if let Some((scheme, _)) = uri.split_once(':')
         && scheme.contains('.')

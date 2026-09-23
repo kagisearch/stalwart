@@ -10,10 +10,12 @@ use crate::utils::{
 };
 use ahash::AHashSet;
 use calcard::jscontact::JSContactProperty;
-use groupware::cache::GroupwareCache;
+use dav_proto::Depth;
+use groupware::{DavResourceName, cache::GroupwareCache};
 use hyper::StatusCode;
 use jmap_proto::request::method::MethodObject;
 use serde_json::{Value, json};
+use std::str::FromStr;
 use types::{collection::SyncCollection, id::Id};
 
 pub async fn test(test: &TestServer) {
@@ -131,6 +133,20 @@ pub async fn test(test: &TestServer) {
     response.list()[2].assert_is_equal(
         acme_contact.with_property(JSContactProperty::<Id>::Id, acme_contact_id.as_str()),
     );
+
+    let response = account
+        .jmap_method_calls(json!([[
+            "ContactCard/get",
+            {
+                "accountId": account.id_string(),
+                "properties": [],
+                "ids": [&sarah_contact_id, &carlos_contact_id],
+            },
+            "0"
+        ]]))
+        .await;
+    response.list()[0].assert_is_equal(json!({ "id": &sarah_contact_id }));
+    response.list()[1].assert_is_equal(json!({ "id": &carlos_contact_id }));
 
     // Creating a contact without address book should fail
     assert_eq!(
@@ -488,6 +504,110 @@ END:VCARD"#
         .map(String::from)
         .collect::<AHashSet<_>>();
     assert_eq!(vcard, expected_vcard);
+
+    // Moving a card between address books tombstones the previous CardDAV href
+    test.wait_for_tasks().await;
+    let card_base_path = format!("{}/jdoe%40example.com/", DavResourceName::Card.base_path());
+    let sync_token = dav_client
+        .sync_collection(&card_base_path, "", Depth::Infinity, None, ["D:getetag"])
+        .await
+        .sync_token()
+        .to_string();
+    let moved_card_id = account
+        .jmap_create(
+            MethodObject::ContactCard,
+            [json!({
+                "@type": "Card",
+                "uid": "9b1f6c22-2f0e-4d6b-8f3a-1c7f2b5d9e10",
+                "name": {
+                    "full": "Moving Contact",
+                },
+                "addressBookIds": {
+                    &book1_id: true
+                },
+            })],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .created(0)
+        .id()
+        .to_string();
+    let response = dav_client
+        .sync_collection(
+            &card_base_path,
+            &sync_token,
+            Depth::Infinity,
+            None,
+            ["D:getetag"],
+        )
+        .await
+        .with_href_count(1);
+    let sync_token = response.sync_token().to_string();
+    let href_in_book1 = response.hrefs()[0].to_string();
+
+    account
+        .jmap_update(
+            MethodObject::ContactCard,
+            [(
+                &moved_card_id,
+                json!({
+                    "addressBookIds": {
+                        &book2_id: true
+                    }
+                }),
+            )],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .updated(&moved_card_id);
+
+    let response = dav_client
+        .sync_collection(
+            &card_base_path,
+            &sync_token,
+            Depth::Infinity,
+            None,
+            ["D:getetag"],
+        )
+        .await
+        .with_href_count(2);
+    let sync_token = response.sync_token().to_string();
+    let href_in_book2 = response
+        .hrefs()
+        .into_iter()
+        .find(|href| *href != href_in_book1)
+        .unwrap()
+        .to_string();
+    let response = response.into_propfind_response(None);
+    response
+        .properties(&href_in_book1)
+        .with_status(StatusCode::NOT_FOUND);
+    response
+        .properties(&href_in_book2)
+        .with_status(StatusCode::OK);
+
+    account
+        .jmap_destroy(
+            MethodObject::ContactCard,
+            [moved_card_id.as_str()],
+            Vec::<(&str, &str)>::new(),
+        )
+        .await
+        .assert_destroyed(&[Id::from_str(&moved_card_id).unwrap()]);
+
+    dav_client
+        .sync_collection(
+            &card_base_path,
+            &sync_token,
+            Depth::Infinity,
+            None,
+            ["D:getetag"],
+        )
+        .await
+        .with_href_count(1)
+        .into_propfind_response(None)
+        .properties(&href_in_book2)
+        .with_status(StatusCode::NOT_FOUND);
 
     // Clean up
     test.wait_for_tasks().await;
@@ -1211,8 +1331,8 @@ LANG;TYPE=WORK;PREF=1;PROP-ID=k1:en
 LANG;TYPE=WORK;PREF=2;PROP-ID=k2:fr
 FN:Sarah O'Connor
 N;JSCOMPS=";0;1;2;3;4":O'Connor;Sarah;Marie;Dr.;Ph.D.;;
-KEY;TYPE=PGP;PROP-ID=k1:https://pgp.example.com/pks/lookup?op=get&search=sar
- ah.johnson@example.com
+KEY;TYPE=PGP;PROP-ID=k1:https://pgp.example.com/pks/lookup?op=get&search=sa
+ rah.johnson@example.com
 CATEGORIES:Work,Research,VIP
 BDAY;PROP-ID=k1:19850415
 ANNIVERSARY;PROP-ID=k2:20100610
@@ -1225,17 +1345,17 @@ TEL;TYPE=PREF,CELL,VOICE;PROP-ID=k1:+1-555-123-4567
 TEL;TYPE=WORK,VOICE;PROP-ID=k2:+1-555-987-6543
 TEL;TYPE=HOME,VOICE;PROP-ID=k3:+1-555-456-7890
 ADR;TYPE=WORK;LABEL="123 Business Ave\nSuite 400\nNew York, NY 10001\nUSA";
- TZ=Etc/GMT+5;GEO="40.7128;-74.0060";PROP-ID=k1;JSCOMPS=";11;3;4;5;6":;;123 B
- usiness Ave;New York;NY;10001;USA;;;;;123 Business Ave;;;;;;
+ TZ=Etc/GMT+5;GEO="40.7128;-74.0060";PROP-ID=k1;JSCOMPS=";11;3;4;5;6":;;123
+  Business Ave;New York;NY;10001;USA;;;;;123 Business Ave;;;;;;
 ADR;TYPE=HOME,PREF;LABEL="456 Residential St\nApt 7B\nBrooklyn, NY 11201\nU
- SA";PROP-ID=k2;JSCOMPS=";11;3;4;5;6":;;456 Residential St;Brooklyn;NY;11201;
- USA;;;;;456 Residential St;;;;;;
+ SA";PROP-ID=k2;JSCOMPS=";11;3;4;5;6":;;456 Residential St;Brooklyn;NY;1120
+ 1;USA;;;;;456 Residential St;;;;;;
 TITLE;PROP-ID=k1:Senior Research Scientist
 JSPROP;JSPTR=titles/k2/organizationId:"k1"
 ROLE;PROP-ID=k2:Team Lead
 NICKNAME;PROP-ID=k1:Sadie
-NOTE;PROP-ID=k1:Sarah prefers video calls over phone calls. Available Mon-Th
- u 9-5 EST.
+NOTE;PROP-ID=k1:Sarah prefers video calls over phone calls. Available Mon-T
+ hu 9-5 EST.
 REV:20220315T133000Z
 END:VCARD
 "#;
