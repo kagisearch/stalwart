@@ -577,6 +577,9 @@ END:VCARD
         }
     }
 
+    // Reconnect: the per-session message limit would be exceeded otherwise
+    lmtp = SmtpConnection::connect().await;
+
     // Create nested mailing lists
     admin
         .registry_create_object(MailingList {

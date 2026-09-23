@@ -503,11 +503,11 @@ pub enum MtaHookEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum DeliveryHookEvent {
-    ActionAccept = 605,
-    ActionDiscard = 606,
-    ActionReject = 607,
-    ActionQuarantine = 608,
-    Error = 609,
+    ActionAccept = 637,
+    ActionDiscard = 638,
+    ActionReject = 639,
+    ActionQuarantine = 640,
+    Error = 641,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

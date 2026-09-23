@@ -631,9 +631,8 @@ impl MessageWrapper {
                 self.add_expanded_recipient(&rewritten, server).await;
             }
             Ok(RcptResolution::Expand(addrs)) => {
-                // Flatten nested lists
-                for addr in server.expand_list_members(addrs, rcpt, self.span_id).await {
-                    self.add_expanded_recipient(&addr, server).await;
+                for addr in addrs.as_ref() {
+                    self.add_expanded_recipient(addr, server).await;
                 }
             }
             Ok(_) => {

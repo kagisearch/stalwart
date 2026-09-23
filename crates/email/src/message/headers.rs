@@ -511,7 +511,7 @@ fn from_mail_datetime(date: DateTime) -> Value<'static, EmailProperty, EmailValu
     Value::Element(EmailValue::Date(if utc_date.is_valid() {
         utc_date
     } else {
-        UTCDate::default()
+        UTCDate::from_timestamp(0)
     }))
 }
 
