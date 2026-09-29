@@ -44,6 +44,7 @@ pub async fn send_delivery_hook_request(hook: &DeliveryHook, request: Request) -
                     action: Action::Accept,
                     modifications: Vec::new(),
                     skip_inbox: false,
+                    replace_mailboxes: false,
                     flags: Vec::new(),
                     preview_text: None,
                 })

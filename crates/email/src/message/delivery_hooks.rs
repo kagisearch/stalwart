@@ -14,7 +14,7 @@ use futures::future::join_all;
 use std::{collections::HashSet, str::FromStr, time::Instant};
 use trc::AddContext;
 
-use types::{id::Id, special_use::SpecialUse};
+use types::{id::Id, keyword::Keyword, special_use::SpecialUse};
 
 use crate::{
     cache::{MessageCacheFetch, mailbox::MailboxCacheAccess},
@@ -42,25 +42,75 @@ impl ResolveVariable for DeliveryResolver {
     }
 }
 
+#[derive(Default)]
+pub struct DeliveryHookResult {
+    /// Resolved fileInto targets in hook and modification order. Ingest uses
+    /// the first mailbox for duplicate detection, so the order matters.
+    pub mailbox_ids: Vec<u32>,
+    pub flags: HashSet<String>,
+    /// Remove the Inbox from the current filing. Never set together with
+    /// `replace_mailboxes`.
+    pub skip_inbox: bool,
+    /// The account's Archive mailbox, looked up by its special-use role after
+    /// the hooks have run (including any mailbox creations). `None` when the
+    /// account has no Archive.
+    pub archive_id: Option<u32>,
+    /// Replace the current filing with `mailbox_ids` instead of adding to it.
+    /// When set, `mailbox_ids` holds only the targets of the hooks that asked
+    /// for replacement.
+    pub replace_mailboxes: bool,
+    pub modifications: Vec<ModificationOut>,
+    pub preview_text: Option<String>,
+    /// Discard the message without returning an error
+    pub discarded: bool,
+}
+
 /// Try to call the delivery hook to determine mailbox filing
-/// Returns:
-/// - (mailbox_ids, flags, skip_inbox, modifications)
-/// - none: discard message, but don't return an error
+///
+/// `current_mailbox_ids`, `current_keywords` and `did_file_into` describe the filing chosen by
+/// the user's Sieve script (or the default Inbox filing) and are sent to the hook.
+#[allow(clippy::too_many_arguments)]
 pub async fn try_delivery_hook(
     server: &Server,
     user_id: u32,
     sender: &str,
     recipient: &str,
     parsed_message: &mail_parser::Message<'_>,
-) -> trc::Result<Option<(HashSet<u32>, HashSet<String>, bool, Vec<ModificationOut>, Option<String>)>>
-{
-    let default_response = Some((HashSet::new(), HashSet::new(), false, Vec::new(), None));
-
+    current_mailbox_ids: &[u32],
+    current_keywords: &[Keyword],
+    did_file_into: bool,
+) -> trc::Result<DeliveryHookResult> {
     // No delivery hooks configured: nothing to do.
     let delivery_hooks = &server.core.smtp.session.delivery_hooks;
     if delivery_hooks.is_empty() {
-        return Ok(default_response);
+        return Ok(DeliveryHookResult::default());
     }
+
+    // Filter enabled hooks
+    let resolver = DeliveryResolver;
+    let mut enabled_hooks = Vec::new();
+    for hook in delivery_hooks {
+        if server
+            .eval_if(&hook.enable, &resolver, 0)
+            .await
+            .unwrap_or(false)
+        {
+            enabled_hooks.push(hook);
+        }
+    }
+
+    if enabled_hooks.is_empty() {
+        return Ok(DeliveryHookResult::default());
+    }
+
+    let filing = hooks::Filing {
+        mailbox_ids: current_mailbox_ids
+            .iter()
+            .map(|&id| Id::from(id).as_string())
+            .collect(),
+        flags: current_keywords.iter().map(|k| k.to_string()).collect(),
+        filed_by_script: did_file_into,
+    };
 
     let envelope = hooks::Envelope {
         from: hooks::Address {
@@ -86,30 +136,14 @@ pub async fn try_delivery_hook(
         .unwrap_or_else(|| Id::from(user_id).as_string());
 
     let request = hooks::Request::new(Id::from(user_id).as_string(), principal_name)
-    .with_envelope(envelope)
-    .with_message(hooks::Message {
-        headers,
-        server_headers: vec![],
-        contents: String::from_utf8_lossy(&parsed_message.raw_message).into_owned(),
-        size: parsed_message.raw_message.len(),
-    });
-
-    // Filter enabled hooks
-    let resolver = DeliveryResolver;
-    let mut enabled_hooks = Vec::new();
-    for hook in delivery_hooks {
-        if server
-            .eval_if(&hook.enable, &resolver, 0)
-            .await
-            .unwrap_or(false)
-        {
-            enabled_hooks.push(hook);
-        }
-    }
-
-    if enabled_hooks.is_empty() {
-        return Ok(default_response);
-    }
+        .with_envelope(envelope)
+        .with_message(hooks::Message {
+            headers,
+            server_headers: vec![],
+            contents: String::from_utf8_lossy(&parsed_message.raw_message).into_owned(),
+            size: parsed_message.raw_message.len(),
+        })
+        .with_filing(filing);
 
     // Run all enabled hooks in parallel
     let mut hook_futures = Vec::new();
@@ -125,7 +159,10 @@ pub async fn try_delivery_hook(
     let hook_results = join_all(hook_futures).await;
 
     // Process all hook results
-    let mut mailbox_ids = HashSet::new();
+    let mut add_mailbox_ids = Vec::new();
+    // Targets from hooks that asked to replace the filing. When non-empty these
+    // win over both the existing filing and the targets of additive hooks.
+    let mut replace_mailbox_ids = Vec::new();
     let mut flags = HashSet::new();
     let mut skip_inbox = false;
     let mut modifications_out: Vec<ModificationOut> = Vec::new();
@@ -146,6 +183,12 @@ pub async fn try_delivery_hook(
                     skip_inbox = true;
                 }
 
+                let mailbox_ids = if response.replace_mailboxes {
+                    &mut replace_mailbox_ids
+                } else {
+                    &mut add_mailbox_ids
+                };
+
                 if preview_text.is_none() {
                     preview_text = response.preview_text;
                 }
@@ -154,6 +197,7 @@ pub async fn try_delivery_hook(
                     flags.insert(flag);
                 }
 
+                let mut resolved_file_into = false;
                 for modification in response.modifications {
                     match modification {
                         Modification::FileInto {
@@ -211,7 +255,10 @@ pub async fn try_delivery_hook(
 
                             // Don't file into invalid mailboxes
                             if target_id != u32::MAX {
-                                mailbox_ids.insert(target_id);
+                                resolved_file_into = true;
+                                if !mailbox_ids.contains(&target_id) {
+                                    mailbox_ids.push(target_id);
+                                }
                             }
                         }
                         Modification::AddHeader { name, value } => {
@@ -225,6 +272,18 @@ pub async fn try_delivery_hook(
                             });
                         }
                     }
+                }
+
+                if response.replace_mailboxes && !resolved_file_into {
+                    trc::event!(
+                        DeliveryHook(trc::DeliveryHookEvent::Error),
+                        AccountId = user_id,
+                        Details = format!(
+                            "Hook '{}' requested replace_mailboxes but no fileInto target resolved, ignoring replacement",
+                            hook.id
+                        ),
+                        Elapsed = elapsed,
+                    );
                 }
 
                 match response.action {
@@ -244,7 +303,10 @@ pub async fn try_delivery_hook(
                             Elapsed = elapsed,
                         );
                         // Discard means we stop processing further hooks and do not deliver
-                        return Ok(None);
+                        return Ok(DeliveryHookResult {
+                            discarded: true,
+                            ..Default::default()
+                        });
                     }
                     HookAction::Quarantine => {
                         trc::event!(
@@ -312,5 +374,25 @@ pub async fn try_delivery_hook(
         );
     }
 
-    Ok(Some((mailbox_ids, flags, skip_inbox, modifications_out, preview_text)))
+    // A replacing hook whose targets did not resolve is ignored rather than
+    // replacing the filing with nothing. When the filing is replaced there is
+    // no existing filing left for skip_inbox to act on, so it is dropped too.
+    let (mailbox_ids, replace_mailboxes, skip_inbox) = if !replace_mailbox_ids.is_empty() {
+        (replace_mailbox_ids, true, false)
+    } else {
+        (add_mailbox_ids, false, skip_inbox)
+    };
+
+    Ok(DeliveryHookResult {
+        mailbox_ids,
+        flags,
+        skip_inbox,
+        archive_id: cache
+            .mailbox_by_role(&SpecialUse::Archive)
+            .map(|m| m.document_id),
+        replace_mailboxes,
+        modifications: modifications_out,
+        preview_text,
+        discarded: false,
+    })
 }
