@@ -31,6 +31,17 @@ pub struct Message {
     pub size: usize,
 }
 
+/// Filing state produced by the user's Sieve script (or the default
+/// Inbox filing when no script is active) before the hook runs.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Filing {
+    /// Ids of the mailboxes the message is currently set to be filed into
+    pub mailbox_ids: Vec<String>,
+    pub flags: Vec<String>,
+    /// True when the user's Sieve script explicitly filed the message
+    pub filed_by_script: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Request {
     pub user_id: String,
@@ -39,6 +50,8 @@ pub struct Request {
     pub envelope: Option<Envelope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filing: Option<Filing>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -46,8 +59,23 @@ pub struct Response {
     pub action: Action,
     #[serde(default)]
     pub modifications: Vec<Modification>,
+    /// Remove the Inbox from the filing. A message that would then be in no
+    /// mailbox at all is filed into the account's Archive instead, or stays in
+    /// the Inbox when the account has no Archive or the message is spam that
+    /// is about to be junked. Ignored when `replace_mailboxes` takes effect,
+    /// since the replaced filing contains only the hook's own targets.
     #[serde(default)]
     pub skip_inbox: bool,
+    /// Replace the current filing with the hook's fileInto mailboxes
+    /// instead of adding to it. When several hooks are configured, the
+    /// fileInto targets of hooks that do not ask for replacement are
+    /// dropped as well. Only mailbox targets are affected: flags, header
+    /// modifications and preview text from every hook still apply, so a
+    /// `$junk` flag from another hook still files the message into Junk.
+    /// A replacing hook none of whose fileInto targets resolve is treated
+    /// as additive rather than replacing the filing with nothing.
+    #[serde(default)]
+    pub replace_mailboxes: bool,
     #[serde(default)]
     pub flags: Vec<String>,
     #[serde(default)]
@@ -106,6 +134,7 @@ impl Request {
             principal_name,
             envelope: None,
             message: None,
+            filing: None,
         }
     }
 
@@ -116,6 +145,11 @@ impl Request {
 
     pub fn with_message(mut self, message: Message) -> Self {
         self.message = Some(message);
+        self
+    }
+
+    pub fn with_filing(mut self, filing: Filing) -> Self {
+        self.filing = Some(filing);
         self
     }
 }

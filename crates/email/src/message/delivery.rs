@@ -861,60 +861,87 @@ async fn deliver_to_recipient(
         // Final delivery parameters
         let mut mailbox_ids: Vec<u32> = output_message.mailbox_ids;
         let mut keywords: Vec<Keyword> = output_message.keywords;
+        let mut did_file_into = output_message.did_file_into;
 
         // Apply delivery hooks (mailboxes/flags/skip_inbox + per-recipient modifications)
         let mut owned_new_raw: Option<Vec<u8>> = None;
         let mut use_modified = false;
         let mut parsed_for_ingest = parsed_output_message.clone();
         let mut hook_preview_text: Option<String> = None;
-        match try_delivery_hook(server, uid, &sender, &rcpt.address, &parsed_output_message).await
+        match try_delivery_hook(
+            server,
+            uid,
+            &sender,
+            &rcpt.address,
+            &parsed_output_message,
+            &mailbox_ids,
+            &keywords,
+            did_file_into,
+        )
+        .await
         {
             Ok(result) => {
-                let (hook_mailboxes, hook_flags, skip_inbox, hook_modifications, preview_text) = match result {
-                    Some(v) => v,
-                    None => {
-                        // Discard without error
-                        return Ok(IngestedEmail {
-                            document_id: 0,
-                            thread_id: 0,
-                            change_id: u64::MAX, // this is specially handled and the message is not ingested
-                            blob_id: Default::default(),
-                            imap_uids: Vec::new(),
-                            size: 0,
-                        });
-                    }
-                };
+                if result.discarded {
+                    // Discard without error
+                    return Ok(IngestedEmail {
+                        document_id: 0,
+                        thread_id: 0,
+                        change_id: u64::MAX, // this is specially handled and the message is not ingested
+                        blob_id: Default::default(),
+                        imap_uids: Vec::new(),
+                        size: 0,
+                    });
+                }
 
-                for id in hook_mailboxes {
+                // An effective hook fileInto is explicit filing, just like Sieve fileinto.
+                did_file_into |= !result.mailbox_ids.is_empty();
+
+                // Hook mailboxes are added to the Sieve/default filing, or replace it
+                // when requested
+                if result.replace_mailboxes {
+                    mailbox_ids.clear();
+                }
+
+                for id in result.mailbox_ids {
                     if !mailbox_ids.contains(&id) {
                         mailbox_ids.push(id);
                     }
                 }
 
-                for k in hook_flags
-                    .into_iter()
-                    .map(types::keyword::Keyword::from)
-                {
+                for k in result.flags.into_iter().map(Keyword::from) {
                     if !keywords.contains(&k) {
                         keywords.push(k);
                     }
                 }
 
-                if skip_inbox {
+                if result.skip_inbox {
                     mailbox_ids.retain(|&id| id != INBOX_ID);
+
+                    // A message nothing else claimed falls back to the Archive,
+                    // or stays in the Inbox if there is no Archive. A spam-scored
+                    // message also stays in the Inbox so that ingest junks it,
+                    // unless a $NotJunk keyword makes ingest treat it as ham.
+                    if mailbox_ids.is_empty() {
+                        let is_spam = rcpt.is_spam()
+                            && !did_file_into
+                            && !keywords.contains(&Keyword::NotJunk);
+                        mailbox_ids.push(
+                            result.archive_id.filter(|_| !is_spam).unwrap_or(INBOX_ID),
+                        );
+                    }
                 }
 
                 // Apply flag-based mailbox filing: certain keywords trigger automatic
                 // filing into special-use mailboxes during delivery
                 apply_flag_filing(&mut mailbox_ids, &keywords);
 
-                hook_preview_text = preview_text;
+                hook_preview_text = result.preview_text;
 
                 // Separate modifications by type
                 let mut add_headers: Vec<(String, String)> = Vec::new();
                 let mut replace_headers: Vec<(u32, String, String)> = Vec::new();
 
-                for m in hook_modifications {
+                for m in result.modifications {
                     match m {
                         HookModification::AddHeader { name, value } => {
                             add_headers.push((name, value));
@@ -995,8 +1022,8 @@ async fn deliver_to_recipient(
                 source: IngestSource::Smtp {
                     deliver_to: &rcpt.address,
                     is_sender_authenticated,
-                    // A message the user's script explicitly filed is not treated as spam
-                    is_spam: rcpt.is_spam() && !output_message.did_file_into,
+                    // Explicit filing by Sieve or a delivery hook is not treated as spam
+                    is_spam: rcpt.is_spam() && !did_file_into,
                 },
                 session_id,
                 preview_text: hook_preview_text,
