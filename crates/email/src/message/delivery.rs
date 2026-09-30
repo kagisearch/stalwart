@@ -872,6 +872,7 @@ async fn deliver_to_recipient(
             server,
             uid,
             &sender,
+            is_sender_authenticated,
             &rcpt.address,
             &parsed_output_message,
             &mailbox_ids,
