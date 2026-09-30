@@ -18,6 +18,9 @@ pub struct Address {
 pub struct Envelope {
     pub from: Address,
     pub to: Address,
+    /// True when the sender authenticated over SMTP or the message passed DMARC
+    #[serde(default)]
+    pub sender_authenticated: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

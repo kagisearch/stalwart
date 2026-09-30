@@ -74,6 +74,7 @@ pub async fn try_delivery_hook(
     server: &Server,
     user_id: u32,
     sender: &str,
+    is_sender_authenticated: bool,
     recipient: &str,
     parsed_message: &mail_parser::Message<'_>,
     current_mailbox_ids: &[u32],
@@ -119,6 +120,7 @@ pub async fn try_delivery_hook(
         to: hooks::Address {
             address: recipient.to_string(),
         },
+        sender_authenticated: is_sender_authenticated,
     };
 
     let headers = parsed_message
