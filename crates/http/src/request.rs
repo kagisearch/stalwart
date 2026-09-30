@@ -34,7 +34,7 @@ use hyper::{
     server::conn::http1,
     service::service_fn,
 };
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use jmap::{
     api::{
         ToJmapHttpResponse, event_source::EventSourceHandler, request::RequestHandler,
@@ -735,6 +735,7 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
     let is_tls = session.stream.is_tls();
 
     if let Err(http_err) = http1::Builder::new()
+        .timer(TokioTimer::new())
         .keep_alive(true)
         .serve_connection(
             TokioIo::new(session.stream),
@@ -879,6 +880,7 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
         )
         .with_upgrades()
         .await
+        && !http_err.is_timeout()
     {
         if http_err.is_parse() {
             let server = inner.build_server();
