@@ -45,6 +45,49 @@ pub struct Filing {
     pub filed_by_script: bool,
 }
 
+/// The thread the message is expected to join in the recipient's account,
+/// resolved at hook time the same way ingest does (by referenced Message-IDs,
+/// then by subject). Lets a hook find the message's thread without querying
+/// by header.
+///
+/// This is a prediction, not the final thread id. Ingest recomputes it after
+/// the hooks run, so it can differ when:
+/// - a hook adds or replaces Message-ID, In-Reply-To, References or Subject;
+/// - another message for the account is ingested in between, creating or
+///   merging threads;
+/// - the message is never ingested at all (duplicate, discard or reject).
+///
+/// The three shapes a hook can receive:
+/// - `{ "id": null }`: no existing thread matched, a new one would be
+///   created on ingest.
+/// - `{ "id": "A" }`: exactly one existing thread matched.
+/// - `{ "id": "A", "merged_ids": ["B", "A"] }`: several existing threads
+///   matched. `id` is the predicted initial thread assignment, and
+///   `merged_ids` contains every matched thread, including `id`, in no
+///   particular order.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Thread {
+    /// JMAP id of the existing thread the message is expected to be added to.
+    /// `None` when the message would start a new thread. When several threads
+    /// match, this is the one with the most hits (referenced Message-IDs, or
+    /// same-subject messages on the subject fallback), lowest id on ties. It is
+    /// the initial assignment, not necessarily the thread that survives the
+    /// merge.
+    pub id: Option<String>,
+    /// Only present when several existing threads matched. Contains every
+    /// matched thread, including `id`, in no particular order. A hook reading
+    /// the existing conversation should query all of these ids without adding
+    /// `id` again.
+    ///
+    /// If ingest still finds multiple threads, it queues a background merge.
+    /// The worker rescans the account and resolves the merge independently,
+    /// so this list does not guarantee which threads will merge or which id
+    /// will survive.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub merged_ids: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Request {
     pub user_id: String,
@@ -55,6 +98,8 @@ pub struct Request {
     pub message: Option<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filing: Option<Filing>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<Thread>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -138,6 +183,7 @@ impl Request {
             envelope: None,
             message: None,
             filing: None,
+            thread: None,
         }
     }
 
@@ -153,6 +199,11 @@ impl Request {
 
     pub fn with_filing(mut self, filing: Filing) -> Self {
         self.filing = Some(filing);
+        self
+    }
+
+    pub fn with_thread(mut self, thread: Option<Thread>) -> Self {
+        self.thread = thread;
         self
     }
 }
