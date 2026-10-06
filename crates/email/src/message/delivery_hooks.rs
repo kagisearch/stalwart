@@ -11,8 +11,10 @@
 
 use common::{Server, expr::functions::ResolveVariable};
 use futures::future::join_all;
+use mail_parser::{HeaderName, HeaderValue, parsers::fields::thread::thread_name};
 use std::{collections::HashSet, str::FromStr, time::Instant};
 use trc::AddContext;
+use utils::cheeky_hash::CheekyHash;
 
 use types::{id::Id, keyword::Keyword, special_use::SpecialUse};
 
@@ -23,6 +25,7 @@ use crate::{
         client::send_delivery_hook_request,
     },
     mailbox::{INBOX_ID, TRASH_ID, manage::MailboxFnc},
+    message::{index::extractors::VisitText, ingest::EmailIngest},
 };
 
 pub struct DeliveryResolver;
@@ -137,6 +140,16 @@ pub async fn try_delivery_hook(
         .and_then(|info| info.addresses().first().cloned())
         .unwrap_or_else(|| Id::from(user_id).as_string());
 
+    // Best effort: the thread is extra context for the hook, so a failed
+    // lookup leaves it out rather than failing the delivery.
+    let thread = match find_message_thread(server, user_id, parsed_message).await {
+        Ok(thread) => Some(thread),
+        Err(err) => {
+            trc::error!(err.caused_by(trc::location!()).account_id(user_id));
+            None
+        }
+    };
+
     let request = hooks::Request::new(Id::from(user_id).as_string(), principal_name)
         .with_envelope(envelope)
         .with_message(hooks::Message {
@@ -145,7 +158,8 @@ pub async fn try_delivery_hook(
             contents: String::from_utf8_lossy(&parsed_message.raw_message).into_owned(),
             size: parsed_message.raw_message.len(),
         })
-        .with_filing(filing);
+        .with_filing(filing)
+        .with_thread(thread);
 
     // Run all enabled hooks in parallel
     let mut hook_futures = Vec::new();
@@ -396,5 +410,66 @@ pub async fn try_delivery_hook(
         modifications: modifications_out,
         preview_text,
         discarded: false,
+    })
+}
+
+/// Resolves the thread the message is expected to join in `account_id`, using
+/// the same header extraction and ThreadingId index lookup as `email_ingest`.
+///
+/// Keep in sync with the header extraction at the start of
+/// `EmailIngest::email_ingest`. It is copied rather than shared to keep hook
+/// logic out of the upstream-shared ingest module, so an upstream change there
+/// has to be mirrored here for the hook's prediction to keep matching ingest.
+async fn find_message_thread(
+    server: &Server,
+    account_id: u32,
+    parsed_message: &mail_parser::Message<'_>,
+) -> trc::Result<hooks::Thread> {
+    let mut message_ids = Vec::new();
+    let mut own_message_ids = Vec::new();
+    let mut subject = "";
+    for header in parsed_message.root_part().headers().iter().rev() {
+        match &header.name {
+            HeaderName::MessageId => header.value.visit_text(|id| {
+                if !id.is_empty() {
+                    let hash = CheekyHash::new(id.as_bytes());
+                    own_message_ids.push(hash);
+                    message_ids.push(hash);
+                }
+            }),
+            HeaderName::InReplyTo | HeaderName::References | HeaderName::ResentMessageId => {
+                header.value.visit_text(|id| {
+                    if !id.is_empty() {
+                        message_ids.push(CheekyHash::new(id.as_bytes()));
+                    }
+                });
+            }
+            HeaderName::Subject if subject.is_empty() => {
+                subject = thread_name(match &header.value {
+                    HeaderValue::Text(text) => text.as_ref(),
+                    HeaderValue::TextList(list) if !list.is_empty() => {
+                        list.first().unwrap().as_ref()
+                    }
+                    _ => "",
+                });
+            }
+            _ => (),
+        }
+    }
+
+    message_ids.sort_unstable();
+    message_ids.dedup();
+
+    let result = server
+        .find_thread_id(account_id, subject, &message_ids, &own_message_ids)
+        .await?;
+
+    Ok(hooks::Thread {
+        id: result.thread_id.map(|id| Id::from(id).as_string()),
+        merged_ids: result
+            .merge_ids
+            .into_iter()
+            .map(|id| Id::from(id).as_string())
+            .collect(),
     })
 }
