@@ -24,6 +24,8 @@ const CHURN_DELETION_WINDOW: usize = 4096;
 const CHURN_DELETION_TRIGGER: usize = 1024;
 const CHURN_DELETION_RATIO: f64 = 0.5;
 const BYTES_PER_SYNC: u64 = 1024 * 1024;
+const MAX_LOG_FILE_SIZE: usize = 10 * 1024 * 1024;
+const KEEP_LOG_FILE_NUM: usize = 5;
 
 #[derive(Clone, Copy)]
 enum CfProfile {
@@ -70,9 +72,8 @@ impl RocksDbStore {
         let mut cf_opts = cf_options(CfProfile::Blob, &cache, write_buffer_size);
         cf_opts.set_enable_blob_files(true);
         cf_opts.set_min_blob_size(config.blob_size);
-        cf_opts.set_enable_blob_gc(true);
+        cf_opts.set_enable_blob_gc(false);
         cf_opts.set_blob_gc_age_cutoff(1.0);
-        cf_opts.set_blob_gc_force_threshold(0.5);
         cfs.push(ColumnFamilyDescriptor::new(CF_BLOBS, cf_opts));
 
         // Other cfs
@@ -115,6 +116,8 @@ impl RocksDbStore {
             .set_db_write_buffer_size((config.buffer_size as usize).max(MIN_DB_WRITE_BUFFER_SIZE));
         db_opts.set_bytes_per_sync(BYTES_PER_SYNC);
         db_opts.set_wal_bytes_per_sync(BYTES_PER_SYNC);
+        db_opts.set_max_log_file_size(MAX_LOG_FILE_SIZE);
+        db_opts.set_keep_log_file_num(KEEP_LOG_FILE_NUM);
 
         Ok(Store::RocksDb(Arc::new(RocksDbStore {
             db: OptimisticTransactionDB::open_cf_descriptors(&db_opts, idx_path, cfs)

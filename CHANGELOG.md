@@ -2,6 +2,52 @@
 
 All notable changes to this project will be documented in this file. This project adheres to [Semantic Versioning](http://semver.org/).
 
+## [0.16.26] - 2026-10-11
+
+If you are upgrading from v0.16.x, replace the binary (or run `docker pull`). If you are upgrading from v0.15.x and below, please read the [upgrading documentation](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING/v0_16.md) for more information on how to upgrade from previous versions.
+
+## Added
+- `sd_notify` support.
+- JMAP: `Mailbox/set` allows moving a mailbox under a parent that already has a child with the same name, and rejects renames that only change the case of a mailbox name with `alreadyExists`.
+
+## Changed
+
+## Fixed
+- DNSSEC: Use `hickory-resolver` patched fork at https://github.com/stalwartlabs/hickory-dns.
+- RocksDB: Blob garbage collection rewrites every stored blob on each compaction of the blobs column family, about once per 128MB of new mail.
+- Milter: End-of-headers is not sent to milters that negotiate `SMFIP_NOHDRS` without `SMFIP_NOEOH`, so the transaction stalls until it times out.
+- OIDC: When the access token lacks the `claimUsername` claim but has an `email` claim, the account is built from `email` without consulting the userinfo endpoint.
+- JMAP: 
+  - `onSuccessUpdateEmail` and `onSuccessDestroyEmail` entries in `EmailSubmission/set` that name an existing submission by id update or destroy the Email with the same id instead of the submission's own Email.
+  - A `VacationResponse/set` that only sets `isEnabled` on an account without a vacation response activates an empty Sieve script.
+
+## [0.16.25] - 2026-10-05
+
+If you are upgrading from v0.16.x, replace the binary (or run `docker pull`). If you are upgrading from v0.15.x and below, please read the [upgrading documentation](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING/v0_16.md) for more information on how to upgrade from previous versions.
+
+## Added
+
+## Changed
+
+## Fixed
+- JMAP: Creating a `MaskedEmail` with `emailDomain` fails with `forbidden` for every domain when the account has addresses on more than one domain.
+- Autodiscover: Requests for a response schema other than Outlook's, such as ActiveSync (`mobilesync`), are answered with the Outlook settings instead of error 601.
+- IMAP:
+  - `LOGIN` and `AUTHENTICATE` with a wrong, expired or unknown app password or API key are answered with an untagged `NO`, so clients keep waiting for the command to complete until the connection times out.
+  - The failed login that exceeds the maximum number of authentication failures is answered with an untagged `NO` before the connection is closed.
+- DKIM:
+  - A rotation moves the active key to retiring even when its successor fails to publish or propagate, so outgoing mail is sent unsigned until a retry publishes the new key. The DNS write failure is also not logged and the task reports success.
+  - Keys created while DNS management was manual, or before DKIM was added to the published records, are never rotated after DNS management becomes automatic. Domains already affected start rotating once a `DkimManagement` task is created for them.
+  - After switching DNS management from automatic to manual, a due rotation activates a new key that was never published in DNS, so signatures fail verification, and retiring the old key is retried forever.
+- Spam filter:
+  - Messages with no text line long enough for a Pyzor digest are checked with the digest of empty input and tagged `PYZOR`.
+  - DNSBL answers with several return codes, such as a Spamhaus ZEN listing in both SBL and PBL, are scored for only the first code returned.
+  - DNSBL lookups that return "not listed" are cached for 24 hours regardless of the zone's negative TTL.
+  - Removing a duplicate training sample of a message reclassified on the same day clears the blob link of the sample that is kept.
+- MTA: Queue quotas with an empty `match` expression are never enforced, including the global queue quota created on first start.
+- RocksDB: The info log (`LOG`, `LOG.old.*`) grows without limit because log rotation and retention are left at RocksDB defaults.
+- WebUI: A blob store read error at startup, such as an S3 authentication failure, stops the web interface from being downloaded.
+
 ## [0.16.24] - 2026-09-27
 
 If you are upgrading from v0.16.x, replace the binary (or run `docker pull`). If you are upgrading from v0.15.x and below, please read the [upgrading documentation](https://github.com/stalwartlabs/stalwart/blob/main/UPGRADING/v0_16.md) for more information on how to upgrade from previous versions.

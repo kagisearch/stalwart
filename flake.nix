@@ -30,11 +30,13 @@
             ];
           };
 
-          # Feature set Kagi Mail deploys (kagi-email/flake.nix,
-          # overlays.default -> stalwart.cargoBuildFeatures).
+          # Feature set the kagi-email local dev build uses (kagi-email/flake.nix,
+          # overlays.default -> stalwart.cargoBuildFeatures). The image Cloud
+          # Build deploys to dev and prod is built from Dockerfile, which adds
+          # nats and redis on top of this.
           kagiFeatures = "postgres s3";
 
-          # Feature set CI builds for the release binaries (ci.yml).
+          # Feature set upstream CI builds for the release binaries (ci.yml).
           ciFeatures = "sqlite postgres mysql rocks s3 redis azure nats enterprise";
         in
         {
@@ -44,6 +46,13 @@
           };
 
           devShells.default = pkgs.mkShell {
+            # The clang wrapper injects -D_FORTIFY_SOURCE, which glibc turns
+            # into a #warning at -O0. tikv-jemalloc-sys runs its configure
+            # checks with -Werror, so any debug-profile build (cargo check,
+            # cargo test) fails with "cannot determine return type of
+            # strerror_r" unless fortify is left out of the wrapper flags.
+            hardeningDisable = [ "fortify" ];
+
             nativeBuildInputs = with pkgs; [
               rustToolchain
 

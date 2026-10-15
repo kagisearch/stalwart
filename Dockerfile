@@ -1,9 +1,15 @@
-# FORK CHANGES:
-# trixie provides v19 of libclang-dev, not v16, https://packages.debian.org/trixie/libclang-dev
-# elastic is no longer a feature, and wasn't updated here https://github.com/stalwartlabs/stalwart/commit/472bddf733377018e9c8d0828358f91dc0602ffa#diff-b803fcb7f17ed9235f1e5cb1fcd2f5d3b2838429d4368ae4c57ce4436577f03fL314
-# the sqlite feature pulls libsqlite3-sys 0.38.1, whose build script uses the
-# cfg_select! macro (stable as of Rust 1.95), so the cargo-chef base is pinned to
-# 1.96 rather than 1.92.
+# FORK CHANGES (this is the image Cloud Build deploys to dev and prod):
+# - The cargo-chef base is pinned to Rust 1.96.0 instead of upstream's floating
+#   `latest-rust-slim-trixie`. The sqlite feature pulls libsqlite3-sys 0.38.1,
+#   whose build script uses the cfg_select! macro (stable as of Rust 1.95).
+# - The amd64 RUSTFLAGS add `-C target-cpu=x86-64-v2`. Upstream sets this in
+#   .cargo/config.toml, but the explicit RUSTFLAGS below replace config-file
+#   rustflags entirely, so it has to be repeated here to match upstream's
+#   release builds.
+# - The feature set is trimmed from upstream's full CI set to the backends our
+#   deployments use. Nothing we run needs sqlite, mysql, rocks, azure or
+#   enterprise; the enterprise feature only compiles in license-gated code
+#   plus the SCIM endpoint, which nothing provisions through.
 
 # Stalwart Dockerfile
 # Credits: https://github.com/33KK
@@ -19,7 +25,7 @@ FROM --platform=$BUILDPLATFORM chef AS builder
 ARG TARGETPLATFORM
 RUN case "${TARGETPLATFORM}" in \
     "linux/arm64") echo "aarch64-unknown-linux-gnu" > /target.txt && echo "-C linker=aarch64-linux-gnu-gcc" > /flags.txt ;; \
-    "linux/amd64") echo "x86_64-unknown-linux-gnu" > /target.txt && echo "-C linker=x86_64-linux-gnu-gcc" > /flags.txt ;; \
+    "linux/amd64") echo "x86_64-unknown-linux-gnu" > /target.txt && echo "-C linker=x86_64-linux-gnu-gcc -C target-cpu=x86-64-v2" > /flags.txt ;; \
     *) exit 1 ;; \
     esac
 RUN export DEBIAN_FRONTEND=noninteractive && \
@@ -29,9 +35,9 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
     g++-x86-64-linux-gnu binutils-x86-64-linux-gnu
 RUN rustup target add "$(cat /target.txt)"
 COPY --from=planner /recipe.json /recipe.json
-RUN RUSTFLAGS="$(cat /flags.txt)" cargo chef cook --target "$(cat /target.txt)" --release --no-default-features --features "sqlite postgres mysql rocks s3 redis azure nats enterprise" --recipe-path /recipe.json
+RUN RUSTFLAGS="$(cat /flags.txt)" cargo chef cook --target "$(cat /target.txt)" --release --no-default-features --features "postgres s3 redis nats" --recipe-path /recipe.json
 COPY . .
-RUN RUSTFLAGS="$(cat /flags.txt)" cargo build --target "$(cat /target.txt)" --release -p stalwart --no-default-features --features "sqlite postgres mysql rocks s3 redis azure nats enterprise"
+RUN RUSTFLAGS="$(cat /flags.txt)" cargo build --target "$(cat /target.txt)" --release -p stalwart --no-default-features --features "postgres s3 redis nats"
 RUN mv "/build/target/$(cat /target.txt)/release" "/output"
 
 FROM docker.io/debian:trixie-slim
