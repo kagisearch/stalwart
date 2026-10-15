@@ -7,6 +7,7 @@
 use super::download::BlobDownload;
 use common::{Server, auth::AccessToken};
 use email::message::metadata::MessageData;
+use futures_util::{StreamExt, stream};
 use jmap_proto::{
     method::{
         get::{GetRequest, GetResponse},
@@ -27,6 +28,9 @@ use store::{
 use trc::AddContext;
 use types::{blob::BlobClass, collection::Collection, id::Id, type_state::DataType};
 use utils::map::vec_map::VecMap;
+
+/// How many blobs one `Blob/get` reads at a time.
+const BLOB_GET_CONCURRENCY: usize = 16;
 
 pub trait BlobOperations: Sync + Send {
     fn blob_get(
@@ -68,8 +72,18 @@ impl BlobOperations for Server {
             .map(|length| range_from.saturating_add(length))
             .unwrap_or(usize::MAX);
 
-        for blob_id in ids {
-            if let Some(bytes) = self.blob_download(&blob_id, access_token).await? {
+        // Read several blobs at once, in request order. With a remote blob
+        // store every read is a round trip, which one-after-another reads
+        // would add up across the whole request.
+        let mut downloads = stream::iter(ids)
+            .map(|blob_id| async move {
+                let bytes = self.blob_download(&blob_id, access_token).await;
+                (blob_id, bytes)
+            })
+            .buffered(BLOB_GET_CONCURRENCY);
+
+        while let Some((blob_id, bytes)) = downloads.next().await {
+            if let Some(bytes) = bytes? {
                 let mut blob = Map::with_capacity(properties.len());
                 let bytes_range = if range_from == 0 && range_to == usize::MAX {
                     &bytes[..]

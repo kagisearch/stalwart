@@ -234,6 +234,61 @@ pub async fn test(test: &TestServer) {
     }
     test.blob_expire_all().await;
 
+    // Blob/get reads many blobs at once and still answers in request order,
+    // with an expired blob in the middle reported as not found
+    let create = (0..40)
+        .map(|n| {
+            (
+                format!("b{n}"),
+                json!({ "data": [{ "data:asText": format!("blob number {n}") }] }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let response = account
+        .jmap_method_call(
+            "Blob/upload",
+            json!({ "accountId": account.id_string(), "create": create }),
+        )
+        .await;
+    let mut ids = (0..40)
+        .map(|n| {
+            response
+                .pointer(&format!("/methodResponses/0/1/created/b{n}/id"))
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    ids.insert(20, blob_id.clone());
+    let response = account
+        .jmap_method_call(
+            "Blob/get",
+            json!({
+                "accountId": account.id_string(),
+                "ids": ids,
+                "properties": ["data:asText"]
+            }),
+        )
+        .await;
+    let list = response
+        .pointer("/methodResponses/0/1/list")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("Response: {response:?}"));
+    assert_eq!(list.len(), 40, "Response: {response:?}");
+    for (n, blob) in list.iter().enumerate() {
+        assert_eq!(
+            blob.get("data:asText").and_then(|v| v.as_str()),
+            Some(format!("blob number {n}").as_str()),
+            "Response: {response:?}",
+        );
+    }
+    assert_eq!(
+        response.pointer("/methodResponses/0/1/notFound"),
+        Some(&json!([blob_id])),
+        "Response: {response:?}",
+    );
+    test.blob_expire_all().await;
+
     // Blob/get Example with Range and Encoding Errors
     let response = account.jmap_method_calls(json!([
             [
