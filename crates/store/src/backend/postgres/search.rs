@@ -248,6 +248,18 @@ impl PostgresStore {
                             query.push(')');
                         }
                         values.push(value as &(dyn ToSql + Sync));
+                    } else if let SearchValue::KeyValues(kv) = value
+                        && kv.len() == 1
+                        && matches!(op, SearchOperator::Equal)
+                        && !kv.iter().next().unwrap().1.is_empty()
+                    {
+                        // Containment is what the column's GIN index serves, where
+                        // `->> key = value` reads every row of the account. Key/value
+                        // fields are stored as flat objects of strings, so both match
+                        // the same rows. The value binds as the one-entry object.
+                        query.push_str(field.column());
+                        let _ = write!(query, " @> ${value_pos}");
+                        values.push(value as &(dyn ToSql + Sync));
                     } else if let SearchValue::KeyValues(kv) = value {
                         query.push_str(field.column());
                         query.push(' ');
