@@ -389,6 +389,20 @@ async fn test_filter(store: SearchStore, fields: &AHashMap<u32, String>, mask: &
         (
             vec![
                 SearchFilter::eq(SearchField::AccountId, 0u32),
+                SearchFilter::cond(
+                    EmailSearchField::Headers,
+                    SearchOperator::Equal,
+                    SearchValue::KeyValues(VecMap::from_iter([(
+                        "artist".to_string(),
+                        "belcher, george".to_string(),
+                    )])),
+                ),
+            ],
+            vec!["n04327", "n04328"],
+        ),
+        (
+            vec![
+                SearchFilter::eq(SearchField::AccountId, 0u32),
                 SearchFilter::has_keyword(EmailSearchField::From, "gelatin"),
                 SearchFilter::gt(EmailSearchField::ReceivedAt, 2000u32),
                 SearchFilter::lt(EmailSearchField::Size, 180u32),
