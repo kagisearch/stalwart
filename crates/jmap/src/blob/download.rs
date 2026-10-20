@@ -12,7 +12,7 @@ use groupware::cache::GroupwareCache;
 use registry::schema::enums::Permission;
 use std::future::Future;
 use store::ValueKey;
-use store::write::{AlignedBytes, Archive};
+use store::write::{AlignedBytes, Archive, ValueClass};
 use trc::AddContext;
 use types::acl::Acl;
 use types::blob::{BlobClass, BlobId};
@@ -30,6 +30,15 @@ pub trait BlobDownload: Sync + Send {
     fn has_access_blob(
         &self,
         blob_id: &BlobId,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<bool>> + Send;
+
+    /// `has_access_blob` given whether the blob's link exists, as
+    /// `Store::blob_has_access` or `blobs_have_access` found.
+    fn has_access_linked_blob(
+        &self,
+        blob_id: &BlobId,
+        is_linked: bool,
         access_token: &AccessToken,
     ) -> impl Future<Output = trc::Result<bool>> + Send;
 }
@@ -52,40 +61,16 @@ impl BlobDownload for Server {
                     .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
                     .await
                     .caused_by(trc::location!());
-                match (&blob_id.class, blob) {
-                    (
-                        BlobClass::Linked {
-                            account_id,
-                            collection,
-                            document_id,
-                        },
-                        Ok(Some(data)),
-                    ) if *collection == Collection::Email as u8 => {
-                        let Some(archive) = self
+                match (email_metadata_key(blob_id), blob) {
+                    (Some(key), Ok(Some(data))) => {
+                        match self
                             .store()
-                            .get_value::<Archive<AlignedBytes>>(ValueKey::property(
-                                *account_id,
-                                Collection::Email,
-                                *document_id,
-                                EmailField::Metadata,
-                            ))
+                            .get_value::<Archive<AlignedBytes>>(key)
                             .await
                             .caused_by(trc::location!())?
-                        else {
-                            return Ok(Some(data));
-                        };
-                        let metadata = archive
-                            .to_unarchived::<MessageMetadata>()
-                            .caused_by(trc::location!())?;
-                        let body_offset = metadata.inner.blob_body_offset.to_native();
-                        if metadata.inner.root_part().offset_body.to_native() != body_offset {
-                            let raw_message = ChainedBytes::new(
-                                metadata.inner.raw_headers.as_ref(),
-                            )
-                            .with_last(data.get(body_offset as usize..).unwrap_or_default());
-                            Ok(Some(raw_message.to_bytes()))
-                        } else {
-                            Ok(Some(data))
+                        {
+                            Some(archive) => with_stored_headers(data, &archive).map(Some),
+                            None => Ok(Some(data)),
                         }
                     }
                     (_, blob) => blob,
@@ -101,13 +86,27 @@ impl BlobDownload for Server {
         blob_id: &BlobId,
         access_token: &AccessToken,
     ) -> trc::Result<bool> {
+        if blob_id.class.is_superuser() && access_token.has_permission(Permission::FetchAnyBlob) {
+            return Ok(true);
+        }
+        let is_linked = self
+            .store()
+            .blob_has_access(&blob_id.hash, &blob_id.class)
+            .await
+            .caused_by(trc::location!())?;
+        self.has_access_linked_blob(blob_id, is_linked, access_token)
+            .await
+    }
+
+    async fn has_access_linked_blob(
+        &self,
+        blob_id: &BlobId,
+        is_linked: bool,
+        access_token: &AccessToken,
+    ) -> trc::Result<bool> {
         Ok(
             (blob_id.class.is_superuser() && access_token.has_permission(Permission::FetchAnyBlob))
-                || (self
-                    .store()
-                    .blob_has_access(&blob_id.hash, &blob_id.class)
-                    .await
-                    .caused_by(trc::location!())?
+                || (is_linked
                     && match &blob_id.class {
                         BlobClass::Linked {
                             account_id,
@@ -145,5 +144,41 @@ impl BlobDownload for Server {
                         }
                     }),
         )
+    }
+}
+
+/// The key of the message metadata a whole-blob download of this blob reads,
+/// when the blob is a message.
+pub fn email_metadata_key(blob_id: &BlobId) -> Option<ValueKey<ValueClass>> {
+    match &blob_id.class {
+        BlobClass::Linked {
+            account_id,
+            collection,
+            document_id,
+        } if *collection == Collection::Email as u8 && blob_id.section.is_none() => {
+            Some(ValueKey::property(
+                *account_id,
+                Collection::Email,
+                *document_id,
+                EmailField::Metadata,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Puts back the headers a message was stored with, when they differ from
+/// the ones in its blob.
+pub fn with_stored_headers(data: Vec<u8>, archive: &Archive<AlignedBytes>) -> trc::Result<Vec<u8>> {
+    let metadata = archive
+        .to_unarchived::<MessageMetadata>()
+        .caused_by(trc::location!())?;
+    let body_offset = metadata.inner.blob_body_offset.to_native();
+    if metadata.inner.root_part().offset_body.to_native() != body_offset {
+        Ok(ChainedBytes::new(metadata.inner.raw_headers.as_ref())
+            .with_last(data.get(body_offset as usize..).unwrap_or_default())
+            .to_bytes())
+    } else {
+        Ok(data)
     }
 }

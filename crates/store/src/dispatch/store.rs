@@ -46,6 +46,53 @@ impl Store {
         .caused_by(trc::location!())
     }
 
+    /// Reads the values of several keys, in the order of `keys`. PostgreSQL
+    /// reads keys that share a subspace with one query, the other stores read
+    /// one key at a time.
+    pub async fn get_values<K, U>(&self, keys: Vec<K>) -> trc::Result<Vec<Option<U>>>
+    where
+        K: Key,
+        U: Deserialize + 'static,
+    {
+        #[cfg(feature = "postgres")]
+        if let Self::PostgreSQL(store) = self
+            && let Some(subspace) = keys.first().map(|key| key.subspace())
+            && keys.iter().all(|key| key.subspace() == subspace)
+        {
+            return store
+                .get_values(subspace, keys.iter().map(|key| key.serialize(0)).collect())
+                .await
+                .caused_by(trc::location!());
+        }
+
+        let mut values = Vec::with_capacity(keys.len());
+        for key in keys {
+            values.push(self.get_value(key).await?);
+        }
+        Ok(values)
+    }
+
+    /// Checks whether several keys exist, in the order of `keys`, the same
+    /// way `get_values` reads them.
+    pub async fn keys_exist<K: Key>(&self, keys: Vec<K>) -> trc::Result<Vec<bool>> {
+        #[cfg(feature = "postgres")]
+        if let Self::PostgreSQL(store) = self
+            && let Some(subspace) = keys.first().map(|key| key.subspace())
+            && keys.iter().all(|key| key.subspace() == subspace)
+        {
+            return store
+                .keys_exist(subspace, keys.iter().map(|key| key.serialize(0)).collect())
+                .await
+                .caused_by(trc::location!());
+        }
+
+        let mut exist = Vec::with_capacity(keys.len());
+        for key in keys {
+            exist.push(self.key_exists(key).await?);
+        }
+        Ok(exist)
+    }
+
     pub async fn key_exists(&self, key: impl Key) -> trc::Result<bool> {
         match self {
             #[cfg(feature = "sqlite")]

@@ -46,36 +46,29 @@ impl Store {
         hash: impl AsRef<BlobHash> + Sync + Send,
         class: impl AsRef<BlobClass> + Sync + Send,
     ) -> trc::Result<bool> {
-        let key = match class.as_ref() {
-            BlobClass::Reserved {
-                account_id,
-                expires,
-            } if *expires > now() => ValueKey {
-                account_id: *account_id,
-                collection: 0,
-                document_id: 0,
-                class: ValueClass::Blob(BlobOp::Link {
-                    hash: hash.as_ref().clone(),
-                    to: BlobLink::Temporary { until: *expires },
-                }),
-            },
-            BlobClass::Linked {
-                account_id,
-                collection,
-                document_id,
-            } => ValueKey {
-                account_id: *account_id,
-                collection: *collection,
-                document_id: *document_id,
-                class: ValueClass::Blob(BlobOp::Link {
-                    hash: hash.as_ref().clone(),
-                    to: BlobLink::Document,
-                }),
-            },
-            _ => return Ok(false),
-        };
+        match blob_link_key(hash.as_ref(), class.as_ref()) {
+            Some(key) => self.key_exists(key).await,
+            None => Ok(false),
+        }
+    }
 
-        self.key_exists(key).await
+    /// `blob_has_access` for several blobs, checked with one `keys_exist`.
+    pub async fn blobs_have_access<'x>(
+        &self,
+        blobs: impl IntoIterator<Item = (&'x BlobHash, &'x BlobClass)>,
+    ) -> trc::Result<Vec<bool>> {
+        let keys = blobs
+            .into_iter()
+            .map(|(hash, class)| blob_link_key(hash, class))
+            .collect::<Vec<_>>();
+        let mut exist = self
+            .keys_exist(keys.iter().flatten().cloned().collect())
+            .await?
+            .into_iter();
+        Ok(keys
+            .iter()
+            .map(|key| key.is_some() && exist.next().unwrap_or_default())
+            .collect())
     }
 
     pub async fn purge_blobs_all_shards(&self, blob_store: BlobStore) -> trc::Result<()> {
@@ -202,6 +195,39 @@ impl Store {
         );
 
         Ok(())
+    }
+}
+
+/// The link that grants access to a blob of this class, or `None` when no
+/// link can (an expired reservation, for one).
+fn blob_link_key(hash: &BlobHash, class: &BlobClass) -> Option<ValueKey<ValueClass>> {
+    match class {
+        BlobClass::Reserved {
+            account_id,
+            expires,
+        } if *expires > now() => Some(ValueKey {
+            account_id: *account_id,
+            collection: 0,
+            document_id: 0,
+            class: ValueClass::Blob(BlobOp::Link {
+                hash: hash.clone(),
+                to: BlobLink::Temporary { until: *expires },
+            }),
+        }),
+        BlobClass::Linked {
+            account_id,
+            collection,
+            document_id,
+        } => Some(ValueKey {
+            account_id: *account_id,
+            collection: *collection,
+            document_id: *document_id,
+            class: ValueClass::Blob(BlobOp::Link {
+                hash: hash.clone(),
+                to: BlobLink::Document,
+            }),
+        }),
+        _ => None,
     }
 }
 
