@@ -150,22 +150,33 @@ impl EmailGet for Server {
             }
         }
 
+        // Read every message's metadata in one store call, which on PostgreSQL
+        // is one query rather than a round trip per message.
+        let mut metadatas = self
+            .store()
+            .get_values::<_, Archive<AlignedBytes>>(
+                ids.iter()
+                    .filter(|id| message_ids.contains(id.document_id()))
+                    .map(|id| {
+                        ValueKey::property(
+                            account_id,
+                            Collection::Email,
+                            id.document_id(),
+                            EmailField::Metadata,
+                        )
+                    })
+                    .collect(),
+            )
+            .await?
+            .into_iter();
+
         for id in ids {
             // Obtain the email object
             if !message_ids.contains(id.document_id()) {
                 response.push_not_found(id);
                 continue;
             }
-            let metadata_ = match self
-                .store()
-                .get_value::<Archive<AlignedBytes>>(ValueKey::property(
-                    account_id,
-                    Collection::Email,
-                    id.document_id(),
-                    EmailField::Metadata,
-                ))
-                .await?
-            {
+            let metadata_ = match metadatas.next().flatten() {
                 Some(metadata) => metadata,
                 None => {
                     response.push_not_found(id);

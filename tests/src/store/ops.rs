@@ -774,6 +774,29 @@ pub async fn test(test: &TestServer) {
             );
         }
 
+        // Read several at once: in key order, with the deleted one missing
+        assert_eq!(
+            vec![
+                Some("check2".to_string()),
+                None,
+                Some("check1".to_string()),
+                Some("check2".to_string()),
+            ],
+            db.get_values::<_, String>(
+                [2, 1, 0, 2]
+                    .into_iter()
+                    .map(|property| ValueKey {
+                        account_id: 0,
+                        collection: 0,
+                        document_id: 0,
+                        class: ValueClass::Property(property),
+                    })
+                    .collect()
+            )
+            .await
+            .unwrap()
+        );
+
         // Delete everything
         let mut batch = BatchBuilder::new();
         batch
