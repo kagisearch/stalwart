@@ -175,8 +175,81 @@ impl PostgresStore {
         //create_search_tables::<FileSearchField>(&conn).await?;
         create_search_tables::<TracingSearchField>(&conn).await?;
 
+        // On a large table the build takes minutes, so it runs in the
+        // background rather than holding up startup.
+        let pool = self.conn_pool.clone();
+        tokio::spawn(async move {
+            if let Err(err) = create_email_sort_index(pool).await {
+                trc::error!(err.details("Failed to create the email sort index"));
+            }
+        });
+
         Ok(())
     }
+}
+
+/// Email/query sorted by date and Thread/get read all of an account's
+/// messages in received order. With this index Postgres returns them from
+/// the index alone, rather than reading every row of the account and sorting
+/// them.
+const EMAIL_SORT_INDEX: &str = "idx_s_email_accid_rcvd_sent";
+
+async fn create_email_sort_index(pool: Pool) -> trc::Result<()> {
+    // Taken out of the pool: the build can run for minutes, and closing the
+    // connection afterwards releases the lock below.
+    let conn = Object::take(pool.get().await.map_err(into_pool_error)?);
+    let is_valid = async || {
+        conn.query_opt(
+            "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
+            &[&EMAIL_SORT_INDEX],
+        )
+        .await
+        .map(|row| row.map(|row| row.get::<_, bool>(0)))
+        .map_err(into_error)
+    };
+    if is_valid().await? == Some(true) {
+        return Ok(());
+    }
+
+    // One server builds it at a time, the others leave it to that one.
+    let is_locked: bool = conn
+        .query_one(
+            "SELECT pg_try_advisory_lock(hashtext($1))",
+            &[&EMAIL_SORT_INDEX],
+        )
+        .await
+        .map_err(into_error)?
+        .get(0);
+    if !is_locked {
+        return Ok(());
+    }
+
+    match is_valid().await? {
+        Some(true) => return Ok(()),
+        Some(false) => {
+            // A build that was cut short leaves an invalid index, which
+            // CREATE INDEX IF NOT EXISTS would keep.
+            conn.batch_execute(&format!(
+                "DROP INDEX CONCURRENTLY IF EXISTS {EMAIL_SORT_INDEX}"
+            ))
+            .await
+            .map_err(into_error)?;
+        }
+        None => (),
+    }
+
+    // CONCURRENTLY keeps writes to the table going during the build. It
+    // refuses to run in a transaction, so it is sent on its own rather than
+    // in one multi-statement batch.
+    conn.batch_execute("SET statement_timeout = 0")
+        .await
+        .map_err(into_error)?;
+    conn.batch_execute(&format!(
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS {EMAIL_SORT_INDEX} \
+         ON s_email (accid, rcvd, sent, docid)"
+    ))
+    .await
+    .map_err(into_error)
 }
 
 async fn create_search_tables<T: SearchableField + PsqlSearchField + 'static>(
