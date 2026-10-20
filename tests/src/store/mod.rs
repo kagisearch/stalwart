@@ -10,6 +10,8 @@ pub mod lookup;
 pub mod ops;
 pub mod query;
 pub mod registry;
+#[cfg(feature = "postgres")]
+pub mod sort_index;
 #[cfg(any(feature = "postgres", feature = "mysql"))]
 pub mod sql_timeout;
 
@@ -27,6 +29,10 @@ pub async fn store_tests() {
     registry::test(&test).await;
     import_export::test(&test).await;
     ops::test(&test).await;
+    #[cfg(feature = "postgres")]
+    if matches!(test.server.store(), store::Store::PostgreSQL(_)) {
+        sort_index::test(&test).await;
+    }
     #[cfg(any(feature = "postgres", feature = "mysql"))]
     sql_timeout::test(&test).await;
 
