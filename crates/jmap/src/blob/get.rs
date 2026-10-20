@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::download::BlobDownload;
+use super::download::{BlobDownload, email_metadata_key, with_stored_headers};
 use common::{Server, auth::AccessToken};
 use email::message::metadata::MessageData;
 use futures_util::{StreamExt, stream};
@@ -72,12 +72,63 @@ impl BlobOperations for Server {
             .map(|length| range_from.saturating_add(length))
             .unwrap_or(usize::MAX);
 
+        // Check every blob's link, and read the metadata of the messages among
+        // them, with one store call each rather than two round trips per blob.
+        let is_linked = self
+            .store()
+            .blobs_have_access(ids.iter().map(|blob_id| (&blob_id.hash, &blob_id.class)))
+            .await
+            .caused_by(trc::location!())?;
+        let mut has_access = Vec::with_capacity(ids.len());
+        for (blob_id, is_linked) in ids.iter().zip(is_linked) {
+            has_access.push(
+                self.has_access_linked_blob(blob_id, is_linked, access_token)
+                    .await?,
+            );
+        }
+        let metadata_keys = ids
+            .iter()
+            .zip(&has_access)
+            .map(|(blob_id, has_access)| email_metadata_key(blob_id).filter(|_| *has_access))
+            .collect::<Vec<_>>();
+        let mut metadatas = self
+            .store()
+            .get_values::<_, Archive<AlignedBytes>>(
+                metadata_keys.iter().flatten().cloned().collect(),
+            )
+            .await
+            .caused_by(trc::location!())?
+            .into_iter();
+        let metadatas = metadata_keys
+            .iter()
+            .map(|key| key.as_ref().and_then(|_| metadatas.next().flatten()))
+            .collect::<Vec<_>>();
+
         // Read several blobs at once, in request order. With a remote blob
         // store every read is a round trip, which one-after-another reads
         // would add up across the whole request.
-        let mut downloads = stream::iter(ids)
-            .map(|blob_id| async move {
-                let bytes = self.blob_download(&blob_id, access_token).await;
+        let mut downloads = stream::iter(ids.into_iter().zip(has_access).zip(metadatas))
+            .map(|((blob_id, has_access), metadata)| async move {
+                let bytes = if !has_access {
+                    Ok(None)
+                } else if let Some(section) = &blob_id.section {
+                    self.get_blob_section(&blob_id.hash, section)
+                        .await
+                        .caused_by(trc::location!())
+                } else {
+                    match self
+                        .blob_store()
+                        .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
+                        .await
+                        .caused_by(trc::location!())
+                    {
+                        Ok(Some(data)) => match &metadata {
+                            Some(archive) => with_stored_headers(data, archive).map(Some),
+                            None => Ok(Some(data)),
+                        },
+                        blob => blob,
+                    }
+                };
                 (blob_id, bytes)
             })
             .buffered(BLOB_GET_CONCURRENCY);

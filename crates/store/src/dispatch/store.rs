@@ -72,6 +72,27 @@ impl Store {
         Ok(values)
     }
 
+    /// Checks whether several keys exist, in the order of `keys`, the same
+    /// way `get_values` reads them.
+    pub async fn keys_exist<K: Key>(&self, keys: Vec<K>) -> trc::Result<Vec<bool>> {
+        #[cfg(feature = "postgres")]
+        if let Self::PostgreSQL(store) = self
+            && let Some(subspace) = keys.first().map(|key| key.subspace())
+            && keys.iter().all(|key| key.subspace() == subspace)
+        {
+            return store
+                .keys_exist(subspace, keys.iter().map(|key| key.serialize(0)).collect())
+                .await
+                .caused_by(trc::location!());
+        }
+
+        let mut exist = Vec::with_capacity(keys.len());
+        for key in keys {
+            exist.push(self.key_exists(key).await?);
+        }
+        Ok(exist)
+    }
+
     pub async fn key_exists(&self, key: impl Key) -> trc::Result<bool> {
         match self {
             #[cfg(feature = "sqlite")]

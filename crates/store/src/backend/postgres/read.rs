@@ -9,7 +9,7 @@ use crate::{
     Deserialize, IterateParams, Key, ValueKey, backend::postgres::into_pool_error,
     write::ValueClass,
 };
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use futures::{TryStreamExt, pin_mut};
 
 impl PostgresStore {
@@ -64,6 +64,27 @@ impl PostgresStore {
                     .transpose()
             })
             .collect()
+    }
+
+    pub(crate) async fn keys_exist(
+        &self,
+        subspace: u8,
+        keys: Vec<Vec<u8>>,
+    ) -> trc::Result<Vec<bool>> {
+        let conn = self.conn_pool.get().await.map_err(into_pool_error)?;
+        let s = conn
+            .prepare_cached(&format!(
+                "SELECT k FROM {} WHERE k = ANY($1)",
+                char::from(subspace)
+            ))
+            .await
+            .map_err(into_error)?;
+        let rows = conn.query(&s, &[&keys]).await.map_err(into_error)?;
+        let found: AHashSet<&[u8]> = rows.iter().map(|r| r.get(0)).collect();
+        Ok(keys
+            .iter()
+            .map(|key| found.contains(key.as_slice()))
+            .collect())
     }
 
     pub(crate) async fn key_exists(&self, key: impl Key) -> trc::Result<bool> {
