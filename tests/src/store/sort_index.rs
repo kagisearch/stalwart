@@ -38,6 +38,43 @@ pub async fn test(test: &TestServer) {
     test.server.search_store().create_indexes().await.unwrap();
     wait_until_valid(store).await;
     exec(store, "DELETE FROM s_email WHERE accid = 0 AND docid = 0").await;
+
+    // Creating the search tables while a concurrent build holds the table
+    // does not wait for it, which would leave writes queued behind
+    exec(
+        store,
+        "CREATE FUNCTION slow_id(int) RETURNS int IMMUTABLE LANGUAGE sql \
+         AS 'SELECT $1 FROM pg_sleep(0.02)'",
+    )
+    .await;
+    exec(
+        store,
+        "INSERT INTO s_email (accid, docid) SELECT 0, g FROM generate_series(1, 150) g",
+    )
+    .await;
+    let build = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .sql_query::<usize>(
+                    "CREATE INDEX CONCURRENTLY slow_build ON s_email ((slow_id(docid)))",
+                    vec![],
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        test.server.search_store().create_indexes(),
+    )
+    .await
+    .expect("waited for the concurrent build")
+    .unwrap();
+    build.await.unwrap().unwrap();
+    exec(store, "DROP INDEX slow_build").await;
+    exec(store, "DROP FUNCTION slow_id(int)").await;
+    exec(store, "DELETE FROM s_email WHERE accid = 0").await;
 }
 
 async fn exec(store: &Store, query: &str) {
