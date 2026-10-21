@@ -23,6 +23,7 @@ pub async fn test(test: &TestServer) {
     let mailbox_id = Id::from(INBOX_ID).to_string();
     let account = test.account("jdoe@example.com");
     let client = account.jmap_client().await;
+    let mut email_ids = Vec::new();
 
     for file_name in fs::read_dir(&test_dir).unwrap() {
         let mut file_name = file_name.as_ref().unwrap().path();
@@ -52,6 +53,7 @@ pub async fn test(test: &TestServer) {
         let mut response = request.send_single::<EmailImportResponse>().await.unwrap();
         assert_ne!(response.old_state(), Some(response.new_state()));
         let email = response.created(&id).unwrap();
+        email_ids.push(email.id().unwrap().to_string());
 
         let mut request = client.build();
         request
@@ -165,6 +167,52 @@ pub async fn test(test: &TestServer) {
             panic!("Test failed, output saved to {}", file_name.display());
         }
     }
+
+    // Every message in one get, more than are read ahead at a time, in
+    // reverse order and with an unknown id among them: each comes back in
+    // the order asked for, as it does fetched on its own.
+    let bodies = || {
+        [
+            email::Property::Id,
+            email::Property::BodyValues,
+            email::Property::TextBody,
+            email::Property::HtmlBody,
+            email::Property::Attachments,
+        ]
+    };
+    let mut expected = Vec::new();
+    for id in email_ids.iter().rev() {
+        let mut request = client.build();
+        request
+            .get_email()
+            .ids([id.as_str()])
+            .properties(bodies())
+            .arguments()
+            .fetch_all_body_values(true);
+        let email = request.send_get_email().await.unwrap().take_list().pop();
+        expected.push(serde_json::to_value(email.unwrap()).unwrap());
+    }
+    assert!(expected.len() > 8);
+    let missing = Id::from(u32::MAX - 1).to_string();
+    let mut ids = email_ids.iter().rev().cloned().collect::<Vec<_>>();
+    ids.insert(ids.len() / 2, missing.clone());
+    let mut request = client.build();
+    request
+        .get_email()
+        .ids(ids)
+        .properties(bodies())
+        .arguments()
+        .fetch_all_body_values(true);
+    let mut response = request.send_get_email().await.unwrap();
+    assert_eq!(response.not_found(), [missing]);
+    assert_eq!(
+        response
+            .take_list()
+            .iter()
+            .map(|email| serde_json::to_value(email).unwrap())
+            .collect::<Vec<_>>(),
+        expected
+    );
 
     test.destroy_all_mailboxes(account).await;
     test.account("admin@example.com")
