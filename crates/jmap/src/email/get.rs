@@ -17,6 +17,7 @@ use email::{
         },
     },
 };
+use futures_util::{StreamExt, stream};
 use jmap_proto::{
     method::get::{GetRequest, GetResponse},
     object::email::{Email, EmailProperty, EmailValue, HeaderForm},
@@ -40,6 +41,10 @@ use types::{
     id::Id,
 };
 use utils::chained_bytes::ChainedBytes;
+
+// Raw messages read ahead of the one being built. Each is held whole, so
+// fewer than Blob/get downloads at once.
+const EMAIL_GET_BLOB_READ_AHEAD: usize = 8;
 
 pub trait EmailGet: Sync + Send {
     fn email_get(
@@ -152,7 +157,7 @@ impl EmailGet for Server {
 
         // Read every message's metadata in one store call, which on PostgreSQL
         // is one query rather than a round trip per message.
-        let mut metadatas = self
+        let metadatas = self
             .store()
             .get_values::<_, Archive<AlignedBytes>>(
                 ids.iter()
@@ -167,8 +172,34 @@ impl EmailGet for Server {
                     })
                     .collect(),
             )
-            .await?
-            .into_iter();
+            .await?;
+
+        // The raw messages the loop below reads, in its order and a few ahead
+        // of it, rather than one blob store round trip at a time.
+        let blob_hashes = if needs_body {
+            ids.iter()
+                .filter(|id| message_ids.contains(id.document_id()))
+                .zip(&metadatas)
+                .filter(|(id, _)| cache.email_by_id(&id.document_id()).is_some())
+                .filter_map(|(_, metadata)| metadata.as_ref())
+                .map(|metadata| {
+                    metadata
+                        .unarchive::<MessageMetadata>()
+                        .map(|metadata| BlobHash::from(&metadata.blob_hash))
+                        .caused_by(trc::location!())
+                })
+                .collect::<trc::Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let mut raw_bodies = stream::iter(blob_hashes)
+            .map(|blob_hash| async move {
+                self.blob_store()
+                    .get_blob(blob_hash.as_slice(), 0..usize::MAX)
+                    .await
+            })
+            .buffered(EMAIL_GET_BLOB_READ_AHEAD);
+        let mut metadatas = metadatas.into_iter();
 
         for id in ids {
             // Obtain the email object
@@ -201,10 +232,7 @@ impl EmailGet for Server {
             let raw_body;
             let mut raw_message = ChainedBytes::new(metadata.raw_headers.as_ref());
             if needs_body {
-                raw_body = self
-                    .blob_store()
-                    .get_blob(blob_hash.as_slice(), 0..usize::MAX)
-                    .await?;
+                raw_body = raw_bodies.next().await.transpose()?.flatten();
 
                 if let Some(raw_body) = &raw_body {
                     raw_message.append(
