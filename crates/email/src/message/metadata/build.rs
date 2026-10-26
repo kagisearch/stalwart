@@ -190,6 +190,19 @@ struct Builder<'m> {
 
 impl MessageMetadata {
     pub fn build(message: &Message<'_>, extra: &ExtraHeaders, blob_hash: BlobHash) -> NewMetadata {
+        Self::build_with_preview(message, extra, blob_hash, None)
+    }
+
+    /// FORK: `build` with the preview taken from `preview` instead of the
+    /// message body, when one is given. Delivery hooks use it to supply their
+    /// own preview text. The caller keeps it within `PREVIEW_LENGTH`, which is
+    /// what the string pool budgets for a preview.
+    pub fn build_with_preview(
+        message: &Message<'_>,
+        extra: &ExtraHeaders,
+        blob_hash: BlobHash,
+        preview: Option<&str>,
+    ) -> NewMetadata {
         let raw = message.raw();
         let root = message.root().root_part();
         let block = raw.get(..root.offset_body() as usize).unwrap_or_default();
@@ -200,11 +213,14 @@ impl MessageMetadata {
         let mut builder = Builder::new(message, extra, block.len());
         builder.metadata.blob_hash = blob_hash;
         builder.metadata.blob_body_offset = root.offset_body();
-        builder.metadata.preview = message
-            .root()
-            .body_preview(PREVIEW_LENGTH)
-            .as_deref()
-            .map_or(Str::NONE, |preview| builder.push_whole(preview));
+        builder.metadata.preview = match preview {
+            Some(preview) => builder.push_whole(preview),
+            None => message
+                .root()
+                .body_preview(PREVIEW_LENGTH)
+                .as_deref()
+                .map_or(Str::NONE, |preview| builder.push_whole(preview)),
+        };
         builder.number();
         builder.messages();
         builder.parts(extra);

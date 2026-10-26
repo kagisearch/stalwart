@@ -49,6 +49,7 @@ impl QueuedEmail {
             keywords: self.keywords.clone(),
             received_at: self.received_at,
             metadata: None,
+            preview_text: None,
             session_id,
         }
     }

@@ -9,6 +9,7 @@ pub mod copy;
 pub mod crypto;
 pub mod delete;
 pub mod delivery;
+pub mod delivery_hooks;
 pub mod headers;
 pub mod index;
 pub mod ingest;

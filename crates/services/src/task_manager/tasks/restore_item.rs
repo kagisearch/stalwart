@@ -64,6 +64,7 @@ async fn restore_item(server: &Server, task: &TaskRestoreArchivedItem) -> trc::R
                     received_at: (task.created_at.timestamp() as u64).into(),
                     source: IngestSource::Restore,
                     metadata: None,
+                    preview_text: None,
                     session_id: 0,
                 })
                 .await

@@ -1030,6 +1030,7 @@ impl EmailSet for Server {
                             train_classifier: true,
                         },
                         metadata: ingest_metadata,
+                        preview_text: None,
                         session_id: session.session_id,
                     })
                     .await;

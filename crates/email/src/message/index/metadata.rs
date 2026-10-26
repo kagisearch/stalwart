@@ -70,8 +70,10 @@ impl IndexMessage for BatchBuilder {
         extra_headers: &ExtraHeaders,
         blob_hash: BlobHash,
         mut data: PendingMessageData,
+        preview: Option<&str>,
     ) -> trc::Result<&mut Self> {
-        let built = MessageMetadata::build(message, extra_headers, blob_hash.clone());
+        let built =
+            MessageMetadata::build_with_preview(message, extra_headers, blob_hash.clone(), preview);
         if built.has_attachments {
             data.data.keywords |= 1 << HASATTACHMENT;
         } else {

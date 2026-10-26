@@ -171,6 +171,8 @@ pub(super) trait IndexMessage {
         extra_headers: &ExtraHeaders,
         blob_hash: BlobHash,
         data: PendingMessageData,
+        // FORK: preview text chosen by a delivery hook, replacing the body preview
+        preview: Option<&str>,
     ) -> trc::Result<&mut Self>;
 }
 

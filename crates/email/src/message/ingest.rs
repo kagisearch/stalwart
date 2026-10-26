@@ -103,6 +103,9 @@ pub struct IngestEmail<'x> {
     pub received_at: Option<u64>,
     pub source: IngestSource<'x>,
     pub metadata: Option<Box<IngestMetadata>>,
+    /// FORK: preview text chosen by a delivery hook. Replaces the preview
+    /// derived from the message body. `None` everywhere but SMTP delivery.
+    pub preview_text: Option<String>,
     pub session_id: u64,
 }
 
@@ -452,6 +455,20 @@ impl EmailIngest for Server {
                         overridden = Some("trusted-reply");
                     }
 
+                    // FORK: a $Junk keyword, set by the Sieve script or a
+                    // delivery hook, is final. The checks above only flip
+                    // spam to ham, so they are undone here rather than
+                    // letting a contact or a trusted reply override an
+                    // explicit junk verdict, and no ham sample is trained
+                    // from it. $NotJunk needs nothing: the delivery hook entry
+                    // point hands it in as ham and nothing above flips ham to
+                    // spam.
+                    if !is_spam && params.keywords.contains(&Keyword::Junk) {
+                        is_spam = true;
+                        train_spam = None;
+                        overridden = Some("junk-keyword");
+                    }
+
                     // Add Spam-Status header
                     let result = if is_spam { "Yes" } else { "No" };
                     if let Some(reason) = overridden {
@@ -767,12 +784,25 @@ impl EmailIngest for Server {
         // SPDX-License-Identifier: LicenseRef-SEL
         #[cfg(feature = "enterprise")]
         batch
-            .index_message(tenant_id, &message, &extra_headers, blob_hash.clone(), data)
+            .index_message(
+                tenant_id,
+                &message,
+                &extra_headers,
+                blob_hash.clone(),
+                data,
+                params.preview_text.as_deref(),
+            )
             .caused_by(trc::location!())?;
         // SPDX-SnippetEnd
         #[cfg(not(feature = "enterprise"))]
         batch
-            .index_message(&message, &extra_headers, blob_hash.clone(), data)
+            .index_message(
+                &message,
+                &extra_headers,
+                blob_hash.clone(),
+                data,
+                params.preview_text.as_deref(),
+            )
             .caused_by(trc::location!())?;
         batch
             .set(

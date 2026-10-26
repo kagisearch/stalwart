@@ -233,6 +233,7 @@ impl<T: SessionStream> SessionData<T> {
                             train_classifier: true,
                         },
                         metadata: None,
+                        preview_text: None,
                         session_id: self.session_id,
                     },
                     key,

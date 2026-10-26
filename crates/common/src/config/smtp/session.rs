@@ -28,6 +28,8 @@ use std::{
     time::Duration,
 };
 
+use crate::config::smtp::delivery_hooks::DeliveryHook;
+
 #[derive(Clone)]
 pub struct SessionConfig {
     pub timeout: IfBlock,
@@ -45,6 +47,8 @@ pub struct SessionConfig {
 
     pub milters: Vec<Milter>,
     pub hooks: Vec<MTAHook>,
+    /// FORK: `MtaHook` objects with no SMTP stages, run during local delivery
+    pub delivery_hooks: Vec<DeliveryHook>,
 }
 
 #[derive(Clone)]
@@ -193,6 +197,7 @@ impl SessionConfig {
         let ext = bp.setting_infallible::<MtaExtensions>().await;
 
         let mut hooks = Vec::new();
+        let mut delivery_hooks = Vec::new();
 
         for hook in bp.list_infallible::<MtaHook>().await {
             let id = hook.id;
@@ -210,20 +215,42 @@ impl SessionConfig {
                 }
             };
 
-            hooks.push(MTAHook {
-                enable,
-                id,
-                url: hook.url,
-                timeout: hook.timeout.into_inner(),
-                headers,
-                tls_allow_invalid_certs: hook.allow_invalid_certs,
-                tempfail_on_error: hook.temp_fail_on_error,
-                run_on_stage: hook.stages.into_iter().map(Stage::from).collect(),
-                max_response_size: hook.max_response_size as usize,
-                client: utils::http::http_client_builder(hook.allow_invalid_certs)
-                    .build()
-                    .unwrap_or_default(),
-            });
+            // FORK: an `MtaHook` with no SMTP stages can never fire in the MTA
+            // pipeline (`run_on_stage` would be empty), so a stage-less hook is
+            // treated as a delivery hook: an HTTP webhook invoked during message
+            // delivery, after the user's Sieve script has chosen the filing. This
+            // loop is the only consumer of `MtaHook` objects, so the two kinds stay
+            // cleanly separated.
+            if hook.stages.is_empty() {
+                delivery_hooks.push(DeliveryHook {
+                    enable,
+                    id: id.to_string(),
+                    url: hook.url,
+                    timeout: hook.timeout.into_inner(),
+                    headers,
+                    tls_allow_invalid_certs: hook.allow_invalid_certs,
+                    tempfail_on_error: hook.temp_fail_on_error,
+                    max_response_size: hook.max_response_size as usize,
+                    client: utils::http::http_client_builder(hook.allow_invalid_certs)
+                        .build()
+                        .unwrap_or_default(),
+                });
+            } else {
+                hooks.push(MTAHook {
+                    enable,
+                    id,
+                    url: hook.url,
+                    timeout: hook.timeout.into_inner(),
+                    headers,
+                    tls_allow_invalid_certs: hook.allow_invalid_certs,
+                    tempfail_on_error: hook.temp_fail_on_error,
+                    run_on_stage: hook.stages.into_iter().map(Stage::from).collect(),
+                    max_response_size: hook.max_response_size as usize,
+                    client: utils::http::http_client_builder(hook.allow_invalid_certs)
+                        .build()
+                        .unwrap_or_default(),
+                });
+            }
         }
 
         let mta_sts_policy = Policy::try_parse(bp).await.map(|policy| LocalMtaStsPolicy {
@@ -428,6 +455,7 @@ impl SessionConfig {
                 })
                 .collect(),
             hooks,
+            delivery_hooks,
         }
     }
 }

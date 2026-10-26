@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::ingest::{EmailIngest, IngestEmail, IngestSource};
+use super::{
+    delivery_hooks::DeliveryHookIngest,
+    ingest::{IngestEmail, IngestSource},
+};
 use crate::{mailbox::INBOX_ID, sieve::ingest::SieveScriptIngest};
 use common::{
     Server,
@@ -199,24 +202,29 @@ impl MailDelivery for Server {
                     // Check if there is an active sieve script
                     match self.sieve_script_get_active(account_id).await {
                         Ok(None) => {
-                            // Ingest message
-                            self.email_ingest(IngestEmail {
-                                raw_message: &raw_message,
-                                blob_hash: Some(&message.message_blob),
-                                message: MessageParser::new().parse(&raw_message),
-                                access_token: &access_token,
-                                mailbox_ids: vec![INBOX_ID],
-                                keywords: vec![],
-                                received_at: None,
-                                source: IngestSource::Smtp {
-                                    deliver_to: &rcpt.address,
-                                    envelope_from: &message.sender_address,
-                                    sender_authentication: message.sender_authentication,
-                                    is_spam: rcpt.is_spam(),
+                            // Ingest message (FORK: through the delivery hooks)
+                            self.email_ingest_with_hooks(
+                                IngestEmail {
+                                    raw_message: &raw_message,
+                                    blob_hash: Some(&message.message_blob),
+                                    message: MessageParser::new().parse(&raw_message),
+                                    access_token: &access_token,
+                                    mailbox_ids: vec![INBOX_ID],
+                                    keywords: vec![],
+                                    received_at: None,
+                                    source: IngestSource::Smtp {
+                                        deliver_to: &rcpt.address,
+                                        envelope_from: &message.sender_address,
+                                        sender_authentication: message.sender_authentication,
+                                        is_spam: rcpt.is_spam(),
+                                    },
+                                    metadata: None,
+                                    preview_text: None,
+                                    session_id: message.session_id,
                                 },
-                                metadata: None,
-                                session_id: message.session_id,
-                            })
+                                rcpt.is_spam(),
+                                false,
+                            )
                             .await
                         }
                         Ok(Some(active_script)) => {
