@@ -10,6 +10,7 @@ pull in all features from the main Stalwart project.
 * Do not make sweeping changes (e.g. changing formatting standards).
 * Keep changes isolated, in new files, where possible.
 * Add tests for new behavior to verify external changes don't cause regressions.
+    * Upstream keeps its tests in a sibling `stalwart-tests` checkout, referenced from the code by `#[path]` attributes. Fork tests go in our fork of that repository.
 * Keep changes minimal, providing extensible functionality through hooks to eternal systems.
 * Avoid deduplication between fork code and new functionality.
     * This helps with merge conflicts at the cost of duplication.
@@ -23,7 +24,7 @@ Clone this repository as `origin`, and set up the source as `upstream`.
 ```bash
 git clone https://github.com/kagisearch/stalwart
 git branch --set-upstream-to remotes/origin/main
-git remote add upstream https://github.com/kagisearch/stalwart
+git remote add upstream https://github.com/stalwartlabs/stalwart
 ```
 
 ### Contributing

@@ -42,34 +42,7 @@ fn split_list(header: &str) -> impl Iterator<Item = &str> {
         .filter(|candidate| !candidate.is_empty())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_weak_etag() {
-        assert_eq!(weak_etag(0x3694e05e9dff590), "W/\"03694e05e9dff590\"");
-        assert!(is_weak(&weak_etag(1)));
-    }
-
-    #[test]
-    fn extract_opaque_value() {
-        assert_eq!(opaque_value("W/\"abc\""), "abc");
-        assert_eq!(opaque_value("\"abc\""), "abc");
-        assert_eq!(opaque_value("abc"), "abc");
-    }
-
-    #[test]
-    fn compare_conditional_headers() {
-        let version = weak_etag(0xdeadbeef);
-
-        assert!(matches(&version, &version));
-        assert!(matches("*", &version));
-        assert!(matches("\"00000000deadbeef\"", &version));
-        assert!(matches("W/\"other\", W/\"00000000deadbeef\"", &version));
-        assert!(!matches("W/\"other\"", &version));
-        assert!(!matches("", &version));
-        assert!(matches("W/\"a,b\"", "W/\"a,b\""));
-        assert!(!matches("W/\"a,b\"", "W/\"a\""));
-    }
-}
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../stalwart-tests/unit/scim-proto/src/etag/tests.rs"]
+mod tests;

@@ -27,7 +27,9 @@ pub mod bootstrap;
 pub mod cluster;
 pub mod dkim;
 pub mod domain;
+pub mod index_queue;
 pub mod log;
+pub mod oauth_client;
 pub mod principal;
 pub mod public_key;
 pub mod queued_message;
@@ -52,14 +54,24 @@ pub mod telemetry;
 
 pub(crate) struct RegistryGetResponse<'x> {
     pub server: &'x Server,
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     pub access_token: &'x AccessToken,
+    // SPDX-SnippetEnd
     pub account_id: u32,
     pub ids: Option<Vec<Id>>,
     pub properties: AHashSet<Property>,
     pub response: GetResponse<Registry>,
     pub object_type: ObjectType,
     pub object_flags: u64,
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     pub is_tenant_filtered: bool,
+    // SPDX-SnippetEnd
     pub is_account_filtered: bool,
 }
 
@@ -73,7 +85,12 @@ pub(crate) struct RegistrySetResponse<'x> {
     pub destroy: Vec<Id>,
     pub response: SetResponse<Registry>,
     pub object_type: ObjectType,
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     pub is_tenant_filtered: bool,
+    // SPDX-SnippetEnd
     pub is_account_filtered: bool,
 }
 

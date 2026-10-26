@@ -6,12 +6,15 @@
 
 use crate::{
     auth::ScimConditional,
-    context::{ScimContext, account_of, group_account, parse_id, revision_of, user_account},
+    context::{
+        ScimContext, account_of, bounded, group_account, parse_id, revision_of, user_account,
+    },
     error::{Result, no_content},
     groups,
     request::respond_with_etag,
     users::set::CLIENT_ID,
 };
+use compact_str::ToCompactString;
 use http_proto::{HttpRequest, HttpResponse};
 use hyper::{StatusCode, header};
 use jmap::registry::mapping::principal::AccountUpdate;
@@ -105,10 +108,29 @@ impl ScimContext<'_> {
         object.revision = revision_of(&object);
 
         if let Err(error) = self.set_members(id, &member_ids, &[]).await {
-            let _ = self.delete(id, &object).await;
+            if let Err(rollback) = self.delete(id, &object).await {
+                trc::event!(
+                    Scim(trc::ScimEvent::RollbackFailed),
+                    SpanId = self.session_id,
+                    AccountId = self.access_token.account_id(),
+                    Type = ResourceType::Group.as_str(),
+                    Id = id.to_compact_string(),
+                    Reason = bounded(&rollback.to_compact_string()),
+                );
+            }
 
             return Err(error);
         }
+
+        trc::event!(
+            Scim(trc::ScimEvent::ResourceCreated),
+            SpanId = self.session_id,
+            AccountId = self.access_token.account_id(),
+            Type = ResourceType::Group.as_str(),
+            Id = id.to_compact_string(),
+            Name = bounded(display_name),
+            Total = member_ids.len(),
+        );
 
         Ok((id, object, member_ids))
     }
@@ -178,13 +200,32 @@ impl ScimContext<'_> {
         let object = match self.group_write(id, account, old_object).await {
             Ok(object) => object,
             Err(error) => {
-                self.set_members(id, &current_members, &member_ids)
-                    .await
-                    .ok();
+                if let Err(rollback) = self.set_members(id, &current_members, &member_ids).await {
+                    trc::event!(
+                        Scim(trc::ScimEvent::RollbackFailed),
+                        SpanId = self.session_id,
+                        AccountId = self.access_token.account_id(),
+                        Type = ResourceType::Group.as_str(),
+                        Id = id.to_compact_string(),
+                        Reason = bounded(&rollback.to_compact_string()),
+                    );
+                }
 
                 return Err(error);
             }
         };
+
+        if object.is_some() || groups::members_changed(&current_members, &member_ids) {
+            trc::event!(
+                Scim(trc::ScimEvent::ResourceUpdated),
+                SpanId = self.session_id,
+                AccountId = self.access_token.account_id(),
+                Type = ResourceType::Group.as_str(),
+                Id = id.to_compact_string(),
+                Name = bounded(display_name),
+                Total = member_ids.len(),
+            );
+        }
 
         Ok((object, member_ids))
     }
@@ -207,7 +248,17 @@ impl ScimContext<'_> {
         self.assert_permission(Permission::SysAccountDestroy)?;
 
         group_account(object)?;
-        self.delete(id, object).await
+        self.delete(id, object).await?;
+
+        trc::event!(
+            Scim(trc::ScimEvent::ResourceDeleted),
+            SpanId = self.session_id,
+            AccountId = self.access_token.account_id(),
+            Type = ResourceType::Group.as_str(),
+            Id = id.to_compact_string(),
+        );
+
+        Ok(())
     }
 
     pub async fn group_write(
@@ -328,12 +379,31 @@ impl ScimContext<'_> {
     }
 
     async fn revert_members(&self, group_id: Id, applied: &[(Id, bool)]) {
+        let mut failure = None;
+
         for (member_id, was_added) in applied.iter().rev() {
-            let _ = if *was_added {
+            let result = if *was_added {
                 self.remove_membership(*member_id, group_id).await
             } else {
                 self.add_membership(*member_id, group_id).await
             };
+
+            if let Err(error) = result
+                && failure.is_none()
+            {
+                failure = Some(error);
+            }
+        }
+
+        if let Some(error) = failure {
+            trc::event!(
+                Scim(trc::ScimEvent::RollbackFailed),
+                SpanId = self.session_id,
+                AccountId = self.access_token.account_id(),
+                Type = ResourceType::Group.as_str(),
+                Id = group_id.to_compact_string(),
+                Reason = bounded(&error.to_compact_string()),
+            );
         }
     }
 
@@ -500,50 +570,7 @@ fn truncate(value: &mut String, max_len: usize) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn display_names_slugify_to_local_parts() {
-        for (display_name, expected) in [
-            ("Sales Team", "sales-team"),
-            ("  Sales   Team  ", "sales-team"),
-            ("Sales/Marketing", "sales-marketing"),
-            ("R&D", "r-d"),
-            ("ALL CAPS", "all-caps"),
-            ("Ünïcödé Grüppe", "ünïcödé-grüppe"),
-            ("!!!", FALLBACK_NAME),
-            ("", FALLBACK_NAME),
-            ("---", FALLBACK_NAME),
-            ("2024 Planning", "2024-planning"),
-        ] {
-            assert_eq!(slugify(display_name), expected, "{display_name}");
-        }
-    }
-
-    #[test]
-    fn slugs_are_truncated_to_a_valid_local_part() {
-        let slug = slugify(&"a".repeat(MAX_LOCAL_PART_LEN + 20));
-
-        assert_eq!(slug.len(), MAX_LOCAL_PART_LEN);
-        assert!(!slug.ends_with('-'));
-    }
-
-    #[test]
-    fn truncation_never_leaves_a_trailing_separator() {
-        let slug = slugify(&format!("{} tail", "a".repeat(MAX_LOCAL_PART_LEN - 1)));
-
-        assert!(!slug.ends_with('-'), "{slug}");
-        assert!(slug.len() <= MAX_LOCAL_PART_LEN);
-    }
-
-    #[test]
-    fn truncation_respects_character_boundaries() {
-        let mut value = "é".repeat(MAX_LOCAL_PART_LEN);
-        truncate(&mut value, MAX_LOCAL_PART_LEN);
-
-        assert!(value.len() <= MAX_LOCAL_PART_LEN);
-        assert!(value.is_char_boundary(value.len()));
-    }
-}
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/scim/src/groups/set/tests.rs"]
+mod tests;

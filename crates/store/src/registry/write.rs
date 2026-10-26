@@ -7,14 +7,14 @@
 use crate::{
     IterateParams, RegistryStore, SerializeInfallible, U16_LEN, U64_LEN, ValueKey,
     write::{
-        BatchBuilder, RegistryClass, ValueClass,
+        BatchBuilder, MAX_ACCOUNT_ID, RegistryClass, ValueClass,
         assert::AssertValue,
         key::{DeserializeBigEndian, KeySerializer},
     },
 };
 use registry::{
     schema::prelude::{
-        OBJ_FILTER_ACCOUNT, OBJ_FILTER_TENANT, OBJ_SEQ_ID, OBJ_SINGLETON, Object, ObjectInner,
+        OBJ_FILTER_ACCOUNT, OBJ_NOT_STORED, OBJ_SEQ_ID, OBJ_SINGLETON, Object, ObjectInner,
         ObjectType, Property,
     },
     types::{
@@ -27,6 +27,12 @@ use registry::{
 use std::{borrow::Cow, fmt::Display};
 use trc::AddContext;
 use types::id::Id;
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
+#[cfg(feature = "enterprise")]
+use registry::schema::prelude::OBJ_FILTER_TENANT;
+// SPDX-SnippetEnd
 
 const MAX_OBJECT_PAYLOAD_SIZE: usize = 200_000;
 
@@ -149,16 +155,34 @@ impl RegistryStore {
                 allowed_orphan_types,
             } => {
                 return if object_id.object().flags() & OBJ_SINGLETON == 0 {
-                    self.delete(object_id, object, allowed_orphan_types).await
+                    Box::pin(self.delete(object_id, object, allowed_orphan_types)).await
                 } else {
                     Ok(RegistryWriteResult::CannotDeleteSingleton)
                 };
             }
         }
 
+        if object_flags & OBJ_NOT_STORED != 0 && object_type != ObjectType::DataStore {
+            return Ok(RegistryWriteResult::NotSupported);
+        }
+
         // Validate object
         let mut errors = Vec::new();
         object.validate(&mut errors);
+        if let Some(property) = set_index.keys.iter().find_map(IndexKey::text_with_nul) {
+            errors.push(ValidationError::Invalid {
+                property,
+                value: "Indexed text cannot contain U+0000".to_string(),
+            });
+        }
+        // SPDX-SnippetBegin
+        // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+        // SPDX-License-Identifier: LicenseRef-SEL
+        #[cfg(feature = "enterprise")]
+        if object.inner.member_tenant_id().is_some() || object.inner.account_id().is_some() {
+            object.validate_inline_secrets(&mut errors);
+        }
+        // SPDX-SnippetEnd
         if !errors.is_empty() {
             return Ok(RegistryWriteResult::ValidationError { errors });
         }
@@ -176,17 +200,22 @@ impl RegistryStore {
         }
 
         // Validate foreign keys
+        // SPDX-SnippetBegin
+        // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+        // SPDX-License-Identifier: LicenseRef-SEL
+        #[cfg(feature = "enterprise")]
         let tenant_id = object.inner.member_tenant_id().map(|id| id.id());
+        // SPDX-SnippetEnd
         let account_id = object
             .inner
             .account_id()
             .map(|id| id.id())
             .or_else(|| (object_type == ObjectType::Account).then_some(item_id));
 
-        #[cfg(not(feature = "test_mode"))]
+        #[cfg(not(stalwart_tests))]
         let set_keys = &set_index.keys;
 
-        #[cfg(feature = "test_mode")]
+        #[cfg(stalwart_tests)]
         let set_keys = set_index
             .keys
             .iter()
@@ -223,7 +252,13 @@ impl RegistryStore {
                         return Ok(RegistryWriteResult::InvalidForeignKey {
                             object_id: *foreign_id,
                         });
-                    } else if let Some(tenant_id) = tenant_id
+                    }
+
+                    // SPDX-SnippetBegin
+                    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                    // SPDX-License-Identifier: LicenseRef-SEL
+                    #[cfg(feature = "enterprise")]
+                    if let Some(tenant_id) = tenant_id
                         && (object_flags & OBJ_FILTER_TENANT) != 0
                         && !self
                             .0
@@ -242,7 +277,10 @@ impl RegistryStore {
                         return Ok(RegistryWriteResult::InvalidForeignKey {
                             object_id: *foreign_id,
                         });
-                    } else if (object_flags & OBJ_FILTER_ACCOUNT) != 0
+                    }
+                    // SPDX-SnippetEnd
+
+                    if (object_flags & OBJ_FILTER_ACCOUNT) != 0
                         && let Some(account_id) = account_id
                         && !self
                             .0
@@ -292,21 +330,6 @@ impl RegistryStore {
             }
         }
 
-        // Assign id
-        if generate_id {
-            let mut id_batch = BatchBuilder::new();
-            id_batch.add_and_get(
-                ValueClass::Registry(RegistryClass::IdCounter { object_id }),
-                1,
-            );
-            item_id = self
-                .0
-                .store
-                .write(id_batch.build_all())
-                .await
-                .and_then(|v| v.last_counter_id())? as u64;
-        }
-
         // It's pickle time!
         let out = object.inner.to_pickled_vec();
         if out.len() > MAX_OBJECT_PAYLOAD_SIZE {
@@ -320,6 +343,27 @@ impl RegistryStore {
                     ),
                 }],
             });
+        }
+
+        // Assign id
+        if generate_id {
+            let mut id_batch = BatchBuilder::new();
+            id_batch.add_and_get(
+                ValueClass::Registry(RegistryClass::IdCounter { object_id }),
+                1,
+            );
+            item_id = self
+                .0
+                .store
+                .write_batch(&mut id_batch)
+                .await?
+                .last_counter_id() as u64;
+            if object_type == ObjectType::Account && item_id > u64::from(MAX_ACCOUNT_ID) {
+                return Err(trc::StoreEvent::UnexpectedError
+                    .caused_by(trc::location!())
+                    .ctx(trc::Key::Id, item_id)
+                    .details("Account id space exhausted"));
+            }
         }
 
         // Build batch
@@ -339,7 +383,7 @@ impl RegistryStore {
             );
 
         self.store()
-            .write(batch.build_all())
+            .write_batch(&mut batch)
             .await
             .map(|_| RegistryWriteResult::Success(Id::new(item_id)))
     }
@@ -405,9 +449,42 @@ impl RegistryStore {
             }))
             .registry_index(object_type_id, item_id, clear_index.keys.iter(), false);
 
+        // SPDX-SnippetBegin
+        // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+        // SPDX-License-Identifier: LicenseRef-SEL
+        #[cfg(feature = "enterprise")]
+        match object_type {
+            ObjectType::Tenant => {
+                batch.clear(ValueClass::TenantQuota(id.document_id()));
+            }
+            ObjectType::Account => {
+                if let Some(tenant_id) = object.inner.member_tenant_id() {
+                    let used_quota = self
+                        .0
+                        .store
+                        .get_counter(ValueKey {
+                            account_id: id.document_id(),
+                            collection: 0,
+                            document_id: 0,
+                            class: ValueClass::Quota,
+                        })
+                        .await
+                        .caused_by(trc::location!())?;
+                    if used_quota != 0 {
+                        batch.add(
+                            ValueClass::TenantQuota(tenant_id.document_id()),
+                            -used_quota,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+        // SPDX-SnippetEnd
+
         self.0
             .store
-            .write(batch.build_all())
+            .write_batch(&mut batch)
             .await
             .map(|_| RegistryWriteResult::Success(Id::from(item_id)))
             .caused_by(trc::location!())
@@ -435,20 +512,16 @@ impl RegistryStore {
             .iterate(
                 IterateParams::new(from_key, to_key).no_values().ascending(),
                 |key, _| {
-                    if key.len() == (U16_LEN * 2) + (U64_LEN * 2) {
-                        let object =
-                            ObjectType::from_id(key.deserialize_be_u16(U64_LEN + U16_LEN)?)
-                                .ok_or_else(|| {
-                                    trc::EventType::Registry(
-                                        trc::RegistryEvent::DeserializationError,
-                                    )
+                    let object =
+                        ObjectType::from_id(key.deserialize_be_u16((U16_LEN * 2) + U64_LEN)?)
+                            .ok_or_else(|| {
+                                trc::EventType::Registry(trc::RegistryEvent::DeserializationError)
                                     .into_err()
                                     .caused_by(trc::location!())
                                     .ctx(trc::Key::Key, key)
-                                })?;
-                        let id = key.deserialize_be_u64(U64_LEN + U16_LEN + U16_LEN)?;
-                        linked.push(ObjectId::new(object, Id::new(id)));
-                    }
+                            })?;
+                    let id = key.deserialize_be_u64((U16_LEN * 3) + U64_LEN)?;
+                    linked.push(ObjectId::new(object, Id::new(id)));
 
                     Ok(true)
                 },
@@ -479,7 +552,7 @@ impl BatchBuilder {
                         index_id: property.to_id(),
                         object_id,
                         item_id,
-                        key: value.serialize(),
+                        key: search_key(value),
                     },
                     vec![],
                 ),
@@ -525,17 +598,38 @@ impl BatchBuilder {
     }
 }
 
+pub(crate) const TEXT_TERMINATOR: u8 = 0;
+
 fn serialize_composite_key(value_1: &IndexValue<'_>, value_2: &IndexValue<'_>) -> Vec<u8> {
     let mut key = value_1.serialize();
     match value_2 {
-        IndexValue::Text(text) => key.extend_from_slice(text.as_bytes()),
-        IndexValue::Bytes(bytes) => key.extend_from_slice(bytes),
+        IndexValue::Text(text) => {
+            key.push(TEXT_TERMINATOR);
+            key.extend_from_slice(text.as_bytes());
+        }
+        IndexValue::Bytes(bytes) => {
+            key.push(TEXT_TERMINATOR);
+            key.extend_from_slice(bytes);
+        }
         IndexValue::U64(num) => key.extend_from_slice(&num.to_be_bytes()),
         IndexValue::I64(num) => key.extend_from_slice(&num.to_be_bytes()),
+        IndexValue::U32(num) => key.extend_from_slice(&num.to_be_bytes()),
         IndexValue::U16(num) => key.extend_from_slice(&num.to_be_bytes()),
         IndexValue::None => {}
     }
     key
+}
+
+fn search_key(value: &IndexValue<'_>) -> Vec<u8> {
+    match value {
+        IndexValue::Text(text) => {
+            let mut key = Vec::with_capacity(text.len() + 1);
+            key.extend_from_slice(text.as_bytes());
+            key.push(TEXT_TERMINATOR);
+            key
+        }
+        value => value.serialize(),
+    }
 }
 
 impl SerializeInfallible for IndexValue<'_> {
@@ -545,6 +639,7 @@ impl SerializeInfallible for IndexValue<'_> {
             IndexValue::Bytes(bytes) => bytes.clone(),
             IndexValue::U64(num) => num.to_be_bytes().to_vec(),
             IndexValue::I64(num) => num.to_be_bytes().to_vec(),
+            IndexValue::U32(num) => num.to_be_bytes().to_vec(),
             IndexValue::U16(num) => num.to_be_bytes().to_vec(),
             IndexValue::None => vec![],
         }

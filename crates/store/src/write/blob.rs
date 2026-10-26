@@ -8,7 +8,7 @@ use super::{BlobOp, Operation, ValueClass, ValueOp, key::DeserializeBigEndian, n
 use crate::{
     BlobStore, Deserialize, IterateParams, SerializeInfallible, Store, U16_LEN, U32_LEN, U64_LEN,
     ValueKey,
-    write::{BatchBuilder, BlobLink, RegistryClass},
+    write::{BatchBuilder, BlobLink, RegistryClass, SetValue, SizedSetValue},
 };
 use registry::{
     schema::prelude::Property,
@@ -20,11 +20,73 @@ use types::{
     blob::BlobClass,
     blob_hash::{BLOB_HASH_LEN, BlobHash},
 };
+use utils::codec::leb128::{Leb128, Leb128Reader, Leb128Writer};
+
+const OBJECT_ID_LEN: usize = U16_LEN + U64_LEN;
+const MAX_LEB128_U64_LEN: usize = 10;
+const BLOB_DELETE_CHUNK: usize = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobLinkValue {
+    pub size: u64,
+    pub object_id: Option<ObjectId>,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct BlobQuota {
     pub bytes: usize,
     pub count: usize,
+}
+
+impl BlobLinkValue {
+    pub fn new(size: impl TryInto<u64>) -> Self {
+        BlobLinkValue {
+            size: size.try_into().unwrap_or(u64::MAX),
+            object_id: None,
+        }
+    }
+
+    pub fn with_object_id(mut self, object_id: ObjectId) -> Self {
+        self.object_id = Some(object_id);
+        self
+    }
+}
+
+impl SerializeInfallible for BlobLinkValue {
+    fn serialize(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(
+            self.size.leb128_len() + self.object_id.map_or(0, |_| OBJECT_ID_LEN),
+        );
+        bytes.push_leb128(self.size);
+        if let Some(object_id) = &self.object_id {
+            bytes.extend_from_slice(&object_id.serialize());
+        }
+        bytes
+    }
+}
+
+impl Deserialize for BlobLinkValue {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
+        let mut remaining = bytes;
+        let size = remaining.read_leb128::<u64>();
+        match (size, remaining.len()) {
+            (Some(size), 0) => Ok(BlobLinkValue::new(size)),
+            (Some(size), OBJECT_ID_LEN) => {
+                Ok(BlobLinkValue::new(size).with_object_id(ObjectId::deserialize(remaining)?))
+            }
+            _ => Err(trc::StoreEvent::DataCorruption
+                .into_err()
+                .details("Invalid blob link value")
+                .ctx(trc::Key::Value, bytes)
+                .caused_by(trc::location!())),
+        }
+    }
+}
+
+impl From<BlobLinkValue> for SizedSetValue {
+    fn from(value: BlobLinkValue) -> Self {
+        SetValue::fixed(value.serialize())
+    }
 }
 
 impl Store {
@@ -41,34 +103,43 @@ impl Store {
         .caused_by(trc::location!())
     }
 
-    pub async fn blob_has_access(
+    pub async fn blob_link_size(
         &self,
         hash: impl AsRef<BlobHash> + Sync + Send,
         class: impl AsRef<BlobClass> + Sync + Send,
-    ) -> trc::Result<bool> {
-        match blob_link_key(hash.as_ref(), class.as_ref()) {
-            Some(key) => self.key_exists(key).await,
-            None => Ok(false),
-        }
-    }
+    ) -> trc::Result<Option<u64>> {
+        let key = match class.as_ref() {
+            BlobClass::Reserved {
+                account_id,
+                expires,
+            } if *expires > now() => ValueKey {
+                account_id: *account_id,
+                collection: 0,
+                document_id: 0,
+                class: ValueClass::Blob(BlobOp::Link {
+                    hash: hash.as_ref().clone(),
+                    to: BlobLink::Temporary { until: *expires },
+                }),
+            },
+            BlobClass::Linked {
+                account_id,
+                collection,
+                document_id,
+            } => ValueKey {
+                account_id: *account_id,
+                collection: *collection,
+                document_id: *document_id,
+                class: ValueClass::Blob(BlobOp::Link {
+                    hash: hash.as_ref().clone(),
+                    to: BlobLink::Document,
+                }),
+            },
+            _ => return Ok(None),
+        };
 
-    /// `blob_has_access` for several blobs, checked with one `keys_exist`.
-    pub async fn blobs_have_access<'x>(
-        &self,
-        blobs: impl IntoIterator<Item = (&'x BlobHash, &'x BlobClass)>,
-    ) -> trc::Result<Vec<bool>> {
-        let keys = blobs
-            .into_iter()
-            .map(|(hash, class)| blob_link_key(hash, class))
-            .collect::<Vec<_>>();
-        let mut exist = self
-            .keys_exist(keys.iter().flatten().cloned().collect())
-            .await?
-            .into_iter();
-        Ok(keys
-            .iter()
-            .map(|key| key.is_some() && exist.next().unwrap_or_default())
-            .collect())
+        self.get_value::<BlobLinkValue>(key)
+            .await
+            .map(|value| value.map(|value| value.size))
     }
 
     pub async fn purge_blobs_all_shards(&self, blob_store: BlobStore) -> trc::Result<()> {
@@ -126,20 +197,31 @@ impl Store {
         state.finalize(BlobHash::default());
 
         // Delete expired or unlinked blobs
+        let mut hashes = Vec::with_capacity(BLOB_DELETE_CHUNK.min(state.delete_keys.len()));
         for (_, op) in &state.delete_keys {
             if let BlobOp::Commit { hash } = op {
-                blob_store
-                    .delete_blob(hash.as_ref())
-                    .await
-                    .caused_by(trc::location!())?;
+                hashes.push(hash.as_ref());
+                if hashes.len() == BLOB_DELETE_CHUNK {
+                    blob_store
+                        .delete_blobs(&hashes)
+                        .await
+                        .caused_by(trc::location!())?;
+                    hashes.clear();
+                }
             }
+        }
+        if !hashes.is_empty() {
+            blob_store
+                .delete_blobs(&hashes)
+                .await
+                .caused_by(trc::location!())?;
         }
 
         // Delete hashes
         let mut batch = BatchBuilder::new();
         for (account_id, op) in state.delete_keys {
-            if batch.is_large_batch() {
-                self.write(batch.build_all())
+            if batch.is_large_bulk_batch() {
+                self.write_batch(&mut batch)
                     .await
                     .caused_by(trc::location!())?;
                 batch = BatchBuilder::new();
@@ -155,8 +237,8 @@ impl Store {
             });
         }
         for (account_id, object_id) in state.delete_registry {
-            if batch.is_large_batch() {
-                self.write(batch.build_all())
+            if batch.is_large_bulk_batch() {
+                self.write_batch(&mut batch)
                     .await
                     .caused_by(trc::location!())?;
                 batch = BatchBuilder::new();
@@ -178,7 +260,7 @@ impl Store {
                 }));
         }
         if !batch.is_empty() {
-            self.write(batch.build_all())
+            self.write_batch(&mut batch)
                 .await
                 .caused_by(trc::location!())?;
         }
@@ -188,46 +270,13 @@ impl Store {
 
         trc::event!(
             Store(StoreEvent::BlobStorePurged),
-            Id = shard_index as u16,
-            Expires = total_deleted,
-            Total = total_active,
+            Partition = shard_index as u16,
+            Total = total_deleted,
+            Used = total_active,
             Elapsed = started.elapsed()
         );
 
         Ok(())
-    }
-}
-
-/// The link that grants access to a blob of this class, or `None` when no
-/// link can (an expired reservation, for one).
-fn blob_link_key(hash: &BlobHash, class: &BlobClass) -> Option<ValueKey<ValueClass>> {
-    match class {
-        BlobClass::Reserved {
-            account_id,
-            expires,
-        } if *expires > now() => Some(ValueKey {
-            account_id: *account_id,
-            collection: 0,
-            document_id: 0,
-            class: ValueClass::Blob(BlobOp::Link {
-                hash: hash.clone(),
-                to: BlobLink::Temporary { until: *expires },
-            }),
-        }),
-        BlobClass::Linked {
-            account_id,
-            collection,
-            document_id,
-        } => Some(ValueKey {
-            account_id: *account_id,
-            collection: *collection,
-            document_id: *document_id,
-            class: ValueClass::Blob(BlobOp::Link {
-                hash: hash.clone(),
-                to: BlobLink::Document,
-            }),
-        }),
-        _ => None,
     }
 }
 
@@ -298,9 +347,11 @@ impl BlobPurgeState {
                             to: BlobLink::Temporary { until },
                         },
                     ));
-                    if value.len() == U16_LEN + U64_LEN {
+                    if value.len() > MAX_LEB128_U64_LEN
+                        && let Some((_, object_id)) = value.split_last_chunk::<OBJECT_ID_LEN>()
+                    {
                         self.delete_registry
-                            .push((account_id, ObjectId::deserialize(value)?));
+                            .push((account_id, ObjectId::deserialize(object_id)?));
                     }
                 } else {
                     self.last_hash_is_linked = true;
@@ -320,3 +371,8 @@ impl BlobPurgeState {
         }
     }
 }
+
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/store/src/write/blob/tests.rs"]
+mod tests;

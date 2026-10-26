@@ -12,8 +12,13 @@ use jmap_proto::{
 use jmap_tools::{JsonPointer, JsonPointerItem, Key, Map, Value};
 use types::{id::Id, keyword::Keyword};
 
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/jmap/src/email/contention.rs"]
+mod contention;
 pub mod copy;
 pub mod get;
+mod grouped;
 pub mod import;
 pub mod parse;
 pub mod query;
@@ -37,6 +42,22 @@ pub(crate) enum PatchResult<'x> {
     AddMailbox(u32),
     RemoveMailbox(u32),
     Invalid(SetError<EmailProperty>),
+}
+
+pub(crate) fn parse_keywords<'x>(
+    keywords: Value<'x, EmailProperty, EmailValue>,
+) -> Result<Vec<Keyword>, SetError<EmailProperty>> {
+    keywords
+        .into_expanded_boolean_set()
+        .map(|keyword| keyword.try_into_property()?.try_into_keyword())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(invalid_keywords)
+}
+
+pub(crate) fn invalid_keywords() -> SetError<EmailProperty> {
+    SetError::invalid_properties()
+        .with_property(EmailProperty::Keywords)
+        .with_description("Invalid keyword.")
 }
 
 pub(crate) fn handle_email_patch<'x>(

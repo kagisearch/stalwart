@@ -5,8 +5,8 @@
  */
 
 use crate::{
-    context::{ScimContext, parse_id},
-    error::{Error as ScimResponseError, Result, scim_response},
+    context::{ScimContext, bounded, parse_id},
+    error::{Error as ScimResponseError, Origin, Result, failure_event, scim_response},
     groups,
 };
 use http_proto::HttpResponse;
@@ -26,15 +26,19 @@ use scim_proto::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use std::time::Instant;
 use store::ahash::AHashMap;
 use types::id::Id;
 
 impl ScimContext<'_> {
     pub async fn bulk(&self, body: &[u8]) -> Result<HttpResponse> {
+        let start = Instant::now();
         let request = BulkRequest::parse(body, ServiceProviderConfig::DEFAULT.bulk.max_operations)?;
         let order = request.processing_order()?;
         let fail_on_errors = request.fail_on_errors.unwrap_or(usize::MAX);
         let mut operations = request.operations.unwrap_or_default();
+        let total = operations.len();
+        let account_id = u64::from(self.access_token.account_id());
         let mut resolved = AHashMap::with_capacity(operations.len());
         let mut responses = Vec::with_capacity(operations.len());
         let mut errors = 0;
@@ -48,6 +52,36 @@ impl ScimContext<'_> {
                     resolved.get(reference).map(|id: &Id| id.to_string())
                 })
             {
+                match failure_event(error.status, Origin::Scim) {
+                    Some(trc::ScimEvent::Forbidden) => trc::event!(
+                        Scim(trc::ScimEvent::Forbidden),
+                        SpanId = self.session_id,
+                        AccountId = account_id,
+                        Index = index,
+                        Code = error.status,
+                        Reason = error.scim_type.map(|scim_type| scim_type.as_str()),
+                        Details = error.detail.as_deref().map(bounded),
+                    ),
+                    Some(trc::ScimEvent::Conflict) => trc::event!(
+                        Scim(trc::ScimEvent::Conflict),
+                        SpanId = self.session_id,
+                        AccountId = account_id,
+                        Index = index,
+                        Code = error.status,
+                        Reason = error.scim_type.map(|scim_type| scim_type.as_str()),
+                        Details = error.detail.as_deref().map(bounded),
+                    ),
+                    Some(trc::ScimEvent::Error) => trc::event!(
+                        Scim(trc::ScimEvent::Error),
+                        SpanId = self.session_id,
+                        AccountId = account_id,
+                        Index = index,
+                        Code = error.status,
+                        Reason = error.scim_type.map(|scim_type| scim_type.as_str()),
+                        Details = error.detail.as_deref().map(bounded),
+                    ),
+                    _ => {}
+                }
                 responses.push(failed(self, operation, bulk_id, error));
                 errors += 1;
 
@@ -77,16 +111,47 @@ impl ScimContext<'_> {
                     responses.push(response.with_location(self.location(resource_type, id)));
                 }
                 Err(error) => {
-                    let error = match error {
+                    let (error, origin) = match error {
                         ScimResponseError::Scim(error) | ScimResponseError::Allow(error, _) => {
-                            error
+                            (error, Origin::Scim)
                         }
                         ScimResponseError::Internal(error) => {
                             let scim = crate::error::IntoScimError::into_scim_error(&error);
                             trc::error!(error.span_id(self.session_id));
-                            scim
+                            (scim, Origin::Internal)
                         }
                     };
+
+                    match failure_event(error.status, origin) {
+                        Some(trc::ScimEvent::Forbidden) => trc::event!(
+                            Scim(trc::ScimEvent::Forbidden),
+                            SpanId = self.session_id,
+                            AccountId = account_id,
+                            Index = index,
+                            Code = error.status,
+                            Reason = error.scim_type.map(|scim_type| scim_type.as_str()),
+                            Details = error.detail.as_deref().map(bounded),
+                        ),
+                        Some(trc::ScimEvent::Conflict) => trc::event!(
+                            Scim(trc::ScimEvent::Conflict),
+                            SpanId = self.session_id,
+                            AccountId = account_id,
+                            Index = index,
+                            Code = error.status,
+                            Reason = error.scim_type.map(|scim_type| scim_type.as_str()),
+                            Details = error.detail.as_deref().map(bounded),
+                        ),
+                        Some(trc::ScimEvent::Error) => trc::event!(
+                            Scim(trc::ScimEvent::Error),
+                            SpanId = self.session_id,
+                            AccountId = account_id,
+                            Index = index,
+                            Code = error.status,
+                            Reason = error.scim_type.map(|scim_type| scim_type.as_str()),
+                            Details = error.detail.as_deref().map(bounded),
+                        ),
+                        _ => {}
+                    }
 
                     responses.push(failed(self, operation, bulk_id, error));
                     errors += 1;
@@ -96,6 +161,27 @@ impl ScimContext<'_> {
                     }
                 }
             }
+        }
+
+        trc::event!(
+            Scim(trc::ScimEvent::BulkProcessed),
+            SpanId = self.session_id,
+            AccountId = account_id,
+            Total = total,
+            TotalSuccesses = responses.len().saturating_sub(errors),
+            TotalFailures = errors,
+            Elapsed = start.elapsed(),
+        );
+
+        if errors >= fail_on_errors && responses.len() < total {
+            trc::event!(
+                Scim(trc::ScimEvent::BulkAborted),
+                SpanId = self.session_id,
+                AccountId = account_id,
+                Limit = fail_on_errors,
+                Total = total,
+                TotalFailures = errors,
+            );
         }
 
         scim_response(StatusCode::OK, &BulkResponse::new(responses))

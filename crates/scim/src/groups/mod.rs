@@ -117,6 +117,10 @@ pub fn display_name(account: &GroupAccount) -> &str {
         .unwrap_or(account.name.as_str())
 }
 
+pub fn members_changed(current: &[Id], members: &[Id]) -> bool {
+    current.len() != members.len() || members.iter().any(|member| !current.contains(member))
+}
+
 pub fn version(revision: u64, member_ids: &[Id]) -> u64 {
     let mut ids = member_ids.iter().map(Id::id).collect::<Vec<_>>();
     ids.sort_unstable();
@@ -130,27 +134,7 @@ pub fn version(revision: u64, member_ids: &[Id]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(&buffer)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_version_covers_the_membership() {
-        let revision = 0x1234_5678;
-        let empty = version(revision, &[]);
-        let one = version(revision, &[Id::new(1)]);
-        let two = version(revision, &[Id::new(1), Id::new(2)]);
-
-        assert_ne!(empty, one);
-        assert_ne!(one, two);
-        assert_ne!(version(revision + 1, &[Id::new(1)]), one);
-    }
-
-    #[test]
-    fn the_version_is_independent_of_the_member_order() {
-        let members = [Id::new(7), Id::new(3), Id::new(9)];
-        let reversed = [Id::new(9), Id::new(3), Id::new(7)];
-
-        assert_eq!(version(1, &members), version(1, &reversed));
-    }
-}
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/scim/src/groups/tests.rs"]
+mod tests;

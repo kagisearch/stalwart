@@ -137,3 +137,8 @@ impl From<Property> for String {
         value.as_str().to_string()
     }
 }
+
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/registry/src/schema/tests.rs"]
+mod tests;

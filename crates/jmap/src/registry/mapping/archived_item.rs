@@ -12,9 +12,10 @@ use crate::{
     api::query::QueryResponseBuilder,
     registry::{
         mapping::{RegistryGetResponse, RegistryQueryResponse, RegistrySetResponse},
-        query::RegistryQueryFilters,
+        query::{RegistryQueryFilters, with_page_position},
     },
 };
+use compact_str::format_compact;
 use jmap_proto::{error::set::SetError, types::state::State};
 use jmap_tools::{Key, Value};
 use registry::{
@@ -30,7 +31,10 @@ use std::str::FromStr;
 use store::{
     SerializeInfallible, ValueKey,
     registry::RegistryQuery,
-    write::{BatchBuilder, BlobLink, BlobOp, RegistryClass, ValueClass, assert::AssertValue},
+    write::{
+        BatchBuilder, BlobLink, BlobOp, RegistryClass, ValueClass, assert::AssertValue,
+        blob::BlobLinkValue,
+    },
 };
 use trc::AddContext;
 use types::{blob::BlobClass, id::Id};
@@ -132,7 +136,9 @@ pub(crate) async fn archived_item_set(
                                     until: archived_until.timestamp() as u64,
                                 },
                             },
-                            ObjectId::new(ObjectType::ArchivedItem, item_id.into()).serialize(),
+                            BlobLinkValue::new(item.size().unwrap_or_default()).with_object_id(
+                                ObjectId::new(ObjectType::ArchivedItem, item_id.into()),
+                            ),
                         )
                         .set(
                             ValueClass::Registry(RegistryClass::Item { object_id, item_id }),
@@ -222,11 +228,9 @@ pub(crate) async fn archived_item_set(
 
     if !batch.is_empty() {
         set.server
-            .store()
-            .write(batch.build_all())
+            .commit_batch(batch)
             .await
             .caused_by(trc::location!())?;
-        set.server.notify_task_queue();
     }
 
     Ok(set)
@@ -298,7 +302,7 @@ pub(crate) async fn archived_item_query(
             _ => false,
         })?;
 
-    let mut query = if let Some(account_id) = account_id {
+    let query = if let Some(account_id) = account_id {
         RegistryQuery::new(req.object_type).with_account(account_id.document_id())
     } else if !can_impersonate {
         RegistryQuery::new(req.object_type).with_account(req.request.account_id.document_id())
@@ -310,37 +314,39 @@ pub(crate) async fn archived_item_query(
         .request
         .extract_parameters(req.server.core.jmap.query_max_results, Some(Property::Id))?;
 
-    if let Some(limit) = params.limit {
-        query = query.with_limit(limit);
-        if let Some(anchor) = params.anchor {
-            query = query.with_anchor(anchor);
-        } else if let Some(position) = params.position {
-            query = query.with_index_start(position);
-        }
-    }
-
-    let mut results = req.server.registry().query::<Vec<Id>>(query).await?;
+    let page = req
+        .server
+        .registry()
+        .query_page::<Vec<Id>>(params.paged(query))
+        .await?;
+    let position = params.page_position(page.position)?;
+    let mut results = page.ids;
 
     match params.sort_by {
         Property::Id => {
-            if !params.sort_ascending {
+            if params.needs_reversal() {
                 results.sort_unstable_by(|a, b| b.cmp(a));
             }
         }
         property => {
-            return Err(trc::JmapEvent::UnsupportedSort.into_err().details(format!(
-                "Property {} is not supported for sorting",
-                property
-            )));
+            return Err(trc::JmapEvent::UnsupportedSort
+                .into_err()
+                .details(format_compact!(
+                    "Property {} is not supported for sorting",
+                    property
+                )));
         }
     }
 
     // Build response
-    let mut response = QueryResponseBuilder::new(
-        results.len(),
-        req.server.core.jmap.query_max_results,
-        State::Initial,
-        &req.request,
+    let mut response = with_page_position(
+        QueryResponseBuilder::new(
+            results.len(),
+            req.server.core.jmap.query_max_results,
+            State::Initial,
+            &req.request,
+        ),
+        position,
     );
 
     for id in results {

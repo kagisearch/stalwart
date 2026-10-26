@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: LicenseRef-SEL
  */
 
+use crate::context::bounded;
 use http_proto::HttpResponse;
 use hyper::{StatusCode, header};
 use jmap_proto::error::set::{SetError, SetErrorType};
@@ -46,13 +47,63 @@ impl From<trc::Error> for Error {
 
 impl Error {
     pub fn into_response(self, session_id: u64) -> HttpResponse {
+        if let Error::Scim(error) | Error::Allow(error, _) = &self {
+            match failure_event(error.status, Origin::Scim) {
+                Some(trc::ScimEvent::Forbidden) => trc::event!(
+                    Scim(trc::ScimEvent::Forbidden),
+                    SpanId = session_id,
+                    Code = error.status,
+                    Reason = error.scim_type.map(|scim_type| scim_type.as_str()),
+                    Details = error.detail.as_deref().map(bounded),
+                ),
+                Some(trc::ScimEvent::Conflict) => trc::event!(
+                    Scim(trc::ScimEvent::Conflict),
+                    SpanId = session_id,
+                    Code = error.status,
+                    Reason = error.scim_type.map(|scim_type| scim_type.as_str()),
+                    Details = error.detail.as_deref().map(bounded),
+                ),
+                Some(trc::ScimEvent::Error) => trc::event!(
+                    Scim(trc::ScimEvent::Error),
+                    SpanId = session_id,
+                    Code = error.status,
+                    Reason = error.scim_type.map(|scim_type| scim_type.as_str()),
+                    Details = error.detail.as_deref().map(bounded),
+                ),
+                _ => {}
+            }
+        }
+
         match self {
             Error::Scim(error) => error.into_scim_response(),
             Error::Allow(error, allow) => {
                 error.into_scim_response().with_header(header::ALLOW, allow)
             }
             Error::Internal(error) => {
-                let mut response = error.into_scim_error().into_scim_response();
+                let scim_error = error.into_scim_error();
+
+                match failure_event(scim_error.status, Origin::Internal) {
+                    Some(trc::ScimEvent::Forbidden) => trc::event!(
+                        Scim(trc::ScimEvent::Forbidden),
+                        SpanId = session_id,
+                        Code = scim_error.status,
+                        Reason = scim_error.scim_type.map(|scim_type| scim_type.as_str()),
+                        Details = scim_error.detail.as_deref().map(bounded),
+                        AccountId = error
+                            .value(trc::Key::AccountId)
+                            .and_then(|value| value.to_uint()),
+                    ),
+                    Some(trc::ScimEvent::Conflict) => trc::event!(
+                        Scim(trc::ScimEvent::Conflict),
+                        SpanId = session_id,
+                        Code = scim_error.status,
+                        Reason = scim_error.scim_type.map(|scim_type| scim_type.as_str()),
+                        Details = scim_error.detail.as_deref().map(bounded),
+                    ),
+                    _ => {}
+                }
+
+                let mut response = scim_error.into_scim_response();
 
                 if response.status() == StatusCode::TOO_MANY_REQUESTS
                     && let Some(seconds) = error
@@ -67,6 +118,21 @@ impl Error {
                 response
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Scim,
+    Internal,
+}
+
+pub fn failure_event(status: u16, origin: Origin) -> Option<trc::ScimEvent> {
+    match (status, origin) {
+        (403, _) => Some(trc::ScimEvent::Forbidden),
+        (409 | 412, _) => Some(trc::ScimEvent::Conflict),
+        (_, Origin::Scim) => Some(trc::ScimEvent::Error),
+        (_, Origin::Internal) => None,
     }
 }
 
@@ -258,156 +324,7 @@ fn scim_name(property: Property) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use registry::types::{error::ValidationError, id::ObjectId};
-    use scim_proto::message::error::ScimType;
-    use types::id::Id;
-
-    #[test]
-    fn write_failures_map_to_the_scim_errors_clients_expect() {
-        let object_id = ObjectId::new(registry::schema::prelude::ObjectType::Account, Id::new(1));
-
-        for (result, status, scim_type) in [
-            (
-                RegistryWriteResult::PrimaryKeyConflict {
-                    property: Property::Email,
-                    existing_id: object_id,
-                },
-                409,
-                Some(ScimType::Uniqueness),
-            ),
-            (
-                RegistryWriteResult::InvalidForeignKey { object_id },
-                400,
-                Some(ScimType::InvalidValue),
-            ),
-            (
-                RegistryWriteResult::ValidationError {
-                    errors: vec![ValidationError::required(Property::Name)],
-                },
-                400,
-                Some(ScimType::InvalidValue),
-            ),
-            (RegistryWriteResult::NotFound { object_id }, 404, None),
-            (
-                RegistryWriteResult::CannotDeleteLinked {
-                    object_id,
-                    linked_objects: vec![object_id],
-                },
-                409,
-                None,
-            ),
-            (RegistryWriteResult::CannotDeleteSingleton, 403, None),
-            (
-                RegistryWriteResult::InvalidSingletonId,
-                400,
-                Some(ScimType::InvalidValue),
-            ),
-            (RegistryWriteResult::NotSupported, 501, None),
-        ] {
-            let error = result.into_scim_error();
-
-            assert_eq!(error.status, status, "{error:?}");
-            assert_eq!(error.scim_type, scim_type, "{error:?}");
-        }
-    }
-
-    #[test]
-    fn a_duplicate_address_names_user_name_in_the_detail() {
-        let error = RegistryWriteResult::PrimaryKeyConflict {
-            property: Property::Email,
-            existing_id: ObjectId::new(registry::schema::prelude::ObjectType::Account, Id::new(1)),
-        }
-        .into_scim_error();
-
-        assert!(
-            error.detail.as_deref().unwrap().contains("userName"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn validation_errors_are_summarised_in_the_detail() {
-        let error = RegistryWriteResult::ValidationError {
-            errors: vec![
-                ValidationError::required(Property::Name),
-                ValidationError::required(Property::DomainId),
-            ],
-        }
-        .into_scim_error();
-
-        let detail = error.detail.as_deref().unwrap();
-
-        assert!(detail.contains("name"), "{detail}");
-        assert!(detail.contains("domainId"), "{detail}");
-        assert!(detail.contains("; "), "{detail}");
-    }
-
-    #[test]
-    fn trc_errors_map_to_the_documented_statuses() {
-        for (error, status) in [
-            (trc::AuthEvent::Failed.into_err(), 401),
-            (trc::SecurityEvent::Unauthorized.into_err(), 403),
-            (trc::JmapEvent::Forbidden.into_err(), 403),
-            (trc::ResourceEvent::NotFound.into_err(), 404),
-            (trc::LimitEvent::SizeRequest.into_err(), 413),
-            (trc::LimitEvent::TooManyRequests.into_err(), 429),
-            (trc::StoreEvent::AssertValueFailed.into_err(), 409),
-            (trc::StoreEvent::UnexpectedError.into_err(), 500),
-        ] {
-            assert_eq!((&error).into_scim_error().status, status, "{error}");
-        }
-    }
-
-    #[test]
-    fn errors_are_serialised_as_scim_json() {
-        let response = ScimError::uniqueness("Duplicate userName").into_scim_response();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-
-        let body = match response.body() {
-            http_proto::HttpResponseBody::Text(body) => body.clone(),
-            _ => panic!("The error body is not text."),
-        };
-        let body = serde_json::from_str::<serde_json::Value>(&body).unwrap();
-
-        assert_eq!(body["schemas"][0], scim_proto::MESSAGE_ERROR);
-        assert_eq!(body["status"], "409");
-        assert_eq!(body["scimType"], "uniqueness");
-    }
-
-    #[test]
-    fn unauthorized_responses_carry_the_bearer_challenge() {
-        let response = ScimError::unauthorized().into_scim_response();
-        let headers = response.headers().unwrap();
-
-        assert_eq!(
-            headers
-                .get(header::WWW_AUTHENTICATE)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            REALM
-        );
-        assert!(!REALM.to_lowercase().contains("basic"));
-    }
-
-    #[test]
-    fn every_response_declares_the_scim_content_type() {
-        for response in [
-            ScimError::not_found().into_scim_response(),
-            no_content(),
-            scim_response(StatusCode::OK, &serde_json::json!({})).unwrap(),
-        ] {
-            assert_eq!(
-                response
-                    .headers()
-                    .and_then(|headers| headers.get(header::CONTENT_TYPE))
-                    .map(|value| value.to_str().unwrap()),
-                Some(CONTENT_TYPE)
-            );
-        }
-    }
-}
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../stalwart-tests/unit/scim/src/error/tests.rs"]
+mod tests;

@@ -86,56 +86,7 @@ impl<T: Serialize> Serialize for ListResponse<'_, T> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn serialize_index_paged_response() {
-        let response = ListResponse::new(100, vec!["a", "b"]).with_start_index(1);
-
-        assert_eq!(
-            serde_json::to_value(&response).unwrap(),
-            serde_json::json!({
-                "schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
-                "totalResults": 100,
-                "itemsPerPage": 2,
-                "startIndex": 1,
-                "Resources": ["a", "b"]
-            })
-        );
-    }
-
-    #[test]
-    fn serialize_cursor_paged_response() {
-        let response = ListResponse::new(100, vec!["a"]).with_next_cursor("VZUTiyhEQJ94IR");
-        let value = serde_json::to_value(&response).unwrap();
-
-        assert_eq!(value["nextCursor"], "VZUTiyhEQJ94IR");
-        assert!(value.get("previousCursor").is_none());
-        assert!(value.get("startIndex").is_none());
-    }
-
-    #[test]
-    fn empty_result_sets_are_valid() {
-        let response = ListResponse::<&str>::default().with_start_index(1);
-
-        assert_eq!(
-            serde_json::to_value(&response).unwrap(),
-            serde_json::json!({
-                "schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
-                "totalResults": 0,
-                "itemsPerPage": 0,
-                "startIndex": 1,
-                "Resources": []
-            })
-        );
-    }
-
-    #[test]
-    fn resources_uses_a_capital_r() {
-        let json = serde_json::to_string(&ListResponse::new(1, vec!["a"])).unwrap();
-
-        assert!(json.contains(r#""Resources":["a"]"#), "{json}");
-    }
-}
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/scim-proto/src/message/list/tests.rs"]
+mod tests;

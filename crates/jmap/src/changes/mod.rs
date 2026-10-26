@@ -5,5 +5,11 @@
  */
 
 pub mod get;
+pub mod page;
 pub mod query;
 pub mod state;
+
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/jmap/src/changes/tests.rs"]
+mod tests;

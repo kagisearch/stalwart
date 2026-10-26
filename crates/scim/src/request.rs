@@ -6,7 +6,7 @@
 
 use crate::{
     auth::{ScimAuthorization, ScimEnabled},
-    context::{ScimContext, parse_id},
+    context::{ScimContext, bounded, parse_id},
     discovery::ScimDiscovery,
     error::{Error as ScimResponseError, Result, scim_response},
 };
@@ -22,6 +22,7 @@ use scim_proto::{
     schema::spc::ServiceProviderConfig,
 };
 use serde::Serialize;
+use std::time::Instant;
 
 pub const MAX_BODY_SIZE: usize = 1024 * 1024;
 pub const SEARCH_ENDPOINT: &str = ".search";
@@ -42,13 +43,28 @@ impl ScimRequestHandler for Server {
         session: HttpSessionData,
         access_token: Option<AccessToken>,
     ) -> HttpResponse {
-        match self
+        let start = Instant::now();
+        let response = match self
             .dispatch_scim_request(&mut req, &session, access_token.as_ref())
             .await
         {
             Ok(response) => response,
             Err(error) => error.into_response(session.session_id),
-        }
+        };
+
+        trc::event!(
+            Scim(trc::ScimEvent::Request),
+            SpanId = session.session_id,
+            Command = bounded(req.method().as_str()),
+            Path = bounded(req.uri().path()),
+            Code = response.status().as_u16(),
+            Elapsed = start.elapsed(),
+            AccountId = access_token
+                .as_ref()
+                .map(|access_token| u64::from(access_token.account_id())),
+        );
+
+        response
     }
 }
 

@@ -6,15 +6,17 @@
 
 use crate::{
     auth::ScimConditional,
-    context::{ScimContext, user_account},
+    context::{ScimContext, bounded, user_account},
     error::Result,
     request::respond_with_etag,
     users,
 };
+use compact_str::ToCompactString;
 use http_proto::{HttpRequest, HttpResponse};
 use hyper::StatusCode;
 use registry::schema::{enums::Permission, prelude::Object, structs::UserAccount};
 use scim_proto::{
+    ResourceType,
     etag::weak_etag,
     filter::EqualityTerm,
     message::{
@@ -73,7 +75,19 @@ impl ScimContext<'_> {
                 .await?;
         }
 
-        self.user_write(id, account, old_object).await
+        let updated = self.user_write(id, account, old_object).await?;
+
+        if updated.is_some() {
+            trc::event!(
+                Scim(trc::ScimEvent::ResourceUpdated),
+                SpanId = self.session_id,
+                AccountId = self.access_token.account_id(),
+                Type = ResourceType::User.as_str(),
+                Id = id.to_compact_string(),
+            );
+        }
+
+        Ok(updated)
     }
 
     async fn apply_user_operation(
@@ -84,6 +98,15 @@ impl ScimContext<'_> {
     ) -> Result<()> {
         let path = &operation.path;
         if is_tolerated_path(path) {
+            trc::event!(
+                Scim(trc::ScimEvent::AttributeIgnored),
+                SpanId = self.session_id,
+                AccountId = self.access_token.account_id(),
+                Type = ResourceType::User.as_str(),
+                Id = id.to_compact_string(),
+                Property = bounded(&path.to_compact_string()),
+            );
+
             return Ok(());
         }
 
@@ -401,67 +424,7 @@ fn as_bool(value: &Value) -> Option<bool> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use scim_proto::filter::Filter;
-
-    fn parse_terms(filter: &str) -> Vec<EqualityTerm<'static>> {
-        Filter::parse(filter)
-            .unwrap()
-            .into_owned()
-            .into_equality_terms()
-            .unwrap()
-    }
-
-    #[test]
-    fn value_filters_select_the_matching_address() {
-        let terms = parse_terms(r#"value eq "babs@example.com""#);
-
-        assert!(matches(&terms, "babs@example.com", false).unwrap());
-        assert!(matches(&terms, "BABS@EXAMPLE.COM", false).unwrap());
-        assert!(!matches(&terms, "other@example.com", false).unwrap());
-    }
-
-    #[test]
-    fn every_address_is_of_type_work() {
-        let terms = parse_terms(r#"type eq "work""#);
-
-        assert!(matches(&terms, "a@example.com", true).unwrap());
-        assert!(matches(&terms, "b@example.com", false).unwrap());
-
-        assert!(!matches(&parse_terms(r#"type eq "home""#), "a@example.com", false).unwrap());
-    }
-
-    #[test]
-    fn the_primary_flag_distinguishes_the_derived_address() {
-        let terms = parse_terms("primary eq true");
-
-        assert!(matches(&terms, "a@example.com", true).unwrap());
-        assert!(!matches(&terms, "b@example.com", false).unwrap());
-    }
-
-    #[test]
-    fn conjunctions_must_all_match() {
-        let terms = parse_terms(r#"type eq "work" and value eq "a@example.com""#);
-
-        assert!(matches(&terms, "a@example.com", false).unwrap());
-        assert!(!matches(&terms, "b@example.com", false).unwrap());
-    }
-
-    #[test]
-    fn unknown_sub_attributes_are_rejected() {
-        let terms = parse_terms(r#"nosuch eq "x""#);
-
-        assert!(matches(&terms, "a@example.com", false).is_err());
-    }
-
-    #[test]
-    fn booleans_and_strings_are_read_as_active_values() {
-        assert_eq!(as_bool(&Value::Bool(true)), Some(true));
-        assert_eq!(as_bool(&Value::String("False".into())), Some(false));
-        assert_eq!(as_bool(&Value::String("TRUE".into())), Some(true));
-        assert_eq!(as_bool(&Value::String("yes".into())), None);
-        assert_eq!(as_bool(&Value::Null), None);
-    }
-}
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/scim/src/users/patch/tests.rs"]
+mod tests;

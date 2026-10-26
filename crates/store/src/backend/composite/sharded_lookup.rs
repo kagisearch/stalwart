@@ -39,6 +39,10 @@ impl ShardedInMemory {
                     InMemoryStoreBase::RedisCluster(redis_cluster_store) => {
                         crate::backend::redis::RedisStore::open_cluster(redis_cluster_store).await
                     }
+                    #[cfg(feature = "redis")]
+                    InMemoryStoreBase::RedisSentinel(redis_sentinel_store) => {
+                        crate::backend::redis::RedisStore::open_sentinel(redis_sentinel_store).await
+                    }
                     _ => Err(
                         "Binary was not compiled with the selected in-memory backend".to_string(),
                     ),
@@ -57,92 +61,114 @@ impl ShardedInMemory {
     }
 
     #[inline(always)]
-    fn get_store(&self, key: &[u8]) -> &InMemoryStore {
+    pub fn get_store(&self, key: &[u8]) -> &InMemoryStore {
         &self.stores[xxhash_rust::xxh3::xxh3_64(key) as usize % self.stores.len()]
     }
 
     pub async fn key_set(&self, kv: KeyValue<Vec<u8>>) -> trc::Result<()> {
-        Box::pin(async move {
-            match self.get_store(&kv.key) {
-                #[cfg(feature = "redis")]
-                InMemoryStore::Redis(store) => store.key_set(&kv.key, &kv.value, kv.expires).await,
-                InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
-                _ => Err(trc::StoreEvent::NotSupported.into_err()),
-            }
-        })
-        .await
+        match self.get_store(&kv.key) {
+            #[cfg(feature = "redis")]
+            InMemoryStore::Redis(store) => store.key_set(&kv.key, &kv.value, kv.expires).await,
+            InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
+            _ => Err(trc::StoreEvent::NotSupported.into_err()),
+        }
     }
 
-    pub async fn counter_incr(&self, kv: KeyValue<i64>) -> trc::Result<i64> {
-        Box::pin(async move {
-            match self.get_store(&kv.key) {
-                #[cfg(feature = "redis")]
-                InMemoryStore::Redis(store) => store.key_incr(&kv.key, kv.value, kv.expires).await,
-                InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
-                _ => Err(trc::StoreEvent::NotSupported.into_err()),
-            }
-        })
-        .await
+    pub async fn key_incr(&self, kv: KeyValue<i64>) -> trc::Result<i64> {
+        match self.get_store(&kv.key) {
+            #[cfg(feature = "redis")]
+            InMemoryStore::Redis(store) => store.key_incr(&kv.key, kv.value, kv.expires).await,
+            InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
+            _ => Err(trc::StoreEvent::NotSupported.into_err()),
+        }
     }
 
     #[allow(unused_variables)]
     pub async fn try_lock(&self, key: &[u8], expires: u64) -> trc::Result<bool> {
-        Box::pin(async move {
-            match self.get_store(key) {
-                #[cfg(feature = "redis")]
-                InMemoryStore::Redis(store) => store.try_lock(key, expires).await,
-                InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
-                _ => Err(trc::StoreEvent::NotSupported.into_err()),
-            }
-        })
-        .await
+        match self.get_store(key) {
+            #[cfg(feature = "redis")]
+            InMemoryStore::Redis(store) => store.try_lock(key, expires).await,
+            InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
+            _ => Err(trc::StoreEvent::NotSupported.into_err()),
+        }
     }
 
-    pub async fn key_delete(&self, key: impl Into<LookupKey<'_>>) -> trc::Result<()> {
+    #[allow(unused_variables)]
+    pub async fn try_lease(&self, key: &[u8], token: u64, expires: u64) -> trc::Result<bool> {
+        match self.get_store(key) {
+            #[cfg(feature = "redis")]
+            InMemoryStore::Redis(store) => store.try_lease(key, token, expires).await,
+            InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
+            _ => Err(trc::StoreEvent::NotSupported.into_err()),
+        }
+    }
+
+    #[allow(unused_variables)]
+    pub async fn renew_lease(&self, key: &[u8], token: u64, expires: u64) -> trc::Result<bool> {
+        match self.get_store(key) {
+            #[cfg(feature = "redis")]
+            InMemoryStore::Redis(store) => store.renew_lease(key, token, expires).await,
+            InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
+            _ => Err(trc::StoreEvent::NotSupported.into_err()),
+        }
+    }
+
+    #[allow(unused_variables)]
+    pub async fn release_lease(&self, key: &[u8], token: u64) -> trc::Result<bool> {
+        match self.get_store(key) {
+            #[cfg(feature = "redis")]
+            InMemoryStore::Redis(store) => store.release_lease(key, token).await,
+            InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
+            _ => Err(trc::StoreEvent::NotSupported.into_err()),
+        }
+    }
+
+    #[allow(unused_variables)]
+    pub async fn renew_lock(&self, key: &[u8], expires: u64) -> trc::Result<()> {
+        match self.get_store(key) {
+            #[cfg(feature = "redis")]
+            InMemoryStore::Redis(store) => store.renew_lock(key, expires).await,
+            InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
+            _ => Err(trc::StoreEvent::NotSupported.into_err()),
+        }
+    }
+
+    pub async fn key_delete(&self, key: impl Into<LookupKey<'_>>) -> trc::Result<bool> {
         let key_ = key.into();
         let key = key_.as_bytes();
-        Box::pin(async move {
-            match self.get_store(key) {
-                #[cfg(feature = "redis")]
-                InMemoryStore::Redis(store) => store.key_delete(key).await,
-                InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
-                _ => Err(trc::StoreEvent::NotSupported.into_err()),
-            }
-        })
-        .await
+        match self.get_store(key) {
+            #[cfg(feature = "redis")]
+            InMemoryStore::Redis(store) => store.key_delete(key).await,
+            InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
+            _ => Err(trc::StoreEvent::NotSupported.into_err()),
+        }
     }
 
     pub async fn counter_delete(&self, key: impl Into<LookupKey<'_>>) -> trc::Result<()> {
         let key_ = key.into();
         let key = key_.as_bytes();
-        Box::pin(async move {
-            match self.get_store(key) {
-                #[cfg(feature = "redis")]
-                InMemoryStore::Redis(store) => store.key_delete(key).await,
-                InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
-                _ => Err(trc::StoreEvent::NotSupported.into_err()),
-            }
-        })
-        .await
+        match self.get_store(key) {
+            #[cfg(feature = "redis")]
+            InMemoryStore::Redis(store) => store.key_delete(key).await.map(|_| ()),
+            InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
+            _ => Err(trc::StoreEvent::NotSupported.into_err()),
+        }
     }
 
     #[allow(unused_variables)]
     pub async fn key_delete_prefix(&self, prefix: &[u8]) -> trc::Result<()> {
-        Box::pin(async move {
-            #[cfg(feature = "redis")]
-            for store in &self.stores {
-                match store {
-                    InMemoryStore::Redis(store) => store.key_delete_prefix(prefix).await?,
-                    InMemoryStore::Static(_) => {
-                        return Err(trc::StoreEvent::NotSupported.into_err());
-                    }
-                    _ => return Err(trc::StoreEvent::NotSupported.into_err()),
+        #[cfg(feature = "redis")]
+        for store in &self.stores {
+            match store {
+                InMemoryStore::Redis(store) => store.key_delete_prefix(prefix).await?,
+                InMemoryStore::Static(_) => {
+                    return Err(trc::StoreEvent::NotSupported.into_err());
                 }
+                _ => return Err(trc::StoreEvent::NotSupported.into_err()),
             }
+        }
 
-            Ok(())
-        })
-        .await
+        Ok(())
     }
 
     pub async fn key_get<T: Deserialize + From<Value<'static>> + std::fmt::Debug + 'static>(
@@ -151,43 +177,23 @@ impl ShardedInMemory {
     ) -> trc::Result<Option<T>> {
         let key_ = key.into();
         let key = key_.as_bytes();
-        Box::pin(async move {
-            match self.get_store(key) {
-                #[cfg(feature = "redis")]
-                InMemoryStore::Redis(store) => store.key_get(key).await,
-                InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
-                _ => Err(trc::StoreEvent::NotSupported.into_err()),
-            }
-        })
-        .await
-    }
-
-    pub async fn counter_get(&self, key: impl Into<LookupKey<'_>>) -> trc::Result<i64> {
-        let key_ = key.into();
-        let key = key_.as_bytes();
-        Box::pin(async move {
-            match self.get_store(key) {
-                #[cfg(feature = "redis")]
-                InMemoryStore::Redis(store) => store.counter_get(key).await,
-                InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
-                _ => Err(trc::StoreEvent::NotSupported.into_err()),
-            }
-        })
-        .await
+        match self.get_store(key) {
+            #[cfg(feature = "redis")]
+            InMemoryStore::Redis(store) => store.key_get(key).await,
+            InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
+            _ => Err(trc::StoreEvent::NotSupported.into_err()),
+        }
     }
 
     pub async fn key_exists(&self, key: impl Into<LookupKey<'_>>) -> trc::Result<bool> {
         let key_ = key.into();
         let key = key_.as_bytes();
-        Box::pin(async move {
-            match self.get_store(key) {
-                #[cfg(feature = "redis")]
-                InMemoryStore::Redis(store) => store.key_exists(key).await,
-                InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
-                _ => Err(trc::StoreEvent::NotSupported.into_err()),
-            }
-        })
-        .await
+        match self.get_store(key) {
+            #[cfg(feature = "redis")]
+            InMemoryStore::Redis(store) => store.key_exists(key).await,
+            InMemoryStore::Static(_) => Err(trc::StoreEvent::NotSupported.into_err()),
+            _ => Err(trc::StoreEvent::NotSupported.into_err()),
+        }
     }
 
     pub fn into_single(self) -> InMemoryStore {

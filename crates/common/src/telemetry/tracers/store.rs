@@ -8,12 +8,17 @@
  *
  */
 
-use crate::{config::telemetry::StoreTracer, telemetry::tracers::TraceEvents};
-use ahash::AHashMap;
+use crate::{
+    config::telemetry::StoreTracer,
+    telemetry::tracers::{
+        TraceEvents,
+        spans::{SpanTracker, report_discarded_spans, tracks_span},
+    },
+};
 use registry::{
     schema::structs::{
-        Task, TaskIndexTrace, TaskStatus, Trace, TraceKeyValue, TraceValue, TraceValueIpAddr,
-        TraceValueList, TraceValueString, TraceValueUnsignedInt,
+        Trace, TraceKeyValue, TraceValue, TraceValueIpAddr, TraceValueList, TraceValueString,
+        TraceValueUnsignedInt,
     },
     types::ObjectImpl,
 };
@@ -29,27 +34,34 @@ use trc::{
 };
 use utils::snowflake::SnowflakeIdGenerator;
 
-const MAX_EVENTS: usize = 2048;
-
 pub(crate) fn spawn_store_tracer(builder: SubscriberBuilder, settings: StoreTracer) {
-    let (_, mut rx) = builder.register();
+    let (_, mut rx, interests) = builder.register();
     tokio::spawn(async move {
-        let mut active_spans = AHashMap::new();
+        let mut active_spans = SpanTracker::default();
         let store = settings.store;
         let data_store = settings.data;
+        let index_tx = settings.index_tx;
+        let index = settings.index;
         let mut batch = BatchBuilder::new();
         let mut task_batch = BatchBuilder::new();
 
         while let Some(events) = rx.recv().await {
+            if let Some(event) = events.last() {
+                active_spans.sweep(event.inner.timestamp);
+            }
+            if let Some((events, spans)) = active_spans.take_discarded() {
+                report_discarded_spans(events, spans);
+            }
+
             for event in events {
                 if let Some(span) = &event.inner.span {
                     let span_id = span.span_id().unwrap();
                     if !event.inner.typ.is_span_end() {
-                        let events = active_spans.entry(span_id).or_insert_with(Vec::new);
-                        if events.len() < MAX_EVENTS {
-                            events.push(event);
+                        if !tracks_span(&interests, span) {
+                            continue;
                         }
-                    } else if let Some(events) = active_spans.remove(&span_id)
+                        active_spans.track(span_id, event);
+                    } else if let Some(events) = active_spans.finish(span_id)
                         && events
                             .iter()
                             .chain([span, &event])
@@ -69,27 +81,25 @@ pub(crate) fn spawn_store_tracer(builder: SubscriberBuilder, settings: StoreTrac
                             .to_pickled_vec(),
                         );
 
-                        let index_task = Task::IndexTrace(TaskIndexTrace {
-                            status: TaskStatus::now(),
-                            trace_id: span_id.into(),
-                        });
-                        if data_store.is_some() {
-                            task_batch.schedule_task(index_task);
-                        } else {
-                            batch.schedule_task(index_task);
+                        if index {
+                            if data_store.is_some() {
+                                task_batch.queue_trace_index(span_id).bulk_commit_point();
+                            } else {
+                                batch.queue_trace_index(span_id);
+                            }
                         }
+                        batch.bulk_commit_point();
                     }
                 }
             }
 
             if !batch.is_empty() {
-                match store.write(batch.build_all()).await {
+                match store.write_batch(&mut batch).await {
                     Ok(_) => {
-                        if let Some(data_store) = &data_store {
-                            if let Err(err) = data_store.write(task_batch.build_all()).await {
-                                trc::error!(err.caused_by(trc::location!()));
-                            }
-                            task_batch = BatchBuilder::new();
+                        if let Some(data_store) = &data_store
+                            && let Err(err) = data_store.write_batch(&mut task_batch).await
+                        {
+                            trc::error!(err.caused_by(trc::location!()));
                         }
                     }
                     Err(err) => {
@@ -97,6 +107,12 @@ pub(crate) fn spawn_store_tracer(builder: SubscriberBuilder, settings: StoreTrac
                     }
                 }
                 batch = BatchBuilder::new();
+                if data_store.is_some() {
+                    task_batch = BatchBuilder::new();
+                }
+                if index {
+                    index_tx.notify();
+                }
             }
         }
     });
@@ -130,13 +146,20 @@ impl TracingStore for Store {
         .caused_by(trc::location!())?;
 
         if let Some(search_store) = search_store {
-            search_store
-                .unindex(
-                    SearchQuery::new(SearchIndex::Tracing)
-                        .with_filter(SearchFilter::lt(SearchField::Id, until_span_id)),
-                )
-                .await
-                .caused_by(trc::location!())?;
+            if let Some(store) = search_store.internal_fts() {
+                store
+                    .unindex_traces(until_span_id)
+                    .await
+                    .caused_by(trc::location!())?;
+            } else {
+                search_store
+                    .unindex(
+                        SearchQuery::new(SearchIndex::Tracing)
+                            .with_filter(SearchFilter::integer_lt(SearchField::Id, until_span_id)),
+                    )
+                    .await
+                    .caused_by(trc::location!())?;
+            }
         }
 
         Ok(())
@@ -165,6 +188,8 @@ impl StoreTracer {
                             | EventType::Spf(_)
                             | EventType::Dmarc(_)
                             | EventType::Dkim(_)
+                            | EventType::Dkim2(_)
+                            | EventType::Arc(_)
                             | EventType::MailAuth(_)
                             | EventType::Queue(
                                 QueueEvent::MessageQueued

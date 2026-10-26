@@ -56,64 +56,7 @@ pub fn decode(cursor: &str, signature: u64, ids: &[Id]) -> Result<usize> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn round_trip() {
-        let ids = (1..=10u64).map(Id::new).collect::<Vec<_>>();
-        let cursor = encode(42, 5, ids[4]);
-
-        assert_eq!(cursor.len(), CURSOR_LEN);
-        assert_eq!(decode(&cursor, 42, &ids).unwrap(), 5);
-    }
-
-    #[test]
-    fn anchor_survives_insertions() {
-        let mut ids = (1..=10u64).map(Id::new).collect::<Vec<_>>();
-        let cursor = encode(42, 5, ids[4]);
-        ids.insert(0, Id::new(100));
-
-        assert_eq!(decode(&cursor, 42, &ids).unwrap(), 6);
-    }
-
-    #[test]
-    fn deleted_anchor_falls_back_to_position() {
-        let mut ids = (1..=10u64).map(Id::new).collect::<Vec<_>>();
-        let cursor = encode(42, 5, ids[4]);
-        ids.remove(4);
-
-        assert_eq!(decode(&cursor, 42, &ids).unwrap(), 5);
-    }
-
-    #[test]
-    fn signature_mismatch_is_rejected() {
-        let ids = (1..=10u64).map(Id::new).collect::<Vec<_>>();
-        let cursor = encode(42, 5, ids[4]);
-
-        assert!(decode(&cursor, 43, &ids).is_err());
-    }
-
-    #[test]
-    fn malformed_cursors_are_rejected() {
-        let ids = (1..=10u64).map(Id::new).collect::<Vec<_>>();
-
-        for cursor in [
-            "",
-            "abc",
-            &"z".repeat(CURSOR_LEN),
-            &"0".repeat(CURSOR_LEN - 1),
-        ] {
-            assert!(decode(cursor, 42, &ids).is_err(), "{cursor}");
-        }
-    }
-
-    #[test]
-    fn position_beyond_the_end_is_clamped() {
-        let ids = (1..=3u64).map(Id::new).collect::<Vec<_>>();
-        let cursor = encode(42, 900, Id::new(999));
-
-        assert_eq!(decode(&cursor, 42, &ids).unwrap(), 3);
-    }
-}
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/scim/src/query/cursor/tests.rs"]
+mod tests;

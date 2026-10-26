@@ -8,19 +8,24 @@
  *
  */
 
+pub mod ai;
 pub mod alerts;
 pub mod config;
 pub mod license;
-pub mod llm;
+pub mod logo;
 pub mod masked;
 
+pub use crate::config::mailstore::spamfilter::AI_TAG_PREFIX;
+
 use crate::{
-    Core, LogoCache, Server, USER_AGENT, config::groupware::CalendarTemplateVariable,
-    expr::Expression, manager::application::Resource,
+    Core, LogoCache, Server, config::groupware::CalendarTemplateVariable, expr::if_block::IfBlock,
+    manager::application::Resource,
 };
-use ahash::{AHashMap, AHashSet};
+use ai::{AiClassifier, AiModel, AiVerdict, BreakerPolicy, PreparedClassifier};
+use bytes::Bytes;
+use compact_str::CompactString;
 use license::LicenseKey;
-use llm::AiApiConfig;
+use logo::{LogoLoadError, LogoSource};
 use mail_parser::DateTime;
 use registry::{
     schema::structs::{Domain, Tenant},
@@ -28,42 +33,166 @@ use registry::{
 };
 use std::{sync::Arc, time::Duration};
 use trc::{AddContext, MetricType};
-use utils::{HttpLimitResponse, cron::SimpleCron, template::Template};
+use utils::{cron::SimpleCron, outbound::OutboundPolicy, template::Template};
 
 #[derive(Clone)]
 pub struct Enterprise {
     pub license: LicenseKey,
-    pub logo_url: Option<String>,
+    pub logo: Option<String>,
     pub deleted_items_retention: Option<Duration>,
     pub deleted_accounts_retention: Option<Duration>,
     pub trace_retention: Option<Duration>,
     pub metrics_retention: Option<Duration>,
     pub metrics_interval: SimpleCron,
     pub metrics_alerts: Vec<MetricAlert>,
-    pub ai_apis: AHashMap<String, Arc<AiApiConfig>>,
-    pub spam_filter_llm: Option<SpamFilterLlmConfig>,
+    pub ai_models: Vec<Arc<AiModel>>,
+    pub spam_ai: Option<Arc<SpamAiConfig>>,
     pub template_calendar_alarm: Option<Template<CalendarTemplateVariable>>,
     pub template_scheduling_email: Option<Template<CalendarTemplateVariable>>,
     pub template_scheduling_web: Option<Arc<str>>,
 }
 
-#[derive(Debug, Clone)]
-pub struct SpamFilterLlmConfig {
-    pub model: Arc<AiApiConfig>,
-    pub temperature: f64,
-    pub prompt: String,
-    pub separator: char,
-    pub index_category: usize,
-    pub index_confidence: Option<usize>,
-    pub index_explanation: Option<usize>,
-    pub categories: AHashSet<String>,
-    pub confidence: AHashSet<String>,
+pub struct SpamAiConfig {
+    pub mode: SpamAiMode,
+    pub condition: IfBlock,
+    pub tiers: Box<[SpamAiTier]>,
+    pub classifier: Arc<AiClassifier>,
+    pub category_tags: Box<[[CompactString; 3]]>,
+    pub signal_tags: Box<[CompactString]>,
+    pub buckets: SpamAiBuckets,
+    pub add_header: bool,
+    pub input: SpamAiInput,
+    pub deadline: Duration,
+    pub breaker: BreakerPolicy,
+    pub learn: Option<SpamAiLearn>,
+    pub web_search: SpamAiWebSearch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpamAiMode {
+    Automatic,
+    Shadow,
+}
+
+pub struct SpamAiTier {
+    pub classifier: PreparedClassifier,
+    pub escalate_below: f32,
+    pub escalate_on: Box<[u8]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpamAiBuckets {
+    pub high: f32,
+    pub medium: f32,
+    pub uncertain_below: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpamAiInput {
+    pub max_input_chars: usize,
+    pub max_links: usize,
+    pub max_attachments: usize,
+    pub trim_quotes: bool,
+    pub include_auth: bool,
+    pub include_links: bool,
+    pub include_attachments: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpamAiLearn {
+    pub min_probability: f32,
+    pub sample_rate: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpamAiWebSearch {
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpamAiBucket {
+    High,
+    Medium,
+    Low,
+}
+
+pub const AI_TAG_UNCERTAIN: &str = "AI_UNCERTAIN";
+pub const AI_TAG_ERROR: &str = "AI_ERROR";
+pub const AI_SIGNAL_THRESHOLD: f32 = 0.5;
+
+impl SpamAiBuckets {
+    pub fn bucket(&self, probability: f32) -> SpamAiBucket {
+        if probability >= self.high {
+            SpamAiBucket::High
+        } else if probability >= self.medium {
+            SpamAiBucket::Medium
+        } else {
+            SpamAiBucket::Low
+        }
+    }
+}
+
+impl SpamAiBucket {
+    pub fn index(self) -> usize {
+        match self {
+            SpamAiBucket::High => 0,
+            SpamAiBucket::Medium => 1,
+            SpamAiBucket::Low => 2,
+        }
+    }
+}
+
+impl SpamAiConfig {
+    pub fn is_uncertain(&self, verdict: &AiVerdict) -> bool {
+        verdict.confidence < self.buckets.uncertain_below
+    }
+
+    pub fn should_escalate(&self, tier: &SpamAiTier, verdict: &AiVerdict) -> bool {
+        self.is_uncertain(verdict)
+            || verdict.confidence < tier.escalate_below
+            || self.buckets.bucket(verdict.probability) == SpamAiBucket::Low
+            || tier.escalate_on.contains(&verdict.category)
+    }
+
+    pub fn verdict_tags(&self, verdict: &AiVerdict, tags: &mut Vec<CompactString>) {
+        if self.is_uncertain(verdict) {
+            tags.push(CompactString::const_new(AI_TAG_UNCERTAIN));
+        } else if let Some(tag) =
+            self.category_tag(verdict.category, self.buckets.bucket(verdict.probability))
+        {
+            tags.push(tag.clone());
+        }
+        for (signal, probability) in verdict.signals.iter() {
+            if *probability >= AI_SIGNAL_THRESHOLD
+                && let Some(tag) = self.signal_tag(*signal)
+            {
+                tags.push(tag.clone());
+            }
+        }
+    }
+
+    pub fn category_name(&self, category: u8) -> &str {
+        self.classifier
+            .categories
+            .get(usize::from(category))
+            .map_or("unknown", |category| category.name.as_ref())
+    }
+
+    pub fn category_tag(&self, category: u8, bucket: SpamAiBucket) -> Option<&CompactString> {
+        self.category_tags
+            .get(usize::from(category))
+            .and_then(|tags| tags.get(bucket.index()))
+    }
+
+    pub fn signal_tag(&self, signal: u8) -> Option<&CompactString> {
+        self.signal_tags.get(usize::from(signal))
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct MetricAlert {
     pub id: ObjectId,
-    pub condition: Expression,
+    pub condition: IfBlock,
     pub method: Vec<AlertMethod>,
 }
 
@@ -88,6 +217,20 @@ pub struct AlertContent(pub Vec<AlertContentToken>);
 pub enum AlertContentToken {
     Text(String),
     Metric(MetricType),
+}
+
+impl Enterprise {
+    pub fn ai_model(&self, name: &str) -> Option<&Arc<AiModel>> {
+        if name.is_empty() && self.ai_models.len() == 1 {
+            self.ai_models.first()
+        } else {
+            self.ai_models.iter().find(|model| &*model.name == name)
+        }
+    }
+
+    pub fn ai_model_by_id(&self, id: u64) -> Option<&Arc<AiModel>> {
+        self.ai_models.iter().find(|model| model.id == id)
+    }
 }
 
 impl Core {
@@ -126,7 +269,7 @@ impl Server {
                 Server(trc::ServerEvent::Licensing),
                 Details = "Stalwart Enterprise Edition license key is valid",
                 Domain = enterprise.license.domain.clone(),
-                Total = enterprise.license.accounts,
+                Limit = enterprise.license.accounts,
                 ValidFrom =
                     DateTime::from_timestamp(enterprise.license.valid_from as i64).to_rfc3339(),
                 ValidTo = DateTime::from_timestamp(enterprise.license.valid_to as i64).to_rfc3339(),
@@ -143,7 +286,7 @@ impl Server {
                     Server(trc::ServerEvent::Licensing),
                     Details = "Account creation not possible: license key account limit reached",
                     Domain = enterprise.license.domain.clone(),
-                    Total = total_accounts,
+                    Used = total_accounts,
                     Limit = enterprise.license.accounts,
                 );
 
@@ -154,9 +297,7 @@ impl Server {
         Ok(true)
     }
 
-    pub async fn logo_resource(&self, domain: &str) -> trc::Result<Option<Resource<Vec<u8>>>> {
-        const MAX_IMAGE_SIZE: usize = 1024 * 1024;
-
+    pub async fn logo_resource(&self, domain: &str) -> trc::Result<Option<Resource<Bytes>>> {
         if !self.is_enterprise_edition() {
             return Ok(None);
         }
@@ -167,80 +308,80 @@ impl Server {
             return Ok(logo.data);
         }
 
-        let mut logo_url = None;
+        let mut logo_source = None;
+        let mut logo_policy = OutboundPolicy::Trusted;
         let mut domain_id = u32::MAX;
         let mut tenant_id = None;
         if let Some((d_id, t_id)) = self.domain(domain).await?.map(|d| (d.id, d.id_tenant))
             && let Some(domain_record) = self.registry().object::<Domain>(d_id.into()).await?
         {
-            logo_url = domain_record.logo;
+            if domain_record.logo.is_some() {
+                logo_policy = OutboundPolicy::for_tenant(domain_record.member_tenant_id);
+            }
+            logo_source = domain_record.logo;
             domain_id = d_id;
             tenant_id = t_id;
 
-            if logo_url.is_none()
+            if logo_source.is_none()
                 && let Some(tenant_id) = tenant_id
-            {
-                logo_url = self
+                && let Some(tenant_logo) = self
                     .registry()
                     .object::<Tenant>(tenant_id.into())
                     .await?
-                    .and_then(|t| t.logo);
+                    .and_then(|t| t.logo)
+            {
+                logo_policy = OutboundPolicy::PublicOnly;
+                logo_source = Some(tenant_logo);
             }
         } else {
             domain = "*";
         }
 
-        // Try fetching the default logo
-        if logo_url.is_none()
-            && let Some(default_logo_url) = self.default_logo_url()
+        if logo_source.is_none()
+            && let Some(default_logo) = self.default_logo()
         {
-            let logo = { self.inner.data.logos.lock().get("*").cloned() };
+            let logo = {
+                self.inner
+                    .data
+                    .logos
+                    .lock()
+                    .get("*")
+                    .map(|logo| logo.data.clone())
+            };
             if let Some(logo) = logo {
-                return Ok(logo.data);
+                if domain != "*" {
+                    self.inner.data.logos.lock().insert(
+                        domain.into(),
+                        LogoCache {
+                            domain_id,
+                            tenant_id,
+                            data: logo.clone(),
+                        },
+                    );
+                }
+                return Ok(logo);
             }
-            logo_url = Some(default_logo_url);
+            logo_source = Some(default_logo);
         }
 
-        let mut logo = None;
-        if let Some(logo_url) = logo_url {
-            let response = utils::http::http_client_builder(false)
-                .user_agent(USER_AGENT)
-                .build()
-                .unwrap_or_default()
-                .get(logo_url.as_str())
-                .send()
-                .await
-                .map_err(|err| {
-                    trc::ResourceEvent::DownloadExternal
-                        .into_err()
-                        .details("Failed to download logo")
-                        .reason(err)
-                })?;
-
-            let content_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|ct| ct.to_str().ok())
-                .unwrap_or("image/svg+xml")
-                .to_string();
-
-            let contents = response
-                .bytes_with_limit(MAX_IMAGE_SIZE)
-                .await
-                .map_err(|err| {
-                    trc::ResourceEvent::DownloadExternal
-                        .into_err()
-                        .details("Failed to download logo")
-                        .reason(err)
-                })?
-                .ok_or_else(|| {
-                    trc::ResourceEvent::DownloadExternal
-                        .into_err()
-                        .details("Download exceeded maximum size")
-                })?;
-
-            logo = Resource::new(content_type, contents).into();
-        }
+        let logo = match logo_source {
+            Some(logo_source) => match LogoSource::parse(&logo_source, logo_policy) {
+                Ok(source) => source.load(logo_policy).await.map(Some),
+                Err(err) => Err(LogoLoadError::Rejected(err)),
+            },
+            None => Ok(None),
+        };
+        let logo = match logo {
+            Ok(logo) => logo,
+            Err(err) => {
+                let is_transient = err.is_transient();
+                trc::error!(trc::Error::from(err).ctx(trc::Key::Domain, domain.to_string()));
+                if is_transient {
+                    return Ok(None);
+                }
+                None
+            }
+        };
 
         self.inner.data.logos.lock().insert(
             domain.into(),
@@ -254,10 +395,7 @@ impl Server {
         Ok(logo)
     }
 
-    fn default_logo_url(&self) -> Option<String> {
-        self.core
-            .enterprise
-            .as_ref()
-            .and_then(|e| e.logo_url.as_ref().map(|l| l.into()))
+    fn default_logo(&self) -> Option<String> {
+        self.core.enterprise.as_ref().and_then(|e| e.logo.clone())
     }
 }

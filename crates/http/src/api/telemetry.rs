@@ -55,13 +55,13 @@ impl TelemetryApi for Server {
 
             for (key, value) in params.into_inner() {
                 if key == "filter" {
-                    filter = value.into_owned().into();
-                } else if let Some(key) = Key::parse(key.to_ascii_lowercase().as_str()) {
-                    key_filters.insert(key, value.into_owned());
+                    filter = Some(Needle::new(value.into_owned()));
+                } else if let Some(key) = Key::parse(&key) {
+                    key_filters.insert(key, Needle::new(value.into_owned()));
                 }
             }
 
-            let (_, mut rx) = SubscriberBuilder::new("live-tracer".to_string())
+            let (_, mut rx, _) = SubscriberBuilder::new("live-tracer".to_string())
                 .with_interests(Box::new(Bitset::all()))
                 .with_lossy(false)
                 .register();
@@ -103,28 +103,7 @@ impl TelemetryApi for Server {
                                                 .chain(event.inner.span.as_ref().map_or(([]).iter(), |s| s.keys.iter()))
                                             {
                                                 if let Some(needle) = key_filters.get(key).or(filter.as_ref()) {
-                                                    let matches = match value {
-                                                        Value::String(haystack) => haystack.contains(needle),
-                                                        Value::Timestamp(haystack) => {
-                                                            DateTime::from_timestamp(*haystack as i64)
-                                                                .to_rfc3339()
-                                                                .contains(needle)
-                                                        }
-                                                        Value::Bool(true) => needle == "true",
-                                                        Value::Bool(false) => needle == "false",
-                                                        Value::Ipv4(haystack) => haystack.to_string().contains(needle),
-                                                        Value::Ipv6(haystack) => haystack.to_string().contains(needle),
-                                                        Value::Event(_) |
-                                                        Value::Array(_) |
-                                                        Value::UInt(_) |
-                                                        Value::Int(_) |
-                                                        Value::Float(_) |
-                                                        Value::Duration(_) |
-                                                        Value::Bytes(_) |
-                                                        Value::None => false,
-                                                    };
-
-                                                    if matches {
+                                                    if needle.matches(value) {
                                                         matched_keys.insert(*key);
                                                         if filter.is_some() || matched_keys.len() == key_filters.len() {
                                                             if let Some(span_id) = event.span_id() {
@@ -196,6 +175,8 @@ impl TelemetryApi for Server {
                 }
             }
 
+            let selected = !event_types.is_empty() || !metric_types.is_empty();
+
             // Refresh expensive metrics
             for metric_type in [
                 MetricType::QueueCount,
@@ -213,18 +194,20 @@ impl TelemetryApi for Server {
                 }
             }
 
+            let inner = self.inner.clone();
             Ok(HttpResponse::new(StatusCode::OK)
                 .with_content_type("text/event-stream")
                 .with_cache_control("no-store")
                 .with_stream_body(BoxBody::new(StreamBody::new(
                     async_stream::stream! {
                         loop {
+                            inner.refresh_live_gauges();
                             let mut metrics = String::with_capacity(512);
                             metrics.push_str("event: metrics\ndata: [");
                             let mut is_first = true;
 
                             for counter in Collector::collect_counters(true) {
-                                if event_types.is_empty() || event_types.contains(&counter.id()) {
+                                if !selected || event_types.contains(&counter.id()) {
                                     if !is_first {
                                         metrics.push(',');
                                     } else {
@@ -239,7 +222,7 @@ impl TelemetryApi for Server {
                                 }
                             }
                             for gauge in Collector::collect_gauges(true) {
-                                if metric_types.is_empty() || metric_types.contains(&gauge.id()) {
+                                if !selected || metric_types.contains(&gauge.id()) {
                                     if !is_first {
                                         metrics.push(',');
                                     } else {
@@ -254,7 +237,7 @@ impl TelemetryApi for Server {
                                 }
                             }
                             for histogram in Collector::collect_histograms(true) {
-                                if metric_types.is_empty() || metric_types.contains(&histogram.id()) {
+                                if !selected || metric_types.contains(&histogram.id()) {
                                     if !is_first {
                                         metrics.push(',');
                                     } else {
@@ -276,6 +259,43 @@ impl TelemetryApi for Server {
                         }
                     },
                 ))))
+        }
+    }
+}
+
+struct Needle {
+    text: String,
+    uint: Option<u64>,
+    int: Option<i64>,
+    float: Option<f64>,
+}
+
+impl Needle {
+    fn new(text: String) -> Self {
+        let trimmed = text.trim();
+        Needle {
+            uint: trimmed.parse().ok(),
+            int: trimmed.parse().ok(),
+            float: trimmed.parse().ok(),
+            text,
+        }
+    }
+
+    fn matches(&self, value: &Value) -> bool {
+        match value {
+            Value::String(haystack) => haystack.contains(self.text.as_str()),
+            Value::Timestamp(haystack) => DateTime::from_timestamp(*haystack as i64)
+                .to_rfc3339()
+                .contains(self.text.as_str()),
+            Value::Bool(true) => self.text == "true",
+            Value::Bool(false) => self.text == "false",
+            Value::Ipv4(haystack) => haystack.to_string().contains(self.text.as_str()),
+            Value::Ipv6(haystack) => haystack.to_string().contains(self.text.as_str()),
+            Value::UInt(haystack) | Value::Duration(haystack) => self.uint == Some(*haystack),
+            Value::Int(haystack) => self.int == Some(*haystack),
+            Value::Float(haystack) => self.float == Some(*haystack),
+            Value::Array(values) => values.iter().any(|value| self.matches(value)),
+            Value::Event(_) | Value::Bytes(_) | Value::None => false,
         }
     }
 }

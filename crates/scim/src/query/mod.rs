@@ -7,7 +7,7 @@
 pub mod cursor;
 
 use crate::{
-    context::{ScimContext, group_account, parse_id, user_account},
+    context::{ScimContext, bounded, group_account, parse_id, user_account},
     error::{Result, scim_response},
 };
 use common::auth::EmailCache;
@@ -27,6 +27,7 @@ use scim_proto::{
     message::{error::Error, list::ListResponse, search::SearchRequest},
 };
 use serde_json::Value;
+use std::time::Instant;
 use store::{ahash::AHashMap, registry::RegistryQuery};
 use trc::AddContext;
 use types::id::Id;
@@ -56,6 +57,7 @@ impl ScimContext<'_> {
     ) -> Result<HttpResponse> {
         self.assert_permission(Permission::SysAccountGet)?;
 
+        let start = Instant::now();
         let selection = request.attribute_selection()?;
         let (ids, mut loaded) = self.matching_ids(resource_type, request).await?;
         let total_results = ids.len();
@@ -107,12 +109,25 @@ impl ScimContext<'_> {
         }
         response.items_per_page = Some(response.resources.len());
 
+        trc::event!(
+            Scim(trc::ScimEvent::Query),
+            SpanId = self.session_id,
+            AccountId = self.access_token.account_id(),
+            Type = resource_type.as_str(),
+            Query = request.filter.as_deref().map(bounded),
+            Total = total_results,
+            Limit = count,
+            Index = (!request.is_cursor_paginated()).then(|| request.effective_start_index()),
+            Elapsed = start.elapsed(),
+        );
+
         scim_response(StatusCode::OK, &response)
     }
 
     pub async fn search_all(&self, request: &SearchRequest<'_>) -> Result<HttpResponse> {
         self.assert_permission(Permission::SysAccountGet)?;
 
+        let start = Instant::now();
         let selection = request.attribute_selection()?;
         let mut page = Vec::new();
         let mut total_results = 0;
@@ -159,6 +174,17 @@ impl ScimContext<'_> {
         if let Some(error) = rejected.filter(|_| !accepted) {
             return Err(error);
         }
+
+        trc::event!(
+            Scim(trc::ScimEvent::Query),
+            SpanId = self.session_id,
+            AccountId = self.access_token.account_id(),
+            Query = request.filter.as_deref().map(bounded),
+            Total = total_results,
+            Limit = count,
+            Index = start_index,
+            Elapsed = start.elapsed(),
+        );
 
         scim_response(
             StatusCode::OK,

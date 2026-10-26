@@ -17,6 +17,10 @@ pub trait EnterpriseRegistry {
 }
 
 impl EnterpriseRegistry for Server {
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     fn assert_enterprise_object(&self, object_type: ObjectType) -> trc::Result<()> {
         if !matches!(
             object_type,
@@ -28,18 +32,19 @@ impl EnterpriseRegistry for Server {
             return Ok(());
         }
 
-        // SPDX-SnippetBegin
-        // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
-        // SPDX-License-Identifier: LicenseRef-SEL
-        #[cfg(feature = "enterprise")]
         if self.is_enterprise_edition() {
             return Ok(());
         }
-        // SPDX-SnippetEnd
 
         Err(trc::JmapEvent::Forbidden.into_err().details(concat!(
             "This feature is only available in the Enterprise edition. ",
             "Obtain your trial license at https://license.stalw.art/trial."
         )))
+    }
+    // SPDX-SnippetEnd
+
+    #[cfg(not(feature = "enterprise"))]
+    fn assert_enterprise_object(&self, _object_type: ObjectType) -> trc::Result<()> {
+        Ok(())
     }
 }

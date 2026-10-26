@@ -9,17 +9,24 @@
  */
 
 use super::{
-    AlertContent, AlertContentToken, AlertMethod, Enterprise, MetricAlert, SpamFilterLlmConfig,
-    license::LicenseKey, llm::AiApiConfig,
+    AI_TAG_ERROR, AI_TAG_PREFIX, AI_TAG_UNCERTAIN, AlertContent, AlertContentToken, AlertMethod,
+    Enterprise, MetricAlert, SpamAiBuckets, SpamAiConfig, SpamAiInput, SpamAiLearn, SpamAiMode,
+    SpamAiTier, SpamAiWebSearch,
+    ai::{
+        AiCategory, AiClassifier, AiModel, AiSignal, BreakerPolicy, PreparedClassifier,
+        VerbalConfidence,
+    },
+    license::LicenseKey,
 };
-use crate::{enterprise::llm::ApiType, expr::if_block::BootstrapExprExt};
-use ahash::AHashMap;
+use crate::expr::if_block::{BootstrapExprExt, IfBlock};
+use ahash::AHashSet;
+use compact_str::CompactString;
 use registry::schema::{
-    enums::AiModelType,
+    enums,
     prelude::{ObjectType, Property},
     structs::{
-        self, AiModel, Alert, CalendarAlarm, CalendarScheduling, DataRetention, SecretKeyOptional,
-        SecretKeyValue, SpamLlm, SystemSettings,
+        self, Alert, CalendarAlarm, CalendarScheduling, DataRetention, SecretKeyOptional,
+        SecretKeyValue, SpamAi, SpamAiProperties, SystemSettings,
     },
 };
 use std::sync::Arc;
@@ -84,10 +91,10 @@ impl Enterprise {
                     result.key
                 }),
             (Ok(None), Ok(None)) => {
-                #[cfg(not(feature = "test_mode"))]
+                #[cfg(not(stalwart_tests))]
                 return None;
 
-                #[cfg(feature = "test_mode")]
+                #[cfg(stalwart_tests)]
                 Ok(LicenseKey {
                     valid_to: store::write::now() + (86400 * 365),
                     valid_from: store::write::now() - 3600,
@@ -115,7 +122,7 @@ impl Enterprise {
         };
 
         // Update the license if a new one was obtained
-        let logo_url = enterprise.logo_url.clone();
+        let logo = enterprise.logo.clone();
         if let Some(license) = update_license {
             enterprise.license_key = SecretKeyOptional::Value(SecretKeyValue { secret: license });
             if let Err(err) = bp
@@ -158,38 +165,19 @@ impl Enterprise {
 
         let dr = bp.setting_infallible::<DataRetention>().await;
 
-        // Parse AI APIs
-        let mut ai_apis = AHashMap::new();
-        let mut ai_apis_ids = AHashMap::new();
-        for api in bp.list_infallible::<AiModel>().await {
-            let id = api.id;
-            let api = api.object;
-            let api = Arc::new(AiApiConfig {
-                id: api.name,
-                api_type: match api.model_type {
-                    AiModelType::Chat => ApiType::ChatCompletion,
-                    AiModelType::Text => ApiType::TextCompletion,
-                },
-                url: api.url,
-                headers: api
-                    .http_auth
-                    .build_headers(api.http_headers, "application/json".into())
-                    .await
-                    .map_err(|err| {
-                        bp.build_error(id, format!("Unable to build HTTP headers: {}", err))
-                    })
-                    .unwrap_or_default(),
-                model: api.model,
-                timeout: api.timeout.into_inner(),
-                tls_allow_invalid_certs: api.allow_invalid_certs,
-                default_temperature: api.temperature.into_inner(),
-                client: utils::http::http_client_builder(api.allow_invalid_certs)
-                    .build()
-                    .unwrap_or_default(),
-            });
-            ai_apis.insert(api.id.clone(), api.clone());
-            ai_apis_ids.insert(id.id().id(), api);
+        let mut ai_models = Vec::new();
+        for model in bp.list_infallible::<structs::AiModel>().await {
+            if let Some(model) = AiModel::build(bp, model.id, model.object).await {
+                ai_models.push(Arc::new(model));
+            }
         }
+
+        let spam_ai = match bp.setting_infallible::<SpamAi>().await {
+            SpamAi::Enable(properties) => {
+                SpamAiConfig::parse(bp, &ai_models, properties).map(Arc::new)
+            }
+            SpamAi::Disable => None,
+        };
 
         // Build the enterprise configuration
         let mut enterprise = Enterprise {
@@ -200,10 +188,10 @@ impl Enterprise {
             deleted_accounts_retention: dr
                 .archive_deleted_accounts_for
                 .map(|retention| retention.into_inner()),
-            logo_url,
+            logo,
             metrics_alerts: Default::default(),
-            spam_filter_llm: SpamFilterLlmConfig::parse(bp, &ai_apis_ids).await,
-            ai_apis,
+            ai_models,
+            spam_ai,
             template_calendar_alarm: None,
             template_scheduling_email: None,
             template_scheduling_web: None,
@@ -220,7 +208,13 @@ impl Enterprise {
             if !alert.enable {
                 continue;
             }
-            let condition = bp.compile_expr(id, &alert.ctx_condition()).default;
+            let condition = bp.compile_expr(id, &alert.ctx_condition());
+            let condition = IfBlock::new(
+                condition.id,
+                condition.property,
+                Box::default(),
+                condition.default,
+            );
             let mut method = Vec::with_capacity(1);
             if let structs::AlertEmail::Enabled(alert) = alert.email_alert {
                 method.push(AlertMethod::Email {
@@ -283,43 +277,175 @@ impl Enterprise {
     }
 }
 
-impl SpamFilterLlmConfig {
-    pub async fn parse(
+impl SpamAiConfig {
+    pub fn parse(
         bp: &mut Bootstrap,
-        models: &AHashMap<u64, Arc<AiApiConfig>>,
+        models: &[Arc<AiModel>],
+        properties: SpamAiProperties,
     ) -> Option<Self> {
-        match bp.setting_infallible::<SpamLlm>().await {
-            SpamLlm::Enable(llm) => {
-                let Some(model) = models.get(&llm.model_id.id()).cloned() else {
-                    bp.build_error(
-                        ObjectType::SpamLlm.singleton(),
-                        format!("Model {:?} not found in AI API configuration", llm.model_id),
-                    );
-                    return None;
-                };
-                Some(SpamFilterLlmConfig {
-                    model,
-                    temperature: llm.temperature.into_inner(),
-                    prompt: llm.prompt,
-                    separator: llm.separator.chars().next().unwrap_or(','),
-                    index_category: llm.response_pos_category as usize,
-                    index_confidence: llm.response_pos_confidence.map(|v| v as usize),
-                    index_explanation: llm.response_pos_explanation.map(|v| v as usize),
-                    categories: llm
-                        .categories
+        let id = ObjectType::SpamAi.singleton();
+        let condition = bp.compile_expr(id, &properties.ctx_condition());
+        let classifier = Arc::new(AiClassifier {
+            instructions: properties.instructions.into_boxed_str(),
+            categories: properties
+                .categories
+                .iter()
+                .map(|category| AiCategory {
+                    name: category.name.as_str().into(),
+                    description: category.description.as_str().into(),
+                    includes: category
+                        .includes
                         .iter()
-                        .map(|v| v.trim().to_uppercase())
-                        .collect(),
-                    confidence: llm
-                        .confidence
-                        .iter()
-                        .map(|v| v.trim().to_uppercase())
+                        .map(|include| include.as_str().into())
                         .collect(),
                 })
-            }
-            SpamLlm::Disable => None,
+                .collect(),
+            signals: properties
+                .signals
+                .iter()
+                .map(|signal| AiSignal {
+                    name: signal.name.as_str().into(),
+                    question: signal.question.as_str().into(),
+                })
+                .collect(),
+            explanation: properties.explanation,
+            verbal: VerbalConfidence {
+                high: properties.verbal_high.into_inner() as f32,
+                medium: properties.verbal_medium.into_inner() as f32,
+                low: properties.verbal_low.into_inner() as f32,
+            },
+        });
+        if let Err(err) = classifier.validate() {
+            bp.build_error(id, format!("Invalid AI classifier definition: {err:?}"));
+            return None;
         }
+        let category_tags = classifier
+            .categories
+            .iter()
+            .map(|category| {
+                ["_HIGH", "_MEDIUM", "_LOW"].map(|suffix| ai_tag(&category.name, suffix))
+            })
+            .collect::<Box<[_]>>();
+        let signal_tags = classifier
+            .signals
+            .iter()
+            .map(|signal| ai_tag(&signal.name, ""))
+            .collect::<Box<[_]>>();
+        if let Some(tag) = duplicate_tag(&category_tags, &signal_tags) {
+            bp.build_error(
+                id,
+                format!("AI classifier names produce the tag {tag} more than once"),
+            );
+            return None;
+        }
+
+        let mut tiers = Vec::with_capacity(properties.tiers.len());
+        for tier in properties.tiers.iter() {
+            let Some(model) = models
+                .iter()
+                .find(|model| model.id == tier.model_id.id())
+                .cloned()
+            else {
+                bp.build_error(id, format!("AI model {:?} not found", tier.model_id.id()));
+                return None;
+            };
+            let mut escalate_on = Vec::with_capacity(tier.escalate_on.len());
+            for name in tier.escalate_on.iter() {
+                match classifier.category_index(name) {
+                    Some(category) => escalate_on.push(category),
+                    None => bp
+                        .build_warning(id, format!("Unknown escalation category {name:?} ignored")),
+                }
+            }
+            let classifier = match PreparedClassifier::new(model, classifier.clone()) {
+                Ok(classifier) => classifier,
+                Err(err) => {
+                    bp.build_error(id, format!("Unable to prepare AI classifier: {err}"));
+                    return None;
+                }
+            };
+            tiers.push(SpamAiTier {
+                classifier,
+                escalate_below: tier.escalate_below.into_inner() as f32,
+                escalate_on: escalate_on.into_boxed_slice(),
+            });
+        }
+        if tiers.is_empty() {
+            bp.build_error(id, "The AI classifier requires at least one model tier");
+            return None;
+        }
+
+        Some(SpamAiConfig {
+            mode: match properties.mode {
+                enums::SpamAiMode::Automatic => SpamAiMode::Automatic,
+                enums::SpamAiMode::Shadow => SpamAiMode::Shadow,
+            },
+            condition,
+            tiers: tiers.into_boxed_slice(),
+            category_tags,
+            signal_tags,
+            classifier,
+            buckets: SpamAiBuckets {
+                high: properties.bucket_high.into_inner() as f32,
+                medium: properties.bucket_medium.into_inner() as f32,
+                uncertain_below: properties.uncertain_below.into_inner() as f32,
+            },
+            add_header: properties.add_header,
+            input: SpamAiInput {
+                max_input_chars: usize::try_from(properties.max_input_chars).unwrap_or(usize::MAX),
+                max_links: usize::try_from(properties.max_links).unwrap_or(usize::MAX),
+                max_attachments: usize::try_from(properties.max_attachments).unwrap_or(usize::MAX),
+                trim_quotes: properties.trim_quotes,
+                include_auth: properties.include_auth,
+                include_links: properties.include_links,
+                include_attachments: properties.include_attachments,
+            },
+            deadline: properties.deadline.into_inner(),
+            breaker: BreakerPolicy {
+                threshold: u32::try_from(properties.breaker_threshold).unwrap_or(u32::MAX),
+                cooldown: properties.breaker_cooldown.into_inner(),
+            },
+            learn: match properties.learn {
+                structs::SpamAiLearn::Enable(learn) => Some(SpamAiLearn {
+                    min_probability: learn.min_probability.into_inner() as f32,
+                    sample_rate: learn.sample_rate.into_inner() as f32,
+                }),
+                structs::SpamAiLearn::Disable => None,
+            },
+            web_search: match properties.web_search {
+                structs::SpamAiWebSearch::Disable => SpamAiWebSearch::Disabled,
+            },
+        })
     }
+}
+
+fn duplicate_tag<'x>(
+    category_tags: &'x [[CompactString; 3]],
+    signal_tags: &'x [CompactString],
+) -> Option<&'x str> {
+    let mut seen = AHashSet::with_capacity(category_tags.len() * 3 + signal_tags.len() + 2);
+    seen.insert(AI_TAG_UNCERTAIN);
+    seen.insert(AI_TAG_ERROR);
+    category_tags
+        .iter()
+        .flatten()
+        .chain(signal_tags)
+        .map(CompactString::as_str)
+        .find(|tag| !seen.insert(*tag))
+}
+
+fn ai_tag(name: &str, suffix: &str) -> CompactString {
+    let mut tag = CompactString::with_capacity(AI_TAG_PREFIX.len() + name.len() + suffix.len());
+    tag.push_str(AI_TAG_PREFIX);
+    tag.extend(name.chars().map(|ch| {
+        if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_uppercase()
+        } else {
+            '_'
+        }
+    }));
+    tag.push_str(suffix);
+    tag
 }
 
 impl AlertContent {
@@ -376,3 +502,8 @@ impl AlertContent {
         AlertContent(tokens)
     }
 }
+
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/common/src/enterprise/config/tests.rs"]
+mod tests;

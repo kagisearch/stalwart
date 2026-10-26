@@ -5,8 +5,9 @@
  */
 
 use registry::{
+    pickle::Pickle,
     schema::{
-        enums::DmarcActionDisposition,
+        enums::{DmarcActionDisposition, TaskType},
         prelude::{ObjectType, Property},
         structs::{
             ArfExternalReport, DmarcExternalReport, DmarcInternalReport, Task, TaskDmarcReport,
@@ -24,14 +25,21 @@ use store::{
     SerializeInfallible, U64_LEN,
     registry::ObjectIdVersioned,
     write::{
-        BatchBuilder, RegistryClass, TaskQueueClass, ValueClass, assert::AssertValue,
+        BatchBuilder, RegistryClass, TaskId, TaskQueueClass, ValueClass, assert::AssertValue,
         key::KeySerializer,
     },
     xxhash_rust::xxh3::Xxh3,
 };
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
+#[cfg(feature = "enterprise")]
 use types::id::Id;
+// SPDX-SnippetEnd
 
-pub trait InternalReportIndex: ObjectImpl {
+pub trait InternalReportIndex: ObjectImpl + Pickle {
+    const TASK_TYPE: TaskType;
+
     fn deliver_at(&self) -> UTCDateTime;
 
     fn set_deliver_at(&mut self, at: UTCDateTime);
@@ -59,18 +67,44 @@ pub trait InternalReportIndex: ObjectImpl {
             batch
                 .assert_value(key.clone(), AssertValue::Hash(revision))
                 .clear(ValueClass::TaskQueue(TaskQueueClass::Due {
-                    id: item_id,
+                    id: TaskId::Assigned(item_id),
+                    typ: Self::TASK_TYPE,
                     due: current_deliver_at.timestamp() as u64,
                 }))
-                .set(
-                    ValueClass::TaskQueue(TaskQueueClass::Due {
-                        id: item_id,
-                        due: at.timestamp() as u64,
-                    }),
-                    object_id.serialize(),
-                )
+                .clear(ValueClass::TaskQueue(TaskQueueClass::Due {
+                    id: TaskId::Assigned(item_id),
+                    typ: Self::TASK_TYPE,
+                    due: u64::MAX,
+                }))
+                .schedule_task_with_id(item_id, self.task(item_id))
                 .set(key, self.to_pickled_vec());
         }
+    }
+
+    fn write_header(&self, batch: &mut BatchBuilder, item_id: u64) -> usize {
+        let object = Self::OBJECT;
+        let value = self.to_pickled_vec();
+        let len = value.len();
+
+        batch
+            .set(
+                self.primary_key(),
+                ObjectIdVersioned {
+                    object_id: ObjectId::new(object, item_id.into()),
+                    version: 0,
+                }
+                .serialize(),
+            )
+            .schedule_task_with_id(item_id, self.task(item_id))
+            .set(
+                ValueClass::Registry(RegistryClass::Item {
+                    object_id: object.to_id(),
+                    item_id,
+                }),
+                value,
+            );
+
+        len
     }
 
     fn write_ops(&self, batch: &mut BatchBuilder, item_id: u64, is_set: bool) {
@@ -97,19 +131,32 @@ pub trait InternalReportIndex: ObjectImpl {
                     item_id,
                 }))
                 .clear(pk)
-                .clear(ValueClass::TaskQueue(TaskQueueClass::Task { id: item_id }))
+                .clear(ValueClass::TaskQueue(TaskQueueClass::Task {
+                    id: TaskId::Assigned(item_id),
+                }))
                 .clear(ValueClass::TaskQueue(TaskQueueClass::Due {
-                    id: item_id,
+                    id: TaskId::Assigned(item_id),
+                    typ: Self::TASK_TYPE,
                     due: self.deliver_at().timestamp() as u64,
+                }))
+                .clear(ValueClass::TaskQueue(TaskQueueClass::Due {
+                    id: TaskId::Assigned(item_id),
+                    typ: Self::TASK_TYPE,
+                    due: u64::MAX,
                 }));
         }
     }
 }
 
-pub trait ExternalReportIndex: ObjectImpl {
+pub trait ExternalReportIndex: ObjectImpl + Pickle {
     fn text(&self) -> impl Iterator<Item = &str>;
 
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     fn tenant_id(&self) -> Option<Id>;
+    // SPDX-SnippetEnd
 
     fn expires_at(&self) -> u64;
 
@@ -126,9 +173,14 @@ pub trait ExternalReportIndex: ObjectImpl {
             index_builder.text(Property::Text, text);
         }
 
+        // SPDX-SnippetBegin
+        // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+        // SPDX-License-Identifier: LicenseRef-SEL
+        #[cfg(feature = "enterprise")]
         if let Some(tenant_id) = self.tenant_id() {
             index_builder.search(Property::MemberTenantId, tenant_id.id());
         }
+        // SPDX-SnippetEnd
 
         let (success_count, fail_count) = self.success_fail_count();
         index_builder.search(Property::TotalSuccessfulSessions, success_count);
@@ -151,7 +203,27 @@ pub trait ExternalReportIndex: ObjectImpl {
     }
 }
 
+pub(crate) fn internal_report_key(
+    object: ObjectType,
+    domain: &str,
+    policy: Option<u64>,
+    window_end: u64,
+) -> ValueClass {
+    let mut key = KeySerializer::new(domain.len() + 1 + (U64_LEN * 2));
+    key.write(domain).write(0u8);
+    if let Some(policy) = policy {
+        key.write(policy);
+    }
+    ValueClass::Registry(RegistryClass::PrimaryKey {
+        object_id: object.to_id().into(),
+        index_id: Property::Domain.to_id(),
+        key: key.write(window_end).finalize(),
+    })
+}
+
 impl InternalReportIndex for DmarcInternalReport {
+    const TASK_TYPE: TaskType = TaskType::DmarcReport;
+
     fn deliver_at(&self) -> UTCDateTime {
         self.deliver_at
     }
@@ -168,18 +240,18 @@ impl InternalReportIndex for DmarcInternalReport {
     }
 
     fn primary_key(&self) -> ValueClass {
-        ValueClass::Registry(RegistryClass::PrimaryKey {
-            object_id: ObjectType::DmarcInternalReport.to_id().into(),
-            index_id: Property::Domain.to_id(),
-            key: KeySerializer::new(self.domain.len() + U64_LEN)
-                .write(self.domain.as_str())
-                .write(self.policy_identifier)
-                .finalize(),
-        })
+        internal_report_key(
+            ObjectType::DmarcInternalReport,
+            &self.domain,
+            Some(self.policy_identifier),
+            self.report.date_range_end.timestamp().cast_unsigned(),
+        )
     }
 }
 
 impl InternalReportIndex for TlsInternalReport {
+    const TASK_TYPE: TaskType = TaskType::TlsReport;
+
     fn deliver_at(&self) -> UTCDateTime {
         self.deliver_at
     }
@@ -196,11 +268,12 @@ impl InternalReportIndex for TlsInternalReport {
     }
 
     fn primary_key(&self) -> ValueClass {
-        ValueClass::Registry(RegistryClass::PrimaryKey {
-            object_id: ObjectType::TlsInternalReport.to_id().into(),
-            index_id: Property::Domain.to_id(),
-            key: self.domain.as_bytes().to_vec(),
-        })
+        internal_report_key(
+            ObjectType::TlsInternalReport,
+            &self.domain,
+            None,
+            self.report.date_range_end.timestamp().cast_unsigned(),
+        )
     }
 }
 
@@ -241,9 +314,14 @@ impl ExternalReportIndex for ArfExternalReport {
             .chain(non_empty(&self.from))
     }
 
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     fn tenant_id(&self) -> Option<Id> {
         self.member_tenant_id
     }
+    // SPDX-SnippetEnd
 
     fn expires_at(&self) -> u64 {
         self.expires_at.timestamp() as u64
@@ -287,9 +365,14 @@ impl ExternalReportIndex for DmarcExternalReport {
             .chain(non_empty(&self.from))
     }
 
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     fn tenant_id(&self) -> Option<Id> {
         self.member_tenant_id
     }
+    // SPDX-SnippetEnd
 
     fn expires_at(&self) -> u64 {
         self.expires_at.timestamp() as u64
@@ -319,7 +402,7 @@ impl ExternalReportIndex for DmarcExternalReport {
                 report.policy_domain.as_str(),
                 report.report_id.as_str(),
             ],
-            report.date_range_begin,
+            report.date_range_start,
             report.date_range_end,
         ))
     }
@@ -354,9 +437,14 @@ impl ExternalReportIndex for TlsExternalReport {
             .chain(non_empty(&self.from))
     }
 
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     fn tenant_id(&self) -> Option<Id> {
         self.member_tenant_id
     }
+    // SPDX-SnippetEnd
 
     fn expires_at(&self) -> u64 {
         self.expires_at.timestamp() as u64

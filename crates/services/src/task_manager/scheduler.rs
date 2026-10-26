@@ -11,6 +11,7 @@ use std::{
     time::{Instant, SystemTime},
 };
 
+use crate::task_manager::reconcile::insert_task_if_absent;
 use common::{
     BuildServer, Inner, LONG_1D_SLUMBER,
     config::{mailstore::spamfilter, telemetry::OtelMetrics},
@@ -22,7 +23,13 @@ use registry::{
     },
     types::EnumImpl,
 };
-use store::write::{BatchBuilder, now};
+use store::write::now;
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
+#[cfg(feature = "enterprise")]
+use store::write::SearchIndex;
+// SPDX-SnippetEnd
 use trc::{ClusterEvent, Collector, MetricType, TaskManagerEvent, TelemetryEvent};
 
 #[derive(PartialEq, Eq)]
@@ -97,12 +104,12 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
             }
 
             // Spam classifier training
-            if let Some(train_frequency) = server
+            if let Some(train_interval) = server
                 .core
                 .spam
                 .classifier
                 .as_ref()
-                .and_then(|c| c.train_frequency)
+                .and_then(|c| c.train_interval)
             {
                 let next_train = match server.inner.data.spam_classifier.load().as_ref() {
                     spamfilter::SpamClassifier::FhClassifier {
@@ -110,8 +117,8 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
                     }
                     | spamfilter::SpamClassifier::CcfhClassifier {
                         last_trained_at, ..
-                    } => now().saturating_sub(*last_trained_at).min(train_frequency),
-                    spamfilter::SpamClassifier::Disabled => train_frequency,
+                    } => now().saturating_sub(*last_trained_at).min(train_interval),
+                    spamfilter::SpamClassifier::Disabled => train_interval,
                 };
 
                 queue.schedule(
@@ -134,6 +141,11 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
             // SPDX-License-Identifier: LicenseRef-SEL
 
             // Enterprise Edition license management
+            #[cfg(feature = "enterprise")]
+            if server.core.enterprise.is_none() && has_license_api_key(&server).await {
+                queue.schedule(Instant::now() + LICENSE_RETRY_MIN, Event::RenewLicense);
+            }
+
             #[cfg(feature = "enterprise")]
             if let Some(enterprise) = &server.core.enterprise {
                 queue.schedule(
@@ -161,13 +173,15 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
         // SPDX-SnippetEnd
 
         let mut next_metric_update = Instant::now();
+        #[cfg(feature = "enterprise")]
+        let mut license_retry = LICENSE_RETRY_MIN;
 
         loop {
             tokio::time::sleep(queue.wake_up_time()).await;
 
             let server = inner.build_server();
             let roles = &server.core.network.roles;
-            let mut batch = (roles.task_scheduler).then(BatchBuilder::new);
+            let mut tasks = (roles.task_scheduler).then(Vec::new);
 
             while let Some(event) = queue.pop() {
                 match event.event {
@@ -178,13 +192,13 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
                             Event::PurgeAccount,
                         );
 
-                        if let Some(batch) = batch.as_mut() {
+                        if let Some(tasks) = tasks.as_mut() {
                             trc::event!(
                                 TaskManager(TaskManagerEvent::TaskQueued),
                                 Type = TaskStoreMaintenanceType::PurgeAccounts.as_str()
                             );
 
-                            batch.schedule_task(Task::StoreMaintenance(TaskStoreMaintenance {
+                            tasks.push(Task::StoreMaintenance(TaskStoreMaintenance {
                                 maintenance_type: TaskStoreMaintenanceType::PurgeAccounts,
                                 status: TaskStatus::now(),
                                 shard_index: None,
@@ -197,13 +211,13 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
                             Event::PurgeDataStore,
                         );
 
-                        if let Some(batch) = batch.as_mut() {
+                        if let Some(tasks) = tasks.as_mut() {
                             trc::event!(
                                 TaskManager(TaskManagerEvent::TaskQueued),
                                 Type = TaskStoreMaintenanceType::PurgeData.as_str()
                             );
 
-                            batch.schedule_task(Task::StoreMaintenance(TaskStoreMaintenance {
+                            tasks.push(Task::StoreMaintenance(TaskStoreMaintenance {
                                 maintenance_type: TaskStoreMaintenanceType::PurgeData,
                                 status: TaskStatus::now(),
                                 shard_index: None,
@@ -216,13 +230,13 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
                             Event::PurgeBlobStore,
                         );
 
-                        if let Some(batch) = batch.as_mut() {
+                        if let Some(tasks) = tasks.as_mut() {
                             trc::event!(
                                 TaskManager(TaskManagerEvent::TaskQueued),
                                 Type = TaskStoreMaintenanceType::PurgeBlob.as_str()
                             );
 
-                            batch.schedule_task(Task::StoreMaintenance(TaskStoreMaintenance {
+                            tasks.push(Task::StoreMaintenance(TaskStoreMaintenance {
                                 maintenance_type: TaskStoreMaintenanceType::PurgeBlob,
                                 status: TaskStatus::now(),
                                 shard_index: None,
@@ -237,7 +251,7 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
 
                         trc::event!(
                             Cluster(ClusterEvent::NodeIdRenewed),
-                            Id = server.registry().node_id()
+                            NodeId = server.registry().node_id()
                         );
 
                         let server = server.clone();
@@ -263,6 +277,10 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
 
                                 #[cfg(not(feature = "enterprise"))]
                                 let is_enterprise = false;
+
+                                if is_enterprise {
+                                    server.inner.refresh_live_gauges();
+                                }
 
                                 tokio::spawn(async move {
                                     let elapsed = Instant::now();
@@ -308,6 +326,61 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
                                             trc::error!(err.details("Failed to obtain queue size"));
                                         }
                                     }
+
+                                    match server.total_index_pending().await {
+                                        Ok(pending) => {
+                                            for (index, metric_type) in [
+                                                (
+                                                    SearchIndex::Email,
+                                                    MetricType::SearchIndexPendingEmail,
+                                                ),
+                                                (
+                                                    SearchIndex::Calendar,
+                                                    MetricType::SearchIndexPendingCalendar,
+                                                ),
+                                                (
+                                                    SearchIndex::Contacts,
+                                                    MetricType::SearchIndexPendingContacts,
+                                                ),
+                                                (
+                                                    SearchIndex::File,
+                                                    MetricType::SearchIndexPendingFile,
+                                                ),
+                                                (
+                                                    SearchIndex::Tracing,
+                                                    MetricType::SearchIndexPendingTracing,
+                                                ),
+                                            ] {
+                                                Collector::update_gauge(
+                                                    metric_type,
+                                                    pending[index.to_u8() as usize],
+                                                );
+                                            }
+                                        }
+                                        Err(err) => {
+                                            trc::error!(
+                                                err.details("Failed to obtain pending index size")
+                                            );
+                                        }
+                                    }
+
+                                    match server.total_tasks_pending().await {
+                                        Ok((pending, due)) => {
+                                            Collector::update_gauge(
+                                                MetricType::TaskManagerPending,
+                                                pending,
+                                            );
+                                            Collector::update_gauge(
+                                                MetricType::TaskManagerDue,
+                                                due,
+                                            );
+                                        }
+                                        Err(err) => {
+                                            trc::error!(
+                                                err.details("Failed to obtain pending task count")
+                                            );
+                                        }
+                                    }
                                 }
                                 // SPDX-SnippetEnd
 
@@ -342,6 +415,27 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
                                 }
                             }
 
+                            // SPDX-SnippetBegin
+                            // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                            // SPDX-License-Identifier: LicenseRef-SEL
+                            #[cfg(feature = "enterprise")]
+                            if server.is_enterprise_edition() {
+                                let caches = &server.inner.cache;
+                                Collector::update_gauge(
+                                    MetricType::CacheMessagesSize,
+                                    caches.messages_weight(),
+                                );
+                                Collector::update_gauge(
+                                    MetricType::CacheMessagesLargeSize,
+                                    caches.messages_large_weight(),
+                                );
+                                Collector::update_gauge(
+                                    MetricType::CacheSize,
+                                    caches.other_weight(),
+                                );
+                            }
+                            // SPDX-SnippetEnd
+
                             match tokio::task::spawn_blocking(memory_stats::memory_stats).await {
                                 Ok(Some(stats)) => {
                                     Collector::update_gauge(
@@ -367,26 +461,26 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
                         });
                     }
                     Event::TrainSpamClassifier => {
-                        if let Some(train_frequency) = server
+                        if let Some(train_interval) = server
                             .core
                             .spam
                             .classifier
                             .as_ref()
-                            .and_then(|c| c.train_frequency)
+                            .and_then(|c| c.train_interval)
                         {
                             // Schedule next training
                             queue.schedule(
-                                Instant::now() + Duration::from_secs(train_frequency),
+                                Instant::now() + Duration::from_secs(train_interval),
                                 Event::TrainSpamClassifier,
                             );
 
-                            if let Some(batch) = batch.as_mut() {
+                            if let Some(tasks) = tasks.as_mut() {
                                 trc::event!(
                                     TaskManager(TaskManagerEvent::TaskQueued),
                                     Type = TaskType::SpamFilterMaintenance.as_str()
                                 );
 
-                                batch.schedule_task(Task::SpamFilterMaintenance(
+                                tasks.push(Task::SpamFilterMaintenance(
                                     TaskSpamFilterMaintenance {
                                         maintenance_type: TaskSpamFilterMaintenanceType::Train,
                                         status: TaskStatus::now(),
@@ -413,10 +507,12 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
 
                             let metrics_store = server.core.storage.metrics.clone();
                             let metrics_history = metrics_history.clone();
+                            let node_id = server.core.network.node_id;
                             tokio::spawn(async move {
                                 let elapsed = Instant::now();
-                                if let Err(err) =
-                                    metrics_store.write_metrics(None, metrics_history).await
+                                if let Err(err) = metrics_store
+                                    .write_metrics(node_id, None, metrics_history)
+                                    .await
                                 {
                                     trc::error!(err.details("Failed to write metrics"));
                                 }
@@ -463,14 +559,14 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
                             Type = "validateLicense"
                         );
 
-                        match Box::pin(
-                            server.reload_registry(RegistryChange::Reload(ObjectType::Enterprise)),
-                        )
-                        .await
+                        let is_licensed = match server
+                            .reload_registry(RegistryChange::Reload(ObjectType::Enterprise))
+                            .await
                         {
                             Ok(result) => {
+                                result.log();
                                 if !result.has_errors() {
-                                    if let Some(enterprise) =
+                                    let is_licensed = if let Some(enterprise) =
                                         server.inner.build_server().core.enterprise.as_ref()
                                     {
                                         let renew_in = if enterprise.license.is_near_expiration() {
@@ -491,34 +587,79 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
                                             Instant::now() + renew_in,
                                             Event::RenewLicense,
                                         );
-                                    }
+                                        true
+                                    } else {
+                                        false
+                                    };
 
                                     server
                                         .cluster_broadcast(common::ipc::BroadcastEvent::reload(
                                             ObjectType::Enterprise,
                                         ))
                                         .await;
+                                    is_licensed
                                 } else {
-                                    result.log();
+                                    false
                                 }
                             }
                             Err(err) => {
                                 trc::error!(err.details("Failed to reload configuration."));
+                                false
                             }
+                        };
+
+                        if is_licensed {
+                            license_retry = LICENSE_RETRY_MIN;
+                        } else if has_license_api_key(&server).await {
+                            trc::event!(
+                                Server(trc::ServerEvent::Licensing),
+                                Details = "Enterprise license renewal failed, retrying",
+                                NextRetry = trc::Value::Timestamp(now() + license_retry.as_secs()),
+                            );
+                            queue.schedule(Instant::now() + license_retry, Event::RenewLicense);
+                            license_retry = (license_retry * 2).min(LICENSE_RETRY_MAX);
                         }
                     } // SPDX-SnippetEnd
                 }
             }
 
-            if let Some(mut batch) = batch
-                && !batch.is_empty()
-                && let Err(err) = server.store().write(batch.build_all()).await
-            {
-                trc::error!(err.details("Failed to write scheduled tasks"));
+            for task in tasks.into_iter().flatten() {
+                if let Err(err) = insert_task_if_absent(&server, task).await {
+                    trc::error!(err.details("Failed to write scheduled task"));
+                }
             }
         }
     });
 }
+
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
+#[cfg(feature = "enterprise")]
+const LICENSE_RETRY_MIN: Duration = Duration::from_secs(300);
+#[cfg(feature = "enterprise")]
+const LICENSE_RETRY_MAX: Duration = Duration::from_secs(3600);
+
+#[cfg(feature = "enterprise")]
+async fn has_license_api_key(server: &common::Server) -> bool {
+    match server
+        .registry()
+        .object::<registry::schema::structs::Enterprise>(types::id::Id::singleton())
+        .await
+    {
+        Ok(enterprise) => enterprise.is_some_and(|enterprise| {
+            !matches!(
+                enterprise.api_key,
+                registry::schema::structs::SecretKeyOptional::None
+            )
+        }),
+        Err(err) => {
+            trc::error!(err.details("Failed to read Enterprise settings."));
+            false
+        }
+    }
+}
+// SPDX-SnippetEnd
 
 impl Queue {
     pub fn schedule(&mut self, due: Instant, event: Event) {
@@ -527,7 +668,7 @@ impl Queue {
             Due = trc::Value::Timestamp(
                 now() + due.saturating_duration_since(Instant::now()).as_secs()
             ),
-            Id = event.name()
+            Name = event.name()
         );
 
         self.heap.push(Action { due, event });

@@ -6,11 +6,12 @@
 
 use crate::{
     auth::ScimConditional,
-    context::{ScimContext, account_of, revision_of, user_account},
+    context::{ScimContext, account_of, bounded, revision_of, user_account},
     error::{IntoScimError, Result, no_content},
     request::respond_with_etag,
     users,
 };
+use compact_str::ToCompactString;
 use http_proto::{HttpRequest, HttpResponse};
 use hyper::{StatusCode, header};
 use jmap::registry::mapping::principal::{AccountUpdate, validate_account};
@@ -82,6 +83,15 @@ impl ScimContext<'_> {
         let id = self.insert(&object, ResourceType::User).await?;
         object.revision = revision_of(&object);
 
+        trc::event!(
+            Scim(trc::ScimEvent::ResourceCreated),
+            SpanId = self.session_id,
+            AccountId = self.access_token.account_id(),
+            Type = ResourceType::User.as_str(),
+            Id = id.to_compact_string(),
+            Name = bounded(user_name),
+        );
+
         Ok((id, object))
     }
 
@@ -137,7 +147,20 @@ impl ScimContext<'_> {
             self.assert_not_service_principal(id)?;
         }
 
-        self.user_write(id, account, old_object).await
+        let updated = self.user_write(id, account, old_object).await?;
+
+        if updated.is_some() {
+            trc::event!(
+                Scim(trc::ScimEvent::ResourceUpdated),
+                SpanId = self.session_id,
+                AccountId = self.access_token.account_id(),
+                Type = ResourceType::User.as_str(),
+                Id = id.to_compact_string(),
+                Name = bounded(user_name),
+            );
+        }
+
+        Ok(updated)
     }
 
     async fn apply_user(
@@ -195,7 +218,17 @@ impl ScimContext<'_> {
         self.assert_not_service_principal(id)?;
 
         user_account(object)?;
-        self.delete(id, object).await
+        self.delete(id, object).await?;
+
+        trc::event!(
+            Scim(trc::ScimEvent::ResourceDeleted),
+            SpanId = self.session_id,
+            AccountId = self.access_token.account_id(),
+            Type = ResourceType::User.as_str(),
+            Id = id.to_compact_string(),
+        );
+
+        Ok(())
     }
 
     pub async fn user_write(

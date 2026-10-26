@@ -14,18 +14,24 @@ use jmap_proto::error::set::SetError;
 use registry::{schema::structs::TaskStatus, types::datetime::UTCDateTime};
 use registry::{
     schema::{
-        enums::{AccountType, Permission, TenantStorageQuota},
+        enums::{AccountType, Permission},
         prelude::{MASKED_PASSWORD, ObjectType, Property},
         structs::{Account, Credential, Role, Task, TaskDestroyAccount},
     },
     types::EnumImpl,
 };
-use store::{
-    registry::{RegistryObjectCounter, RegistryQuery},
-    write::{BatchBuilder, RegistryClass, ValueClass, now},
-};
+use store::write::{BatchBuilder, RegistryClass, ValueClass, now};
 use trc::AddContext;
 use types::id::Id;
+
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
+#[cfg(feature = "enterprise")]
+use registry::schema::{enums::TenantStorageQuota, prelude::ObjectInner};
+#[cfg(feature = "enterprise")]
+use store::registry::{RegistryObjectCounter, RegistryQuery};
+// SPDX-SnippetEnd
 
 #[derive(Clone, Copy)]
 pub enum AccountUpdate<'x> {
@@ -74,6 +80,12 @@ pub async fn validate_account(
         None
     };
 
+    if let AccountUpdate::Update(old_account) = old_account
+        && let Err(err) = validate_account_access(server, access_token, old_account).await?
+    {
+        return Ok(Err(err));
+    }
+
     let validate_permissions = match (&mut account, old_account) {
         (Account::User(account), AccountUpdate::Update(Account::User(old_account))) => {
             // Validate credentials
@@ -111,11 +123,11 @@ pub async fn validate_account(
                                     credential.secret = old_credential.secret.clone();
                                 }
                                 if credential
-                                    .otp_auth
+                                    .otp_url
                                     .as_ref()
-                                    .is_some_and(|otp_auth| otp_auth == MASKED_PASSWORD)
+                                    .is_some_and(|otp_url| otp_url == MASKED_PASSWORD)
                                 {
-                                    credential.otp_auth = old_credential.otp_auth.clone();
+                                    credential.otp_url = old_credential.otp_url.clone();
                                 }
 
                                 if credential.secret != old_credential.secret {
@@ -145,6 +157,7 @@ pub async fn validate_account(
                                         }
 
                                         credential.secret = hash_secret(
+                                            &server.inner.data.password_verifier,
                                             server.core.network.security.password_hash_algorithm,
                                             std::mem::take(&mut credential.secret).into_bytes(),
                                         )
@@ -208,13 +221,6 @@ pub async fn validate_account(
             account.permissions != old_account.permissions || account.roles != old_account.roles
         }
         (Account::User(account), AccountUpdate::Create(_)) => {
-            // Validate tenant quotas
-            if let Err(err) =
-                validate_tenant_quota(server, access_token, TenantStorageQuota::MaxAccounts).await?
-            {
-                return Ok(Err(err));
-            }
-
             // Validate credentials
             for (index, credential) in account.credentials.values_mut().enumerate() {
                 if let Err(err) = validate_credential_creation(
@@ -232,16 +238,7 @@ pub async fn validate_account(
 
             true
         }
-        (Account::Group(_), AccountUpdate::Create(_)) => {
-            // Validate tenant quotas
-            if let Err(err) =
-                validate_tenant_quota(server, access_token, TenantStorageQuota::MaxGroups).await?
-            {
-                return Ok(Err(err));
-            }
-
-            true
-        }
+        (Account::Group(_), AccountUpdate::Create(_)) => true,
         (Account::User(_), AccountUpdate::Update(Account::Group(_)))
         | (Account::Group(_), AccountUpdate::Update(Account::User(_))) => {
             return Ok(Err(SetError::invalid_properties()
@@ -270,6 +267,17 @@ pub async fn validate_account(
     }
 
     result
+}
+
+pub async fn validate_account_access(
+    server: &Server,
+    access_token: &AccessToken,
+    account: &Account,
+) -> trc::Result<Result<(), SetError<Property>>> {
+    server
+        .can_set_permissions(access_token, account)
+        .await
+        .map(|result| result.map_err(build_set_error))
 }
 
 async fn validate_credential_creation(
@@ -307,6 +315,7 @@ async fn validate_credential_creation(
                     .with_description(err)))
             } else {
                 credential.secret = hash_secret(
+                    &server.inner.data.password_verifier,
                     server.core.network.security.password_hash_algorithm,
                     std::mem::take(&mut credential.secret).into_bytes(),
                 )
@@ -325,21 +334,12 @@ async fn validate_credential_creation(
     }
 }
 
+#[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
 pub(crate) async fn validate_role(
-    server: &Server,
     access_token: &AccessToken,
     role: &mut Role,
     old_role: Option<&Role>,
 ) -> ValidationResult {
-    if old_role.is_none() {
-        // Validate tenant quotas
-        if let Err(err) =
-            validate_tenant_quota(server, access_token, TenantStorageQuota::MaxRoles).await?
-        {
-            return Ok(Err(err));
-        }
-    }
-
     if old_role.is_none_or(|old_role| {
         old_role.enabled_permissions != role.enabled_permissions
             || old_role.disabled_permissions != role.disabled_permissions
@@ -365,12 +365,31 @@ pub(crate) async fn validate_role(
 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
 // SPDX-License-Identifier: LicenseRef-SEL
 #[cfg(feature = "enterprise")]
+pub fn tenant_object_quota(object: &ObjectInner) -> Option<TenantStorageQuota> {
+    match object {
+        ObjectInner::Account(account) => Some(match account.as_ref() {
+            Account::User(_) => TenantStorageQuota::MaxAccounts,
+            Account::Group(_) => TenantStorageQuota::MaxGroups,
+        }),
+        ObjectInner::Domain(_) => Some(TenantStorageQuota::MaxDomains),
+        ObjectInner::MailingList(_) => Some(TenantStorageQuota::MaxMailingLists),
+        ObjectInner::Role(_) => Some(TenantStorageQuota::MaxRoles),
+        ObjectInner::OAuthClient(_) => Some(TenantStorageQuota::MaxOauthClients),
+        ObjectInner::DkimSignature(_) => Some(TenantStorageQuota::MaxDkimKeys),
+        ObjectInner::DnsServer(_) => Some(TenantStorageQuota::MaxDnsServers),
+        ObjectInner::Directory(_) => Some(TenantStorageQuota::MaxDirectories),
+        ObjectInner::AcmeProvider(_) => Some(TenantStorageQuota::MaxAcmeProviders),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "enterprise")]
 pub async fn validate_tenant_quota(
     server: &Server,
-    access_token: &AccessToken,
+    tenant_id: Option<u32>,
     quota: TenantStorageQuota,
 ) -> ValidationResult {
-    if let Some(tenant_id) = access_token.tenant_id() {
+    if let Some(tenant_id) = tenant_id {
         let tenant = server.tenant(tenant_id).await?;
         if let Some(quotas) = tenant
             .quota_objects
@@ -429,15 +448,6 @@ pub async fn validate_tenant_quota(
 }
 // SPDX-SnippetEnd
 
-#[cfg(not(feature = "enterprise"))]
-pub async fn validate_tenant_quota(
-    _server: &Server,
-    _access_token: &AccessToken,
-    _quota: TenantStorageQuota,
-) -> ValidationResult {
-    ValidationResult::Ok(Ok(ObjectResponse::default()))
-}
-
 pub async fn schedule_account_destruction(
     server: &Server,
     account_id: Id,
@@ -459,9 +469,19 @@ pub async fn schedule_account_destruction(
     #[cfg(not(feature = "enterprise"))]
     let status = TaskStatus::now();
 
-    let (account_domain_id, account_name, account_type) = match account {
-        Account::User(account) => (account.domain_id, account.name.clone(), AccountType::User),
-        Account::Group(account) => (account.domain_id, account.name.clone(), AccountType::Group),
+    let (account_domain_id, account_name, account_type, member_group_ids) = match account {
+        Account::User(account) => (
+            account.domain_id,
+            account.name.clone(),
+            AccountType::User,
+            account.member_group_ids.clone(),
+        ),
+        Account::Group(account) => (
+            account.domain_id,
+            account.name.clone(),
+            AccountType::Group,
+            Default::default(),
+        ),
     };
 
     let mut batch = BatchBuilder::new();
@@ -470,11 +490,11 @@ pub async fn schedule_account_destruction(
         account_id,
         account_name,
         account_type,
+        member_group_ids,
         status,
     }));
 
-    server.store().write(batch.build_all()).await?;
-    server.notify_task_queue();
+    server.commit_batch(batch).await?;
 
     Ok(())
 }
@@ -517,9 +537,9 @@ async fn restore_account_id(server: &Server, id: u32) -> trc::Result<()> {
         );
         let last_id = server
             .store()
-            .write(id_batch.build_all())
-            .await
-            .and_then(|v| v.last_counter_id())?;
+            .write_batch(&mut id_batch)
+            .await?
+            .last_counter_id();
 
         if last_id < id as i64 {
             return Err(trc::StoreEvent::UnexpectedError

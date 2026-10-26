@@ -58,7 +58,7 @@ impl ScimType {
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        hashify::tiny_map!(value.as_bytes(),
+        hashify::map!(value.as_bytes(), ScimType,
             "invalidFilter" => ScimType::InvalidFilter,
             "tooMany" => ScimType::TooMany,
             "uniqueness" => ScimType::Uniqueness,
@@ -73,6 +73,7 @@ impl ScimType {
             "expiredCursor" => ScimType::ExpiredCursor,
             "invalidCount" => ScimType::InvalidCount,
         )
+        .copied()
     }
 }
 
@@ -330,74 +331,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn serialize_error() {
-        let error = Error::uniqueness("A user with userName 'alice@corp.example' already exists");
-
-        assert_eq!(
-            serde_json::to_value(&error).unwrap(),
-            serde_json::json!({
-                "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
-                "scimType": "uniqueness",
-                "detail": "A user with userName 'alice@corp.example' already exists",
-                "status": "409"
-            })
-        );
-    }
-
-    #[test]
-    fn status_is_serialized_as_a_string() {
-        let json = serde_json::to_string(&Error::not_found()).unwrap();
-
-        assert!(json.contains(r#""status":"404""#), "{json}");
-        assert!(!json.contains("scimType"), "{json}");
-        assert!(!json.contains("detail"), "{json}");
-    }
-
-    #[test]
-    fn round_trip() {
-        for error in [
-            Error::not_found(),
-            Error::invalid_filter("Unsupported operator 'co'"),
-            Error::uniqueness("duplicate"),
-            Error::max_payload_size_exceeded(1048576),
-        ] {
-            let json = serde_json::to_string(&error).unwrap();
-            assert_eq!(serde_json::from_str::<Error>(&json).unwrap(), error);
-        }
-    }
-
-    #[test]
-    fn deserialize_numeric_status() {
-        let error =
-            serde_json::from_str::<Error>(r#"{"status": 404, "scimType": "invalidPath"}"#).unwrap();
-
-        assert_eq!(error.status, 404);
-        assert_eq!(error.scim_type, Some(ScimType::InvalidPath));
-    }
-
-    #[test]
-    fn scim_type_names() {
-        for scim_type in [
-            ScimType::InvalidFilter,
-            ScimType::TooMany,
-            ScimType::Uniqueness,
-            ScimType::Mutability,
-            ScimType::InvalidSyntax,
-            ScimType::InvalidPath,
-            ScimType::NoTarget,
-            ScimType::InvalidValue,
-            ScimType::InvalidVers,
-            ScimType::Sensitive,
-            ScimType::InvalidCursor,
-            ScimType::ExpiredCursor,
-            ScimType::InvalidCount,
-        ] {
-            assert_eq!(ScimType::parse(scim_type.as_str()), Some(scim_type));
-        }
-    }
-}
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/scim-proto/src/message/error/tests.rs"]
+mod tests;

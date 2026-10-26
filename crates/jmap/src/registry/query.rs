@@ -10,12 +10,14 @@ use crate::{
         EnterpriseRegistry,
         mapping::{
             RegistryQueryResponse, account::credential_query, cluster::cluster_node_query,
-            log::log_query, queued_message::queued_message_query, report::report_query,
+            index_queue::index_queue_status_query, log::log_query,
+            queued_message::queued_message_query, report::report_query,
             spam_sample::spam_sample_query, task::task_query,
         },
     },
 };
 use common::{Server, auth::AccessToken};
+use compact_str::format_compact;
 use jmap_proto::{
     method::query::{Comparator, Filter, QueryRequest, QueryResponse},
     object::registry::{Registry, RegistryComparator, RegistryFilter, RegistryFilterOperator},
@@ -148,6 +150,15 @@ impl RegistryQuery for Server {
                 .and_then(|response| response.build())
             }
 
+            ObjectType::IndexQueueStatus => index_queue_status_query(RegistryQueryResponse {
+                server: self,
+                access_token,
+                object_type,
+                request,
+            })
+            .await
+            .and_then(|response| response.build()),
+
             ObjectType::Task => task_query(RegistryQueryResponse {
                 server: self,
                 access_token,
@@ -171,15 +182,27 @@ impl RegistryQuery for Server {
                 .details("Actions cannot be queried")),
 
             _ => {
-                let mut query = store::registry::RegistryQuery::new(object_type)
-                    .with_tenant(access_token.tenant_id());
+                let mut query = store::registry::RegistryQuery::new(object_type);
+                // SPDX-SnippetBegin
+                // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                // SPDX-License-Identifier: LicenseRef-SEL
+                #[cfg(feature = "enterprise")]
+                {
+                    query = query.with_tenant(access_token.tenant_id());
+                }
+                // SPDX-SnippetEnd
                 let can_impersonate = access_token.has_permission(Permission::Impersonate);
                 if !can_impersonate {
                     query = query.with_account(request.account_id.document_id());
                 }
                 let indexes = object_type.indexes();
                 request.extract_filters(|property, op, value| match property {
+                    // SPDX-SnippetBegin
+                    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                    // SPDX-License-Identifier: LicenseRef-SEL
+                    #[cfg(feature = "enterprise")]
                     Property::MemberTenantId if access_token.tenant_id().is_some() => true,
+                    // SPDX-SnippetEnd
                     Property::AccountId if !can_impersonate => true,
                     property => {
                         let Some(index) = indexes.iter().find(|i| i.prop == property) else {
@@ -240,27 +263,27 @@ impl RegistryQuery for Server {
 
                 let params = request
                     .extract_parameters(self.core.jmap.query_max_results, Some(Property::Id))?;
-                if let Some(limit) = params.limit {
-                    query = query.with_limit(limit);
-                    if let Some(anchor) = params.anchor {
-                        query = query.with_anchor(anchor);
-                    } else if let Some(position) = params.position {
-                        query = query.with_index_start(position);
-                    }
-                }
 
+                let mut position = None;
                 let matches = if query.has_filters() || params.sort_by == Property::Id {
-                    let matches = self.registry().query::<Vec<Id>>(query).await?;
-                    if matches.is_empty() {
-                        return QueryResponseBuilder::new(
-                            0,
-                            self.core.jmap.query_max_results,
-                            State::Initial,
-                            &request,
+                    let page = self
+                        .registry()
+                        .query_page::<Vec<Id>>(params.paged(query))
+                        .await?;
+                    position = params.page_position(page.position)?;
+                    if page.ids.is_empty() {
+                        return with_page_position(
+                            QueryResponseBuilder::new(
+                                0,
+                                self.core.jmap.query_max_results,
+                                State::Initial,
+                                &request,
+                            ),
+                            position,
                         )
                         .build();
                     }
-                    matches.into()
+                    page.ids.into()
                 } else {
                     None
                 };
@@ -268,7 +291,7 @@ impl RegistryQuery for Server {
                 let results = match params.sort_by {
                     Property::Id => {
                         let mut results = matches.unwrap();
-                        if !params.sort_ascending {
+                        if params.needs_reversal() {
                             results.sort_unstable_by(|a, b| b.cmp(a));
                         }
                         results
@@ -279,7 +302,10 @@ impl RegistryQuery for Server {
                             .find(|i| i.prop == property && i.value != IndexSchemaValueType::Text)
                         else {
                             return Err(trc::JmapEvent::UnsupportedSort.into_err().details(
-                                format!("Property {} is not supported for sorting", property),
+                                format_compact!(
+                                    "Property {} is not supported for sorting",
+                                    property
+                                ),
                             ));
                         };
 
@@ -301,11 +327,14 @@ impl RegistryQuery for Server {
                 };
 
                 // Build response
-                let mut response = QueryResponseBuilder::new(
-                    results.len(),
-                    self.core.jmap.query_max_results,
-                    State::Initial,
-                    &request,
+                let mut response = with_page_position(
+                    QueryResponseBuilder::new(
+                        results.len(),
+                        self.core.jmap.query_max_results,
+                        State::Initial,
+                        &request,
+                    ),
+                    position,
                 );
 
                 for id in results {
@@ -341,6 +370,47 @@ pub(crate) struct RegistryQueryParameters {
     pub limit: Option<usize>,
 }
 
+impl RegistryQueryParameters {
+    pub fn paged(&self, query: store::registry::RegistryQuery) -> store::registry::RegistryQuery {
+        let Some(limit) = self.limit else {
+            return query;
+        };
+        let query = query.with_limit(limit);
+        let query = if self.sort_ascending {
+            query.with_ascending()
+        } else {
+            query.with_descending()
+        };
+        match (self.anchor, self.position) {
+            (Some(anchor), _) => query.with_anchor(anchor),
+            (None, Some(position)) => query.with_index_start(position),
+            (None, None) => query,
+        }
+    }
+
+    pub fn page_position(&self, position: Option<usize>) -> trc::Result<Option<usize>> {
+        match (self.limit, position) {
+            (None, _) => Ok(None),
+            (Some(_), Some(position)) => Ok(Some(position)),
+            (Some(_), None) => Err(trc::JmapEvent::AnchorNotFound.into_err()),
+        }
+    }
+
+    pub fn needs_reversal(&self) -> bool {
+        !self.sort_ascending && self.limit.is_none()
+    }
+}
+
+pub(crate) fn with_page_position(
+    response: QueryResponseBuilder,
+    position: Option<usize>,
+) -> QueryResponseBuilder {
+    match position {
+        Some(position) => response.with_position(position),
+        None => response,
+    }
+}
+
 impl RegistryQueryFilters for QueryRequest<Registry> {
     fn extract_filters(
         &mut self,
@@ -367,7 +437,7 @@ impl RegistryQueryFilters for QueryRequest<Registry> {
                         };
                         if !cb(property, operator, value) {
                             return Err(trc::JmapEvent::UnsupportedFilter.into_err().details(
-                                format!(
+                                format_compact!(
                                     "Filter on property {} is not supported or invalid",
                                     property
                                 ),
@@ -375,16 +445,14 @@ impl RegistryQueryFilters for QueryRequest<Registry> {
                         }
                     }
                     RegistryFilter::_T(other) => {
-                        return Err(trc::JmapEvent::UnsupportedFilter
-                            .into_err()
-                            .details(other.to_string()));
+                        return Err(trc::JmapEvent::UnsupportedFilter.into_err().details(other));
                     }
                 },
                 Filter::And | Filter::Close => {}
                 Filter::Or | Filter::Not => {
                     return Err(trc::JmapEvent::UnsupportedFilter
                         .into_err()
-                        .details("Only AND is supported in filters".to_string()));
+                        .details("Only AND is supported in filters"));
                 }
             }
         }
@@ -397,15 +465,6 @@ impl RegistryQueryFilters for QueryRequest<Registry> {
         max_results: usize,
         external_filter: Option<Property>,
     ) -> trc::Result<RegistryQueryParameters> {
-        #[cfg(feature = "test_mode")]
-        let comparator = self
-            .sort
-            .take()
-            .unwrap_or_default()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| Comparator::ascending(RegistryComparator::Property(Property::Id)));
-        #[cfg(not(feature = "test_mode"))]
         let comparator = self
             .sort
             .take()
@@ -419,7 +478,7 @@ impl RegistryQueryFilters for QueryRequest<Registry> {
                 if external_filter.is_some_and(|f| f == property)
                     && !self.calculate_total.unwrap_or(false)
                     && self.anchor_offset.is_none_or(|offset| offset == 0)
-                    && self.position.is_none_or(|pos| pos > 0)
+                    && self.position.is_none_or(|pos| pos >= 0)
                 {
                     Ok(RegistryQueryParameters {
                         sort_by: property,
@@ -445,7 +504,10 @@ impl RegistryQueryFilters for QueryRequest<Registry> {
             }
             RegistryComparator::_T(other) => Err(trc::JmapEvent::UnsupportedSort
                 .into_err()
-                .details(format!("Property {} is not supported for sorting", other))),
+                .details(format_compact!(
+                    "Property {} is not supported for sorting",
+                    other
+                ))),
         }
     }
 }

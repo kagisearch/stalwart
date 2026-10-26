@@ -10,15 +10,18 @@ use common::{
     Server,
     auth::{AccessToken, DomainCache, Permissions},
 };
+use compact_str::CompactString;
+use jmap::registry::mapping::principal::{schedule_account_destruction, validate_account_access};
 use registry::{
     schema::{
         enums::Permission,
-        prelude::{Object, ObjectType},
+        prelude::{Object, ObjectInner, ObjectType},
         structs::{Account, GroupAccount, UserAccount, UserRoles},
     },
     types::id::ObjectId,
 };
 use scim_proto::{BASE_PATH, ResourceType, message::error::Error};
+use services::task_manager::tasks::rebuild_shares::RevokeAccountGrants;
 use std::{fmt::Write, sync::Arc};
 use store::registry::write::{RegistryWrite, RegistryWriteResult};
 use trc::AddContext;
@@ -275,13 +278,25 @@ impl ScimContext<'_> {
     }
 
     pub async fn delete(&self, id: Id, object: &Object) -> Result<()> {
+        if let ObjectInner::Account(account) = &object.inner
+            && let Err(err) = validate_account_access(self.server, self.access_token, account)
+                .await
+                .caused_by(trc::location!())?
+        {
+            return Err(err.into_scim_error().into());
+        }
+
         match self
             .server
             .registry()
             .write(RegistryWrite::Delete {
                 object_id: ObjectId::new(ObjectType::Account, id),
                 object: Some(object),
-                allowed_orphan_types: &[ObjectType::PublicKey, ObjectType::MaskedEmail],
+                allowed_orphan_types: &[
+                    ObjectType::PublicKey,
+                    ObjectType::MaskedEmail,
+                    ObjectType::OAuthGrant,
+                ],
             })
             .await
             .caused_by(trc::location!())?
@@ -290,22 +305,19 @@ impl ScimContext<'_> {
                 let mut invalidator = CacheInvalidationBuilder::default();
                 for sharee_id in self
                     .server
-                    .store()
-                    .acl_revoke_all(id.document_id())
+                    .revoke_account_grants(id.document_id())
                     .await
                     .caused_by(trc::location!())?
                 {
-                    invalidator.invalidate(common::ipc::CacheInvalidation::AccessToken(sharee_id));
+                    self.server
+                        .invalidate_grantee(&mut invalidator, sharee_id)
+                        .await;
                 }
 
-                if let registry::schema::prelude::ObjectInner::Account(account) = &object.inner {
-                    jmap::registry::mapping::principal::schedule_account_destruction(
-                        self.server,
-                        id,
-                        account,
-                    )
-                    .await
-                    .caused_by(trc::location!())?;
+                if let ObjectInner::Account(account) = &object.inner {
+                    schedule_account_destruction(self.server, id, account)
+                        .await
+                        .caused_by(trc::location!())?;
                 }
 
                 invalidator.process_delete(id, object);
@@ -318,6 +330,12 @@ impl ScimContext<'_> {
             result => Err(result.into_scim_error().into()),
         }
     }
+}
+
+pub const MAX_LOGGED_LEN: usize = 256;
+
+pub fn bounded(value: &str) -> CompactString {
+    value[..value.floor_char_boundary(MAX_LOGGED_LEN)].into()
 }
 
 pub fn parse_id(value: &str) -> Result<Id> {
@@ -333,14 +351,9 @@ pub fn revision_of(object: &Object) -> u64 {
 }
 
 pub fn account_domain_id(object: &Object) -> Option<Id> {
-    match &object.inner {
-        registry::schema::prelude::ObjectInner::Account(Account::User(account)) => {
-            Some(account.domain_id)
-        }
-        registry::schema::prelude::ObjectInner::Account(Account::Group(account)) => {
-            Some(account.domain_id)
-        }
-        _ => None,
+    match account_of(object).ok()? {
+        Account::User(account) => Some(account.domain_id),
+        Account::Group(account) => Some(account.domain_id),
     }
 }
 
@@ -352,50 +365,20 @@ pub fn account_of(object: &Object) -> Result<&Account> {
 }
 
 pub fn user_account(object: &Object) -> Result<&UserAccount> {
-    match &object.inner {
-        registry::schema::prelude::ObjectInner::Account(Account::User(account)) => Ok(account),
-        _ => Err(Error::not_found().into()),
+    match account_of(object)? {
+        Account::User(account) => Ok(account),
+        Account::Group(_) => Err(Error::not_found().into()),
     }
 }
 
 pub fn group_account(object: &Object) -> Result<&GroupAccount> {
-    match &object.inner {
-        registry::schema::prelude::ObjectInner::Account(Account::Group(account)) => Ok(account),
-        _ => Err(Error::not_found().into()),
+    match account_of(object)? {
+        Account::Group(account) => Ok(account),
+        Account::User(_) => Err(Error::not_found().into()),
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_id;
-    use types::id::Id;
-
-    #[test]
-    fn identifiers_round_trip() {
-        for id in [0u64, 1, 42, 1 << 32, u64::MAX] {
-            let id = Id::new(id);
-
-            assert_eq!(parse_id(&id.to_string()).unwrap(), id);
-        }
-    }
-
-    #[test]
-    fn identifiers_are_case_exact() {
-        let id = Id::new(12345);
-        let rendered = id.to_string();
-
-        assert!(parse_id(&rendered.to_uppercase()).is_err(), "{rendered}");
-    }
-
-    #[test]
-    fn overflowing_identifiers_are_rejected() {
-        for value in [
-            "",
-            "!",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "vvvvvvvvvvvvvvvv",
-        ] {
-            assert!(parse_id(value).is_err(), "{value}");
-        }
-    }
-}
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../stalwart-tests/unit/scim/src/context/tests.rs"]
+mod tests;

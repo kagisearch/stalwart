@@ -6,15 +6,17 @@
 
 use crate::{
     auth::ScimConditional,
-    context::{ScimContext, group_account, parse_id},
+    context::{ScimContext, bounded, group_account, parse_id},
     error::Result,
     groups,
     request::respond_with_etag,
 };
+use compact_str::ToCompactString;
 use http_proto::{HttpRequest, HttpResponse};
 use hyper::StatusCode;
 use registry::schema::{enums::Permission, prelude::Object, structs::GroupAccount};
 use scim_proto::{
+    ResourceType,
     etag::weak_etag,
     filter::EqualityTerm,
     message::{
@@ -85,13 +87,34 @@ impl ScimContext<'_> {
         let object = match self.group_write(id, account, old_object).await {
             Ok(object) => object,
             Err(error) => {
-                self.set_members(id, &current_members, &member_ids)
-                    .await
-                    .ok();
+                if let Err(rollback) = self.set_members(id, &current_members, &member_ids).await {
+                    trc::event!(
+                        Scim(trc::ScimEvent::RollbackFailed),
+                        SpanId = self.session_id,
+                        AccountId = self.access_token.account_id(),
+                        Type = ResourceType::Group.as_str(),
+                        Id = id.to_compact_string(),
+                        Reason = bounded(&rollback.to_compact_string()),
+                    );
+                }
 
                 return Err(error);
             }
         };
+
+        if object.is_some() || groups::members_changed(&current_members, &member_ids) {
+            trc::event!(
+                Scim(trc::ScimEvent::ResourceUpdated),
+                SpanId = self.session_id,
+                AccountId = self.access_token.account_id(),
+                Type = ResourceType::Group.as_str(),
+                Id = id.to_compact_string(),
+                Name = group_account(object.as_ref().unwrap_or(old_object))
+                    .ok()
+                    .map(|account| bounded(groups::display_name(account))),
+                Total = member_ids.len(),
+            );
+        }
 
         Ok((object, member_ids))
     }
@@ -108,6 +131,15 @@ impl ScimContext<'_> {
             .iter()
             .any(|name| path.attr.eq_ignore_ascii_case(name))
         {
+            trc::event!(
+                Scim(trc::ScimEvent::AttributeIgnored),
+                SpanId = self.session_id,
+                AccountId = self.access_token.account_id(),
+                Type = ResourceType::Group.as_str(),
+                Id = id.to_compact_string(),
+                Property = bounded(&path.to_compact_string()),
+            );
+
             return Ok(());
         }
 
@@ -293,45 +325,7 @@ fn value_as_str<'x>(operation: &'x PatchOperation<'x>) -> Result<&'x str> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use scim_proto::filter::Filter;
-
-    fn parse_terms(filter: &str) -> Vec<EqualityTerm<'static>> {
-        Filter::parse(filter)
-            .unwrap()
-            .into_owned()
-            .into_equality_terms()
-            .unwrap()
-    }
-
-    #[test]
-    fn member_filters_select_by_identifier() {
-        let member = Id::new(42);
-        let terms = parse_terms(&format!(r#"value eq "{member}""#));
-
-        assert!(matches(&terms, member).unwrap());
-        assert!(!matches(&terms, Id::new(43)).unwrap());
-    }
-
-    #[test]
-    fn member_filters_accept_the_user_type() {
-        let member = Id::new(42);
-
-        assert!(matches(&parse_terms(r#"type eq "User""#), member).unwrap());
-        assert!(matches(&parse_terms(r#"type eq "user""#), member).unwrap());
-        assert!(!matches(&parse_terms(r#"type eq "Group""#), member).unwrap());
-    }
-
-    #[test]
-    fn unsupported_sub_attributes_never_match() {
-        assert!(!matches(&parse_terms(r#"display eq "Babs""#), Id::new(42)).unwrap());
-        assert!(matches(&parse_terms(r#"nosuch eq "x""#), Id::new(42)).is_err());
-    }
-
-    #[test]
-    fn a_malformed_identifier_never_matches() {
-        assert!(!matches(&parse_terms(r#"value eq "!!!""#), Id::new(42)).unwrap());
-    }
-}
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/scim/src/groups/patch/tests.rs"]
+mod tests;

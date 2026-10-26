@@ -21,7 +21,7 @@
         { pkgs, system, ... }:
         let
           # Pinned to match the CI images (Dockerfile / Dockerfile.build).
-          rustToolchain = pkgs.rust-bin.stable."1.96.0".default.override {
+          rustToolchain = pkgs.rust-bin.stable."1.98.0".default.override {
             extensions = [
               "rust-src"
               "rust-analyzer"

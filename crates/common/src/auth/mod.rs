@@ -5,10 +5,18 @@
  */
 
 use crate::{
+    auth::{active_script::ActiveScriptSlot, oauth::scope::OAuthScopes},
     expr::if_block::IfBlock,
-    network::limiter::ConcurrencyLimiter,
-    storage::{ObjectQuota, TenantQuota},
+    network::limiter::AccountLimits,
+    storage::ObjectQuota,
 };
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
+#[cfg(feature = "enterprise")]
+use crate::storage::TenantQuota;
+// SPDX-SnippetEnd
+use compact_str::CompactString;
 use directory::Credentials;
 use quick_cache::Equivalent;
 use registry::{
@@ -26,19 +34,21 @@ use types::collection::Collection;
 use utils::{cache::CacheItemWeight, map::bitmap::Bitmap};
 
 pub mod access_token;
+pub mod active_script;
 pub mod authentication;
 pub mod credential;
 pub mod oauth;
 pub mod permissions;
 pub mod rate_limit;
+pub mod sasl;
 
 pub const RECOVERY_ADMIN_ID: u32 = u32::MAX;
-const PERMISSIONS_BITSET_SIZE: usize = Permission::COUNT.div_ceil(std::mem::size_of::<usize>());
+const PERMISSIONS_BITSET_SIZE: usize = Permission::COUNT.div_ceil(std::mem::size_of::<usize>() * 8);
 pub type Permissions = Bitset<PERMISSIONS_BITSET_SIZE>;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct EmailAddress {
-    pub local_part: Box<str>,
+    pub local_part: CompactString,
     pub domain_id: u32,
 }
 
@@ -60,8 +70,14 @@ pub enum EmailCache {
 pub struct DomainCache {
     pub names: Box<[Box<str>]>,
     pub id: u32,
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     pub id_directory: Option<u32>,
+    #[cfg(feature = "enterprise")]
     pub id_tenant: Option<u32>,
+    // SPDX-SnippetEnd
     pub catch_all: Option<Box<str>>,
     pub sub_addressing_custom: Option<Box<IfBlock>>,
     pub flags: u8,
@@ -81,14 +97,41 @@ pub struct AccountCache {
     pub name: Box<str>,
     pub id: u32,
     pub addresses: Box<[EmailAddress]>,
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     pub id_tenant: Option<u32>,
-    pub id_member_of: TinyVec<[u32; 3]>,
+    // SPDX-SnippetEnd
+    pub id_member_of: Box<[u32]>,
     pub quota_disk: u64,
-    pub quota_objects: Option<Box<ObjectQuota>>,
     pub description: Option<Box<str>>,
-    pub encryption_key: Option<EncryptionKeys>,
+    pub storage: Option<Box<AccountStorage>>,
     pub locale: Locale,
     pub flags: u64,
+    pub active_script: ActiveScriptSlot,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AccountStorage {
+    pub quota_objects: Option<ObjectQuota>,
+    pub encryption_key: Option<EncryptionKeys>,
+}
+
+const _: () = assert!(size_of::<AccountCache>() <= 112);
+
+impl AccountStorage {
+    pub fn boxed(
+        quota_objects: Option<ObjectQuota>,
+        encryption_key: Option<EncryptionKeys>,
+    ) -> Option<Box<Self>> {
+        (quota_objects.is_some() || encryption_key.is_some()).then(|| {
+            Box::new(AccountStorage {
+                quota_objects,
+                encryption_key,
+            })
+        })
+    }
 }
 
 pub type EncryptionKeys = Box<[Box<[u8]>]>;
@@ -115,6 +158,10 @@ pub struct MailingListCache {
     pub recipients: Arc<[Box<str>]>,
 }
 
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
+#[cfg(feature = "enterprise")]
 #[derive(Debug, Clone)]
 pub struct TenantCache {
     pub id_roles: TinyVec<[u32; 3]>,
@@ -122,6 +169,7 @@ pub struct TenantCache {
     pub quota_objects: Option<Box<TenantQuota>>,
     pub permissions: Option<Box<PermissionsGroup>>,
 }
+// SPDX-SnippetEnd
 
 #[derive(Debug, Clone, Default)]
 pub struct PermissionsGroup {
@@ -134,23 +182,50 @@ pub struct PermissionsGroup {
 pub struct AccessToken {
     scope_idx: usize,
     inner: Arc<AccessTokenInner>,
+    token_scope: Option<TokenScope>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenScope {
+    Grant {
+        grant_id: u64,
+        scopes: OAuthScopes,
+        client: GrantClient,
+    },
+    External {
+        scopes: OAuthScopes,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantClient {
+    FirstParty,
+    ThirdParty,
+}
+
+const _: () = assert!(size_of::<TokenScope>() <= 16);
+const _: () = assert!(size_of::<Option<TokenScope>>() <= 16);
 
 #[derive(Debug, Default, Clone)]
 pub struct AccessTokenInner {
     pub(crate) account_id: u32,
+    pub(crate) obj_size: u32,
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     pub(crate) tenant_id: Option<u32>,
-    pub(crate) member_of: TinyVec<[u32; 3]>,
+    // SPDX-SnippetEnd
+    pub(crate) member_of: Box<[u32]>,
     pub(crate) access_to: Box<[AccessTo]>,
     pub(crate) scopes: Box<[AccessScope]>,
-    pub(crate) concurrent_http_requests: Option<ConcurrencyLimiter>,
-    pub(crate) concurrent_imap_requests: Option<ConcurrencyLimiter>,
-    pub(crate) concurrent_uploads: Option<ConcurrencyLimiter>,
+    pub(crate) limits: Option<Arc<AccountLimits>>,
     pub(crate) revision_account: u64,
     pub(crate) revision: u64,
     pub(crate) credential_version: u64,
-    pub(crate) obj_size: u64,
 }
+
+const _: () = assert!(size_of::<AccessTokenInner>() <= 96);
 
 #[derive(Debug, Default, Hash, Clone)]
 pub struct AccessScope {
@@ -164,6 +239,7 @@ pub struct AccessScope {
 pub(crate) struct AccessTo {
     pub account_id: u32,
     pub collections: Bitmap<Collection>,
+    pub is_writable: bool,
 }
 
 #[derive(Clone)]
@@ -174,9 +250,14 @@ pub struct AccountInfo {
 }
 
 #[derive(Clone, Copy)]
-pub struct AccountTenantIds {
+pub struct ChangedBy {
     pub account_id: u32,
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     pub tenant_id: Option<u32>,
+    // SPDX-SnippetEnd
 }
 
 pub struct AuthRequest {
@@ -187,13 +268,13 @@ pub struct AuthRequest {
 
 impl CacheItemWeight for AccessTokenInner {
     fn weight(&self) -> u64 {
-        self.obj_size
+        u64::from(self.obj_size)
     }
 }
 
 impl CacheItemWeight for EmailAddress {
     fn weight(&self) -> u64 {
-        std::mem::size_of::<EmailAddress>() as u64 + self.local_part.len() as u64
+        std::mem::size_of::<EmailAddress>() as u64 + self.heap_size()
     }
 }
 
@@ -221,13 +302,13 @@ impl CacheItemWeight for DomainCache {
 
 impl Equivalent<EmailAddress> for EmailAddressRef<'_> {
     fn equivalent(&self, key: &EmailAddress) -> bool {
-        self.local_part == &*key.local_part && self.domain_id == key.domain_id
+        self.local_part == key.local_part.as_str() && self.domain_id == key.domain_id
     }
 }
 
 impl Hash for EmailAddress {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.local_part.as_ref().hash(state);
+        self.local_part.as_str().hash(state);
         self.domain_id.hash(state);
     }
 }
@@ -241,14 +322,22 @@ impl Hash for EmailAddressRef<'_> {
 
 impl CacheItemWeight for AccountCache {
     fn weight(&self) -> u64 {
-        std::mem::size_of::<AccountCache>() as u64
-            + self.name.len() as u64
+        (std::mem::size_of::<AccountCache>()
+            + self.name.len()
+            + std::mem::size_of_val::<[u32]>(&self.id_member_of)
+            + self.description.as_ref().map_or(0, |s| s.len())) as u64
             + self
                 .addresses
                 .iter()
-                .map(|s| s.local_part.len() as u64 + std::mem::size_of::<EmailAddress>() as u64)
+                .map(|address| address.weight())
                 .sum::<u64>()
-            + self.description.as_ref().map_or(0, |s| s.len() as u64)
+            + self.storage.as_ref().map_or(0, |storage| storage.weight())
+    }
+}
+
+impl CacheItemWeight for AccountStorage {
+    fn weight(&self) -> u64 {
+        std::mem::size_of::<AccountStorage>() as u64
             + self.encryption_key.as_ref().map_or(0, |keys| {
                 keys.iter()
                     .map(|k| k.len() as u64 + std::mem::size_of::<Box<[u8]>>() as u64)
@@ -269,7 +358,7 @@ impl CacheItemWeight for MailingListCache {
             + self
                 .addresses
                 .iter()
-                .map(|s| s.local_part.len() as u64 + std::mem::size_of::<EmailAddress>() as u64)
+                .map(|address| address.weight())
                 .sum::<u64>()
             + self
                 .recipients
@@ -279,12 +368,17 @@ impl CacheItemWeight for MailingListCache {
     }
 }
 
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
+#[cfg(feature = "enterprise")]
 impl CacheItemWeight for TenantCache {
     fn weight(&self) -> u64 {
         std::mem::size_of::<TenantCache>() as u64
             + self.permissions.as_ref().map_or(0, |p| p.weight())
     }
 }
+// SPDX-SnippetEnd
 
 impl CacheItemWeight for PermissionsGroup {
     fn weight(&self) -> u64 {
@@ -301,15 +395,25 @@ impl BuildAccessToken for Arc<AccessTokenInner> {
         AccessToken {
             scope_idx: 0,
             inner: self,
+            token_scope: None,
         }
     }
 }
 
 impl EmailAddress {
-    pub fn new(local_part: impl Into<Box<str>>, domain_id: u32) -> Self {
+    pub fn new(local_part: impl Into<CompactString>, domain_id: u32) -> Self {
         Self {
             local_part: local_part.into(),
             domain_id,
+        }
+    }
+
+    #[inline]
+    pub fn heap_size(&self) -> u64 {
+        if self.local_part.is_heap_allocated() {
+            self.local_part.capacity() as u64
+        } else {
+            0
         }
     }
 }
@@ -327,11 +431,43 @@ impl AccountCache {
     pub fn domain_id(&self) -> Option<u32> {
         self.addresses.first().map(|address| address.domain_id)
     }
+
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
+    #[inline]
+    pub fn is_same_tenant(&self, access_token: &AccessToken) -> bool {
+        self.id_tenant == access_token.tenant_id()
+    }
+    // SPDX-SnippetEnd
+
+    #[cfg(not(feature = "enterprise"))]
+    #[inline]
+    pub fn is_same_tenant(&self, _access_token: &AccessToken) -> bool {
+        true
+    }
 }
 
 impl DomainCache {
     pub fn name(&self) -> &str {
         self.names.first().map(|s| s.as_ref()).unwrap_or_default()
+    }
+
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
+    #[inline]
+    pub fn is_same_tenant(&self, other: &DomainCache) -> bool {
+        self.id_tenant == other.id_tenant
+    }
+    // SPDX-SnippetEnd
+
+    #[cfg(not(feature = "enterprise"))]
+    #[inline]
+    pub fn is_same_tenant(&self, _other: &DomainCache) -> bool {
+        true
     }
 
     // SPDX-SnippetBegin

@@ -10,7 +10,7 @@
 
 use crate::{
     Deserialize, IterateParams, Key, Store, ValueKey,
-    search::{IndexDocument, SearchComparator, SearchDocumentId, SearchFilter, SearchQuery},
+    search::{IndexDocument, SearchFilter, SearchQuery, SearchResults},
     write::{AssignedIds, Batch, SearchIndex, ValueClass},
 };
 use std::{
@@ -138,32 +138,38 @@ impl SQLReadReplica {
         .await
     }
 
+    pub async fn iterate_many<T: Key>(
+        &self,
+        ranges: Vec<IterateParams<T>>,
+        mut cb: impl for<'x> FnMut(&'x [u8], &'x [u8]) -> trc::Result<bool> + Sync + Send,
+    ) -> trc::Result<()> {
+        let mut delivered = false;
+        match iterate_many(self.replica(), ranges.clone(), |key, value| {
+            delivered = true;
+            cb(key, value)
+        })
+        .await
+        {
+            Err(_) if !delivered => iterate_many(&self.primary, ranges, cb).await,
+            result => result,
+        }
+    }
+
     pub async fn iterate<T: Key>(
         &self,
         params: IterateParams<T>,
         mut cb: impl for<'x> FnMut(&'x [u8], &'x [u8]) -> trc::Result<bool> + Sync + Send,
     ) -> trc::Result<()> {
-        let mut last_error = None;
-        for store in [
-            &self.replicas
-                [self.last_used_replica.fetch_add(1, Ordering::Relaxed) % self.replicas.len()],
-            &self.primary,
-        ] {
-            match match store {
-                #[cfg(feature = "postgres")]
-                Store::PostgreSQL(store) => store.iterate(params.clone(), &mut cb).await,
-                #[cfg(feature = "mysql")]
-                Store::MySQL(store) => store.iterate(params.clone(), &mut cb).await,
-                _ => panic!("Invalid store type"),
-            } {
-                Ok(result) => return Ok(result),
-                Err(err) => {
-                    last_error = Some(err);
-                }
-            }
+        let mut delivered = false;
+        match iterate(self.replica(), params.clone(), |key, value| {
+            delivered = true;
+            cb(key, value)
+        })
+        .await
+        {
+            Err(_) if !delivered => iterate(&self.primary, params, cb).await,
+            result => result,
         }
-
-        Err(last_error.unwrap())
     }
 
     pub async fn get_counter(
@@ -187,12 +193,12 @@ impl SQLReadReplica {
         .await
     }
 
-    pub async fn write(&self, batch: Batch<'_>) -> trc::Result<AssignedIds> {
+    pub async fn write(&self, batch: Batch<'_>, assigned_ids: &mut AssignedIds) -> trc::Result<()> {
         match &self.primary {
             #[cfg(feature = "postgres")]
-            Store::PostgreSQL(store) => store.write(batch).await,
+            Store::PostgreSQL(store) => store.write(batch, assigned_ids).await,
             #[cfg(feature = "mysql")]
-            Store::MySQL(store) => store.write(batch).await,
+            Store::MySQL(store) => store.write(batch, assigned_ids).await,
             _ => panic!("Invalid store type"),
         }
     }
@@ -237,22 +243,57 @@ impl SQLReadReplica {
         }
     }
 
-    pub async fn query<R: SearchDocumentId>(
+    pub async fn query<R: SearchResults>(
         &self,
         index: SearchIndex,
         filters: &[SearchFilter],
-        sort: &[SearchComparator],
-    ) -> trc::Result<Vec<R>> {
+    ) -> trc::Result<R> {
         match &self.primary {
             #[cfg(feature = "postgres")]
-            Store::PostgreSQL(store) => store.query(index, filters, sort).await,
+            Store::PostgreSQL(store) => store.query(index, filters).await,
             #[cfg(feature = "mysql")]
-            Store::MySQL(store) => store.query(index, filters, sort).await,
+            Store::MySQL(store) => store.query(index, filters).await,
             _ => panic!("Invalid store type"),
         }
     }
 
     pub fn primary_store(&self) -> &Store {
         &self.primary
+    }
+
+    fn replica(&self) -> &Store {
+        self.last_used_replica
+            .fetch_add(1, Ordering::Relaxed)
+            .checked_rem(self.replicas.len())
+            .and_then(|index| self.replicas.get(index))
+            .unwrap_or(&self.primary)
+    }
+}
+
+async fn iterate_many<T: Key>(
+    store: &Store,
+    ranges: Vec<IterateParams<T>>,
+    cb: impl for<'x> FnMut(&'x [u8], &'x [u8]) -> trc::Result<bool> + Sync + Send,
+) -> trc::Result<()> {
+    match store {
+        #[cfg(feature = "postgres")]
+        Store::PostgreSQL(store) => store.iterate_many(ranges, cb).await,
+        #[cfg(feature = "mysql")]
+        Store::MySQL(store) => store.iterate_many(ranges, cb).await,
+        _ => Err(trc::StoreEvent::NotSupported.into_err()),
+    }
+}
+
+async fn iterate<T: Key>(
+    store: &Store,
+    params: IterateParams<T>,
+    cb: impl for<'x> FnMut(&'x [u8], &'x [u8]) -> trc::Result<bool> + Sync + Send,
+) -> trc::Result<()> {
+    match store {
+        #[cfg(feature = "postgres")]
+        Store::PostgreSQL(store) => store.iterate(params, cb).await,
+        #[cfg(feature = "mysql")]
+        Store::MySQL(store) => store.iterate(params, cb).await,
+        _ => Err(trc::StoreEvent::NotSupported.into_err()),
     }
 }

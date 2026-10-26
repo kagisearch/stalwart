@@ -40,12 +40,13 @@ pub enum ResourceType {
 
 impl ResourceType {
     pub fn parse(value: &str) -> Option<Self> {
-        hashify::tiny_map_ignore_case!(value.as_bytes(),
+        hashify::map_ignore_case!(value.as_bytes(), ResourceType,
             "User" => ResourceType::User,
             "Users" => ResourceType::User,
             "Group" => ResourceType::Group,
             "Groups" => ResourceType::Group,
         )
+        .copied()
     }
 
     pub fn from_endpoint(endpoint: &str) -> Option<Self> {
@@ -91,44 +92,7 @@ impl std::fmt::Display for ResourceType {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resource_type_parse() {
-        for (input, expected) in [
-            ("User", Some(ResourceType::User)),
-            ("users", Some(ResourceType::User)),
-            ("GROUPS", Some(ResourceType::Group)),
-            ("Group", Some(ResourceType::Group)),
-            ("Device", None),
-            ("", None),
-        ] {
-            assert_eq!(ResourceType::parse(input), expected, "{input}");
-        }
-    }
-
-    #[test]
-    fn resource_type_from_endpoint() {
-        assert_eq!(
-            ResourceType::from_endpoint("Users"),
-            Some(ResourceType::User)
-        );
-        assert_eq!(
-            ResourceType::from_endpoint("/Groups"),
-            Some(ResourceType::Group)
-        );
-        assert_eq!(ResourceType::from_endpoint("users"), None);
-        assert_eq!(ResourceType::from_endpoint("User"), None);
-        assert_eq!(ResourceType::from_endpoint(""), None);
-    }
-
-    #[test]
-    fn resource_type_endpoints() {
-        assert_eq!(ResourceType::User.endpoint(), "/Users");
-        assert_eq!(ResourceType::Group.endpoint(), "/Groups");
-        assert_eq!(ResourceType::User.schema_urn(), SCHEMA_USER);
-        assert_eq!(ResourceType::Group.schema().id, SCHEMA_GROUP);
-    }
-}
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../stalwart-tests/unit/scim-proto/src/tests.rs"]
+mod tests;

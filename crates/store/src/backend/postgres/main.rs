@@ -8,20 +8,21 @@ use super::{PostgresStore, into_error};
 use crate::{
     backend::postgres::{
         PsqlSearchField, into_pool_error,
+        pool::{PgManager, PgObject, PgPool},
         search::{PG_FALLBACK_LANG, PG_LANGS, PG_UNSTEMMED_LANG},
+        sql::SqlStatements,
         tls::MakeRustlsConnect,
     },
     search::{
-        CalendarSearchField, ContactSearchField, EmailSearchField, SearchableField,
-        TracingSearchField,
+        CalendarSearchField, ContactSearchField, EmailSearchField, FileSearchField,
+        SearchableField, TracingSearchField,
     },
     *,
 };
 use ::registry::schema::{enums::PostgreSqlRecyclingMethod, structs};
 use ahash::AHashSet;
-use deadpool_postgres::{
-    Config, ManagerConfig, Object, Pool, PoolConfig, RecyclingMethod, Runtime,
-};
+use compact_str::ToCompactString;
+use deadpool_postgres::{Config, Manager, ManagerConfig, PoolConfig, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
 use utils::tls::rustls_client_config;
 
@@ -33,7 +34,7 @@ impl PostgresStore {
         cfg.user = config.auth_username;
         cfg.password = config.auth_secret.secret().await?.map(|v| v.into_owned());
         cfg.port = (config.port as u16).into();
-        cfg.connect_timeout = config.timeout.map(|t| t.into_inner());
+        cfg.connect_timeout = config.connect_timeout.map(|t| t.into_inner());
         cfg.options = config.options;
         cfg.manager = Some(ManagerConfig {
             recycling_method: match config.pool_recycling_method {
@@ -42,22 +43,23 @@ impl PostgresStore {
                 PostgreSqlRecyclingMethod::Clean => RecyclingMethod::Clean,
             },
         });
-        if let Some(max_conn) = config.pool_max_connections {
-            cfg.pool = PoolConfig::new(max_conn as usize).into();
-        }
+        cfg.pool = PoolConfig::new(
+            config
+                .pool_max_connections
+                .map_or_else(backend::default_pool_max_connections, |max| max as usize),
+        )
+        .into();
 
-        let primary_pool = if config.use_tls {
-            cfg.create_pool(
-                Some(Runtime::Tokio1),
-                MakeRustlsConnect::new(rustls_client_config(config.allow_invalid_certs)?),
-            )
-        } else {
-            cfg.create_pool(Some(Runtime::Tokio1), NoTls)
-        }
-        .map_err(|e| format!("Failed to create connection pool: {e}"))?;
+        let primary_pool = create_pool(&cfg, config.use_tls, config.allow_invalid_certs)?;
         let ts_configs = discover_ts_configs(&primary_pool).await;
+        let sql = Arc::new(SqlStatements::new());
 
+        // SPDX-SnippetBegin
+        // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+        // SPDX-License-Identifier: LicenseRef-SEL
+        #[cfg(feature = "enterprise")]
         let mut replicas = vec![];
+        #[cfg(feature = "enterprise")]
         for replica in config.read_replicas {
             let mut cfg = cfg.clone();
             cfg.dbname = replica.database.into();
@@ -67,22 +69,17 @@ impl PostgresStore {
             cfg.port = (replica.port as u16).into();
             cfg.options = replica.options;
             replicas.push(Store::PostgreSQL(Arc::new(PostgresStore {
-                conn_pool: if config.use_tls {
-                    cfg.create_pool(
-                        Some(Runtime::Tokio1),
-                        MakeRustlsConnect::new(rustls_client_config(config.allow_invalid_certs)?),
-                    )
-                } else {
-                    cfg.create_pool(Some(Runtime::Tokio1), NoTls)
-                }
-                .map_err(|e| format!("Failed to create connection pool: {e}"))?,
+                conn_pool: create_pool(&cfg, config.use_tls, config.allow_invalid_certs)?,
                 ts_configs: ts_configs.clone(),
+                sql: sql.clone(),
             })));
         }
+        // SPDX-SnippetEnd
 
         let primary = Store::PostgreSQL(Arc::new(PostgresStore {
             conn_pool: primary_pool,
             ts_configs,
+            sql,
         }));
 
         // SPDX-SnippetBegin
@@ -100,63 +97,26 @@ impl PostgresStore {
     pub(crate) async fn create_storage_tables(&self) -> trc::Result<()> {
         let conn = self.conn_pool.get().await.map_err(into_pool_error)?;
 
-        for table in [
-            SUBSPACE_ACL,
-            SUBSPACE_TASK_QUEUE,
-            SUBSPACE_DELETED_ITEMS,
-            SUBSPACE_SPAM_SAMPLES,
-            SUBSPACE_BLOB_LINK,
-            SUBSPACE_IN_MEMORY_VALUE,
-            SUBSPACE_PROPERTY,
-            SUBSPACE_REGISTRY,
-            SUBSPACE_REGISTRY_PK,
-            SUBSPACE_QUEUE_MESSAGE,
-            SUBSPACE_QUEUE_EVENT,
-            SUBSPACE_REPORT_OUT,
-            SUBSPACE_REPORT_IN,
-            SUBSPACE_LOGS,
-            SUBSPACE_BLOBS,
-            SUBSPACE_DIRECTORY,
-            SUBSPACE_TELEMETRY_SPAN,
-            SUBSPACE_TELEMETRY_METRIC,
-        ] {
-            let table = char::from(table);
-            conn.execute(
-                &format!(
-                    "CREATE TABLE IF NOT EXISTS {table} (
-                        k BYTEA PRIMARY KEY,
-                        v BYTEA NOT NULL
-                    )"
+        for subspace in Subspace::ALL
+            .iter()
+            .copied()
+            .filter(|subspace| !subspace.is_internal_fts())
+        {
+            let table = subspace.name();
+            let (columns, storage) = match subspace.shape() {
+                Shape::Value => (
+                    "k BYTEA PRIMARY KEY, v BYTEA NOT NULL",
+                    " WITH (fillfactor = 85)",
                 ),
-                &[],
-            )
-            .await
-            .map_err(into_error)?;
-        }
+                Shape::Presence => ("k BYTEA PRIMARY KEY", ""),
+                Shape::Counter => (
+                    "k BYTEA PRIMARY KEY, v BIGINT NOT NULL DEFAULT 0",
+                    " WITH (fillfactor = 60)",
+                ),
+            };
 
-        for table in [SUBSPACE_INDEXES, SUBSPACE_REGISTRY_IDX] {
-            let table = char::from(table);
             conn.execute(
-                &format!(
-                    "CREATE TABLE IF NOT EXISTS {table} (
-                        k BYTEA PRIMARY KEY
-                    )"
-                ),
-                &[],
-            )
-            .await
-            .map_err(into_error)?;
-        }
-
-        for table in [SUBSPACE_COUNTER, SUBSPACE_QUOTA, SUBSPACE_IN_MEMORY_COUNTER] {
-            conn.execute(
-                &format!(
-                    "CREATE TABLE IF NOT EXISTS {} (
-                    k BYTEA PRIMARY KEY,
-                    v BIGINT NOT NULL DEFAULT 0
-                )",
-                    char::from(table)
-                ),
+                &format!("CREATE TABLE IF NOT EXISTS {table} ({columns}){storage}"),
                 &[],
             )
             .await
@@ -172,88 +132,15 @@ impl PostgresStore {
         create_search_tables::<EmailSearchField>(&conn).await?;
         create_search_tables::<CalendarSearchField>(&conn).await?;
         create_search_tables::<ContactSearchField>(&conn).await?;
-        //create_search_tables::<FileSearchField>(&conn).await?;
+        create_search_tables::<FileSearchField>(&conn).await?;
         create_search_tables::<TracingSearchField>(&conn).await?;
-
-        // On a large table the build takes minutes, so it runs in the
-        // background rather than holding up startup.
-        let pool = self.conn_pool.clone();
-        tokio::spawn(async move {
-            if let Err(err) = create_email_sort_index(pool).await {
-                trc::error!(err.details("Failed to create the email sort index"));
-            }
-        });
 
         Ok(())
     }
 }
 
-/// Email/query sorted by date and Thread/get read all of an account's
-/// messages in received order. With this index Postgres returns them from
-/// the index alone, rather than reading every row of the account and sorting
-/// them.
-const EMAIL_SORT_INDEX: &str = "idx_s_email_accid_rcvd_sent";
-
-async fn create_email_sort_index(pool: Pool) -> trc::Result<()> {
-    // Taken out of the pool: the build can run for minutes, and closing the
-    // connection afterwards releases the lock below.
-    let conn = Object::take(pool.get().await.map_err(into_pool_error)?);
-    let is_valid = async || {
-        conn.query_opt(
-            "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
-            &[&EMAIL_SORT_INDEX],
-        )
-        .await
-        .map(|row| row.map(|row| row.get::<_, bool>(0)))
-        .map_err(into_error)
-    };
-    if is_valid().await? == Some(true) {
-        return Ok(());
-    }
-
-    // One server builds it at a time, the others leave it to that one.
-    let is_locked: bool = conn
-        .query_one(
-            "SELECT pg_try_advisory_lock(hashtext($1))",
-            &[&EMAIL_SORT_INDEX],
-        )
-        .await
-        .map_err(into_error)?
-        .get(0);
-    if !is_locked {
-        return Ok(());
-    }
-
-    match is_valid().await? {
-        Some(true) => return Ok(()),
-        Some(false) => {
-            // A build that was cut short leaves an invalid index, which
-            // CREATE INDEX IF NOT EXISTS would keep.
-            conn.batch_execute(&format!(
-                "DROP INDEX CONCURRENTLY IF EXISTS {EMAIL_SORT_INDEX}"
-            ))
-            .await
-            .map_err(into_error)?;
-        }
-        None => (),
-    }
-
-    // CONCURRENTLY keeps writes to the table going during the build. It
-    // refuses to run in a transaction, so it is sent on its own rather than
-    // in one multi-statement batch.
-    conn.batch_execute("SET statement_timeout = 0")
-        .await
-        .map_err(into_error)?;
-    conn.batch_execute(&format!(
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS {EMAIL_SORT_INDEX} \
-         ON s_email (accid, rcvd, sent, docid)"
-    ))
-    .await
-    .map_err(into_error)
-}
-
 async fn create_search_tables<T: SearchableField + PsqlSearchField + 'static>(
-    conn: &Object,
+    conn: &PgObject,
 ) -> trc::Result<()> {
     let table_name = T::index().psql_table();
     let mut query = format!("CREATE TABLE IF NOT EXISTS {} (", table_name);
@@ -266,11 +153,7 @@ async fn create_search_tables<T: SearchableField + PsqlSearchField + 'static>(
 
     // Add other columns
     for field in T::all_fields() {
-        query.push_str(&format!("{} {}", field.column(), field.column_type()));
-        if let Some(sort_type) = field.sort_column_type() {
-            query.push_str(&format!(", {} {}", field.sort_column().unwrap(), sort_type));
-        }
-        query.push_str(", ");
+        query.push_str(&format!("{} {}, ", field.column(), field.column_type()));
     }
 
     // Add primary key constraint
@@ -285,51 +168,53 @@ async fn create_search_tables<T: SearchableField + PsqlSearchField + 'static>(
 
     conn.execute(&query, &[]).await.map_err(into_error)?;
 
-    // Create the missing indexes. CREATE INDEX IF NOT EXISTS locks the table
-    // before it finds the index exists, so while a concurrent build holds the
-    // table it would wait, and writes to the table would queue behind it.
-    let existing = conn
-        .query(
-            "SELECT indexname FROM pg_indexes WHERE tablename = $1",
-            &[&table_name],
-        )
-        .await
-        .map_err(into_error)?
-        .iter()
-        .map(|row| row.get::<_, String>(0))
-        .collect::<AHashSet<_>>();
+    // Create indexes
     for field in T::all_fields() {
         if field.is_text() || field.is_json() {
             let column_name = field.column();
-            let index_name = format!("gin_{table_name}_{column_name}");
-            if !existing.contains(&index_name) {
-                let create_index_query = format!(
-                    "CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} USING GIN({column_name})",
-                );
-                conn.execute(&create_index_query, &[])
-                    .await
-                    .map_err(into_error)?;
-            }
+            let create_index_query = format!(
+                "CREATE INDEX IF NOT EXISTS gin_{table_name}_{column_name} ON {table_name} USING GIN({column_name})",
+            );
+            conn.execute(&create_index_query, &[])
+                .await
+                .map_err(into_error)?;
         }
 
         if field.is_indexed() {
-            let column_name = field.sort_column().unwrap_or(field.column());
-            let index_name = format!("idx_{table_name}_{column_name}");
-            if !existing.contains(&index_name) {
-                let create_index_query = format!(
-                    "CREATE INDEX IF NOT EXISTS {index_name} ON {table_name}({column_name})",
-                );
-                conn.execute(&create_index_query, &[])
-                    .await
-                    .map_err(into_error)?;
-            }
+            let column_name = field.column();
+            let create_index_query = format!(
+                "CREATE INDEX IF NOT EXISTS idx_{table_name}_{column_name} ON {table_name}({column_name})",
+            );
+            conn.execute(&create_index_query, &[])
+                .await
+                .map_err(into_error)?;
         }
     }
 
     Ok(())
 }
 
-async fn discover_ts_configs(pool: &Pool) -> AHashSet<&'static str> {
+fn create_pool(cfg: &Config, use_tls: bool, allow_invalid_certs: bool) -> Result<PgPool, String> {
+    let pg_config = cfg
+        .get_pg_config()
+        .map_err(|e| format!("Failed to create connection pool: {e}"))?;
+    let manager = if use_tls {
+        Manager::from_config(
+            pg_config,
+            MakeRustlsConnect::new(rustls_client_config(allow_invalid_certs)?),
+            cfg.get_manager_config(),
+        )
+    } else {
+        Manager::from_config(pg_config, NoTls, cfg.get_manager_config())
+    };
+    PgPool::builder(PgManager::new(manager))
+        .config(cfg.get_pool_config())
+        .runtime(Runtime::Tokio1)
+        .build()
+        .map_err(|e| format!("Failed to create connection pool: {e}"))
+}
+
+async fn discover_ts_configs(pool: &PgPool) -> AHashSet<&'static str> {
     let mut ts_configs = AHashSet::from_iter([PG_FALLBACK_LANG, PG_UNSTEMMED_LANG]);
 
     match probe_ts_configs(pool).await {
@@ -344,7 +229,7 @@ async fn discover_ts_configs(pool: &Pool) -> AHashSet<&'static str> {
             trc::event!(
                 Store(trc::StoreEvent::PostgresqlError),
                 Details = "Failed to query pg_ts_config, assuming english only",
-                Reason = err.to_string(),
+                Reason = err.to_compact_string(),
             );
         }
     }
@@ -352,7 +237,7 @@ async fn discover_ts_configs(pool: &Pool) -> AHashSet<&'static str> {
     ts_configs
 }
 
-async fn probe_ts_configs(pool: &Pool) -> trc::Result<Vec<String>> {
+async fn probe_ts_configs(pool: &PgPool) -> trc::Result<Vec<String>> {
     let conn = pool.get().await.map_err(into_pool_error)?;
 
     conn.query("SELECT cfgname::text FROM pg_ts_config", &[])

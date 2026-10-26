@@ -150,3 +150,8 @@ impl SecretKeyEnvironmentVariable {
         }
     }
 }
+
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/registry/src/utils/secret/tests.rs"]
+mod tests;

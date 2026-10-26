@@ -27,7 +27,12 @@ impl<'x> JsonPointerPatch<'x> {
             pos: 0,
             validators: &[],
             is_create: false,
+            // SPDX-SnippetBegin
+            // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+            // SPDX-License-Identifier: LicenseRef-SEL
+            #[cfg(feature = "enterprise")]
             can_set_tenant: false,
+            // SPDX-SnippetEnd
             can_set_account: false,
         }
     }
@@ -38,7 +43,12 @@ impl<'x> JsonPointerPatch<'x> {
             pos: 0,
             validators: &[],
             is_create: self.is_create,
+            // SPDX-SnippetBegin
+            // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+            // SPDX-License-Identifier: LicenseRef-SEL
+            #[cfg(feature = "enterprise")]
             can_set_tenant: self.can_set_tenant,
+            // SPDX-SnippetEnd
             can_set_account: self.can_set_account,
         }
     }
@@ -49,7 +59,12 @@ impl<'x> JsonPointerPatch<'x> {
             pos: 0,
             validators: &[],
             is_create: self.is_create,
+            // SPDX-SnippetBegin
+            // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+            // SPDX-License-Identifier: LicenseRef-SEL
+            #[cfg(feature = "enterprise")]
             can_set_tenant: self.can_set_tenant,
+            // SPDX-SnippetEnd
             can_set_account: self.can_set_account,
         }
     }
@@ -59,10 +74,15 @@ impl<'x> JsonPointerPatch<'x> {
         self
     }
 
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     pub fn with_can_set_tenant(mut self, can_set_tenant: bool) -> Self {
         self.can_set_tenant = can_set_tenant;
         self
     }
+    // SPDX-SnippetEnd
 
     pub fn with_can_set_account(mut self, can_set_account: bool) -> Self {
         self.can_set_account = can_set_account;
@@ -127,6 +147,10 @@ impl<'x> JsonPointerPatch<'x> {
         ))
     }
 
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     pub fn assert_can_set_tenant(self) -> Result<Self, PatchError> {
         if self.can_set_tenant {
             Ok(self)
@@ -137,6 +161,7 @@ impl<'x> JsonPointerPatch<'x> {
             ))
         }
     }
+    // SPDX-SnippetEnd
 
     pub fn assert_can_set_account(self) -> Result<Self, PatchError> {
         if self.can_set_account {

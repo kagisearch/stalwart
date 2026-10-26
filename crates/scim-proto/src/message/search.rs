@@ -33,10 +33,11 @@ pub enum SortOrder {
 
 impl SortOrder {
     pub fn parse(value: &str) -> Option<Self> {
-        hashify::tiny_map_ignore_case!(value.as_bytes(),
+        hashify::map_ignore_case!(value.as_bytes(), SortOrder,
             "ascending" => SortOrder::Ascending,
             "descending" => SortOrder::Descending,
         )
+        .copied()
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -69,15 +70,16 @@ impl<'x> SearchRequest<'x> {
                 None => (parameter, Cow::Borrowed("")),
             };
 
-            match hashify::tiny_map_ignore_case!(name.as_bytes(),
-                "attributes" => Parameter::Attributes,
-                "excludedAttributes" => Parameter::ExcludedAttributes,
-                "filter" => Parameter::Filter,
-                "sortBy" => Parameter::SortBy,
-                "sortOrder" => Parameter::SortOrder,
-                "startIndex" => Parameter::StartIndex,
-                "count" => Parameter::Count,
-                "cursor" => Parameter::Cursor,
+            match hashify::fnc_map_ignore_case!(name.as_bytes(),
+                "attributes" => Some(Parameter::Attributes),
+                "excludedAttributes" => Some(Parameter::ExcludedAttributes),
+                "filter" => Some(Parameter::Filter),
+                "sortBy" => Some(Parameter::SortBy),
+                "sortOrder" => Some(Parameter::SortOrder),
+                "startIndex" => Some(Parameter::StartIndex),
+                "count" => Some(Parameter::Count),
+                "cursor" => Some(Parameter::Cursor),
+                _ => None,
             ) {
                 Some(Parameter::Attributes) => {
                     request.attributes = Some(split_list(value));
@@ -257,229 +259,7 @@ impl<'de> Deserialize<'de> for SortOrder {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_search_request() {
-        let request = SearchRequest::parse(
-            br#"{
-                "schemas": ["urn:ietf:params:scim:api:messages:2.0:SearchRequest"],
-                "attributes": ["displayName", "userName"],
-                "filter": "displayName sw \"smith\"",
-                "startIndex": 1,
-                "count": 10
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            request.attributes.as_deref(),
-            Some(["displayName".into(), "userName".into()].as_slice())
-        );
-        assert_eq!(request.filter.as_deref(), Some(r#"displayName sw "smith""#));
-        assert_eq!(request.start_index, Some(1));
-        assert_eq!(request.count, Some(10));
-    }
-
-    #[test]
-    fn reject_wrong_schema_uri() {
-        let error = SearchRequest::parse(
-            br#"{"schemas": ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"]}"#,
-        )
-        .unwrap_err();
-
-        assert_eq!(error.status, 400);
-        assert_eq!(
-            error.scim_type,
-            Some(crate::message::error::ScimType::InvalidSyntax)
-        );
-    }
-
-    #[test]
-    fn parse_query_string() {
-        let request = SearchRequest::from_query(
-            "filter=userName%20eq%20%22alice%40corp.example%22&startIndex=1&count=100\
-             &sortBy=userName&sortOrder=descending&attributes=userName,active",
-        )
-        .unwrap();
-
-        assert_eq!(
-            request.filter.as_deref(),
-            Some(r#"userName eq "alice@corp.example""#)
-        );
-        assert_eq!(request.start_index, Some(1));
-        assert_eq!(request.count, Some(100));
-        assert_eq!(request.sort_by.as_deref(), Some("userName"));
-        assert_eq!(request.sort_order, Some(SortOrder::Descending));
-        assert_eq!(
-            request.attributes.as_deref(),
-            Some(["userName".into(), "active".into()].as_slice())
-        );
-    }
-
-    #[test]
-    fn parse_query_string_with_plus_encoding() {
-        let request = SearchRequest::from_query("filter=userName+eq+%22a+b%22").unwrap();
-
-        assert_eq!(request.filter.as_deref(), Some(r#"userName eq "a b""#));
-    }
-
-    #[test]
-    fn cursor_pagination_parameters() {
-        let request = SearchRequest::from_query("cursor&count=10").unwrap();
-
-        assert!(request.is_cursor_paginated());
-        assert_eq!(request.cursor.as_deref(), Some(""));
-
-        let request = SearchRequest::from_query("cursor=VZUTiyhEQJ94IR&count=10").unwrap();
-        assert_eq!(request.cursor.as_deref(), Some("VZUTiyhEQJ94IR"));
-
-        let request = SearchRequest::from_query("count=10").unwrap();
-        assert!(!request.is_cursor_paginated());
-    }
-
-    #[test]
-    fn unknown_query_parameters_are_ignored() {
-        let request = SearchRequest::from_query("excludedAttributes=members&unknown=1").unwrap();
-
-        assert_eq!(
-            request.excluded_attributes.as_deref(),
-            Some(["members".into()].as_slice())
-        );
-    }
-
-    #[test]
-    fn invalid_query_parameters() {
-        use crate::message::error::ScimType;
-
-        for (query, scim_type) in [
-            ("startIndex=abc", ScimType::InvalidValue),
-            ("sortOrder=sideways", ScimType::InvalidValue),
-            ("count=1.5", ScimType::InvalidCount),
-        ] {
-            let error = SearchRequest::from_query(query).unwrap_err();
-
-            assert_eq!(error.status, 400, "{query}");
-            assert_eq!(error.scim_type, Some(scim_type), "{query}");
-        }
-    }
-
-    #[test]
-    fn query_strings_may_carry_their_question_mark() {
-        let request = SearchRequest::from_query("?count=5&sortBy=userName").unwrap();
-
-        assert_eq!(request.count, Some(5));
-        assert_eq!(request.sort_by.as_deref(), Some("userName"));
-    }
-
-    #[test]
-    fn query_parameter_names_are_case_insensitive() {
-        let request = SearchRequest::from_query("Filter=title%20pr&StartIndex=3").unwrap();
-
-        assert_eq!(request.filter.as_deref(), Some("title pr"));
-        assert_eq!(request.start_index, Some(3));
-    }
-
-    #[test]
-    fn query_values_are_borrowed_when_not_encoded() {
-        let request =
-            SearchRequest::from_query("sortBy=userName&attributes=userName,active").unwrap();
-
-        assert!(matches!(request.sort_by, Some(Cow::Borrowed(_))));
-        assert!(matches!(
-            request.attributes.as_deref(),
-            Some([Cow::Borrowed(_), Cow::Borrowed(_)])
-        ));
-    }
-
-    #[test]
-    fn cursor_timeout_is_not_a_request_parameter() {
-        assert!(
-            SearchRequest::parse(
-                br#"{"schemas": ["urn:ietf:params:scim:api:messages:2.0:SearchRequest"],
-                     "cursorTimeout": 3600}"#
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn missing_schema_uri_is_rejected() {
-        let error = SearchRequest::parse(br#"{"count": 10}"#).unwrap_err();
-
-        assert_eq!(error.status, 400);
-        assert!(
-            error.detail.as_deref().unwrap().contains("schemas"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn pagination_defaults() {
-        let request = SearchRequest::from_query("").unwrap();
-        assert_eq!(request.effective_start_index(), 1);
-        assert_eq!(request.effective_count(100, 200), 100);
-
-        let request = SearchRequest::from_query("startIndex=0").unwrap();
-        assert_eq!(request.effective_start_index(), 1);
-
-        let request = SearchRequest::from_query("startIndex=-5").unwrap();
-        assert_eq!(request.effective_start_index(), 1);
-
-        let request = SearchRequest::from_query("count=1000").unwrap();
-        assert_eq!(request.effective_count(100, 200), 200);
-
-        let request = SearchRequest::from_query("count=0").unwrap();
-        assert_eq!(request.effective_count(100, 200), 0);
-
-        let request = SearchRequest::from_query("count=-1").unwrap();
-        assert_eq!(request.effective_count(100, 200), 0);
-    }
-
-    #[test]
-    fn filter_and_attributes_are_resolved() {
-        let request =
-            SearchRequest::from_query("filter=userName%20eq%20%22a%22&attributes=userName")
-                .unwrap();
-
-        assert!(request.parse_filter().unwrap().is_some());
-        assert!(matches!(
-            request.attribute_selection().unwrap(),
-            AttributeSelection::Include(_)
-        ));
-
-        let request = SearchRequest::from_query("").unwrap();
-        assert!(request.parse_filter().unwrap().is_none());
-        assert!(request.attribute_selection().unwrap().is_default());
-    }
-
-    #[test]
-    fn mutually_exclusive_attribute_parameters() {
-        let request =
-            SearchRequest::from_query("attributes=userName&excludedAttributes=groups").unwrap();
-
-        assert!(request.attribute_selection().is_err());
-    }
-
-    #[test]
-    fn serialize_search_request() {
-        let request = SearchRequest {
-            filter: Some(r#"userName eq "a""#.into()),
-            count: Some(10),
-            sort_order: Some(SortOrder::Ascending),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            serde_json::to_value(&request).unwrap(),
-            serde_json::json!({
-                "schemas": ["urn:ietf:params:scim:api:messages:2.0:SearchRequest"],
-                "filter": "userName eq \"a\"",
-                "sortOrder": "ascending",
-                "count": 10
-            })
-        );
-    }
-}
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/scim-proto/src/message/search/tests.rs"]
+mod tests;

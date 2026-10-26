@@ -11,6 +11,7 @@ use crate::expr::{
     if_block::{BootstrapExprExt, IfBlock},
 };
 use ahash::AHashSet;
+use bytes::Bytes;
 use hyper::HeaderMap;
 use registry::schema::{
     enums::{self, ExpressionConstant, MtaStage},
@@ -27,8 +28,6 @@ use std::{
     time::Duration,
 };
 
-use crate::config::smtp::delivery_hooks::DeliveryHook;
-
 #[derive(Clone)]
 pub struct SessionConfig {
     pub timeout: IfBlock,
@@ -42,11 +41,16 @@ pub struct SessionConfig {
     pub rcpt: Rcpt,
     pub data: Data,
     pub extensions: Extensions,
-    pub mta_sts_policy: Option<Policy>,
+    pub mta_sts_policy: Option<LocalMtaStsPolicy>,
 
     pub milters: Vec<Milter>,
     pub hooks: Vec<MTAHook>,
-    pub delivery_hooks: Vec<DeliveryHook>,
+}
+
+#[derive(Clone)]
+pub struct LocalMtaStsPolicy {
+    pub policy: Policy,
+    pub text: Bytes,
 }
 
 #[derive(Clone)]
@@ -189,7 +193,6 @@ impl SessionConfig {
         let ext = bp.setting_infallible::<MtaExtensions>().await;
 
         let mut hooks = Vec::new();
-        let mut delivery_hooks = Vec::new();
 
         for hook in bp.list_infallible::<MtaHook>().await {
             let id = hook.id;
@@ -207,44 +210,32 @@ impl SessionConfig {
                 }
             };
 
-            // An `MtaHook` with no SMTP stages can never fire in the MTA pipeline
-            // (`run_on_stage` would be empty), so a stage-less hook is treated as a
-            // delivery hook: an HTTP webhook invoked during message delivery, before
-            // the user's Sieve script. This loop is the only consumer of `MtaHook`
-            // objects, so the two kinds stay cleanly separated.
-            if hook.stages.is_empty() {
-                delivery_hooks.push(DeliveryHook {
-                    enable,
-                    id: id.to_string(),
-                    url: hook.url,
-                    timeout: hook.timeout.into_inner(),
-                    headers,
-                    tls_allow_invalid_certs: hook.allow_invalid_certs,
-                    tempfail_on_error: hook.temp_fail_on_error,
-                    max_response_size: hook.max_response_size as usize,
-                });
-            } else {
-                hooks.push(MTAHook {
-                    enable,
-                    id,
-                    url: hook.url,
-                    timeout: hook.timeout.into_inner(),
-                    headers,
-                    tls_allow_invalid_certs: hook.allow_invalid_certs,
-                    tempfail_on_error: hook.temp_fail_on_error,
-                    run_on_stage: hook.stages.into_iter().map(Stage::from).collect(),
-                    max_response_size: hook.max_response_size as usize,
-                    client: utils::http::http_client_builder(hook.allow_invalid_certs)
-                        .build()
-                        .unwrap_or_default(),
-                });
-            }
+            hooks.push(MTAHook {
+                enable,
+                id,
+                url: hook.url,
+                timeout: hook.timeout.into_inner(),
+                headers,
+                tls_allow_invalid_certs: hook.allow_invalid_certs,
+                tempfail_on_error: hook.temp_fail_on_error,
+                run_on_stage: hook.stages.into_iter().map(Stage::from).collect(),
+                max_response_size: hook.max_response_size as usize,
+                client: utils::http::http_client_builder(hook.allow_invalid_certs)
+                    .build()
+                    .unwrap_or_default(),
+            });
         }
+
+        let mta_sts_policy = Policy::try_parse(bp).await.map(|policy| LocalMtaStsPolicy {
+            text: Bytes::from(policy.to_string()),
+            policy,
+        });
+        let milters = bp.list_infallible::<MtaMilter>().await;
 
         SessionConfig {
             timeout: bp.compile_expr(
                 ObjectType::MtaInboundSession.singleton(),
-                &session.ctx_timeout(),
+                &session.ctx_idle_timeout(),
             ),
             duration: bp.compile_expr(
                 ObjectType::MtaInboundSession.singleton(),
@@ -394,10 +385,8 @@ impl SessionConfig {
                     &ext.ctx_mt_priority(),
                 ),
             },
-            mta_sts_policy: Policy::try_parse(bp).await,
-            milters: bp
-                .list_infallible::<MtaMilter>()
-                .await
+            mta_sts_policy,
+            milters: milters
                 .into_iter()
                 .filter_map(|milter| {
                     let id = milter.id;
@@ -406,24 +395,24 @@ impl SessionConfig {
                     Some(Milter {
                         enable: bp.compile_expr(id, &milter.ctx_enable()),
                         id,
-                        addrs: format!("{}:{}", milter.hostname, milter.port)
+                        addrs: format!("{}:{}", milter.host, milter.port)
                             .to_socket_addrs()
                             .map_err(|err| {
                                 bp.build_error(
                                     id,
                                     format!(
                                         "Unable to resolve milter hostname {}: {}",
-                                        milter.hostname, err
+                                        milter.host, err
                                     ),
                                 )
                             })
                             .ok()?
                             .collect(),
-                        hostname: milter.hostname,
+                        hostname: milter.host,
                         port: milter.port as u16,
-                        timeout_connect: milter.timeout_connect.into_inner(),
-                        timeout_command: milter.timeout_command.into_inner(),
-                        timeout_data: milter.timeout_data.into_inner(),
+                        timeout_connect: milter.connect_timeout.into_inner(),
+                        timeout_command: milter.command_timeout.into_inner(),
+                        timeout_data: milter.data_timeout.into_inner(),
                         tls: milter.use_tls,
                         tls_allow_invalid_certs: milter.allow_invalid_certs,
                         tempfail_on_error: milter.temp_fail_on_error,
@@ -439,7 +428,6 @@ impl SessionConfig {
                 })
                 .collect(),
             hooks,
-            delivery_hooks,
         }
     }
 }
@@ -509,7 +497,7 @@ impl<'x> TryFrom<Variable<'x>> for Mechanism {
                 let mut mechanism = 0;
 
                 for item in items {
-                    match item {
+                    match *item {
                         Variable::Constant(value) => mechanism |= Mechanism::try_from(value)?.0,
                         _ => return Err(()),
                     }
@@ -560,7 +548,6 @@ impl<'x> TryFrom<Variable<'x>> for MtPriority {
                 _ => Err(()),
             },
             Variable::String(value) => {
-                let value = value.as_str();
                 if value.eq_ignore_ascii_case("MIXER") {
                     Ok(MtPriority::Mixer)
                 } else if value.eq_ignore_ascii_case("STANAG4406") {

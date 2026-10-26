@@ -22,9 +22,110 @@ use store::{
 use trc::*;
 use utils::snowflake::SnowflakeIdGenerator;
 
+macro_rules! persisted_metrics {
+    ($list:ident => [$($variant:ident),+ $(,)?]) => {
+        pub const $list: &[MetricType] = &[$(MetricType::$variant),+];
+    };
+    ($list:ident, $matcher:ident => [$($variant:ident),+ $(,)?]) => {
+        persisted_metrics!($list => [$($variant),+]);
+
+        #[inline]
+        pub fn $matcher(metric: MetricType) -> bool {
+            matches!(metric, $(MetricType::$variant)|+)
+        }
+    };
+}
+
+persisted_metrics!(
+    PERSISTED_COUNTERS => [
+        SmtpConnectionStart,
+        ImapConnectionStart,
+        Pop3ConnectionStart,
+        ManageSieveConnectionStart,
+        HttpConnectionStart,
+        DeliveryAttemptStart,
+        QueueMessageQueued,
+        QueueAuthenticatedMessageQueued,
+        QueueDsnQueued,
+        QueueReportQueued,
+        MessageIngestHam,
+        MessageIngestSpam,
+        AuthFailed,
+        SecurityAuthenticationBan,
+        SecurityScanBan,
+        SecurityAbuseBan,
+        SecurityLoiterBan,
+        SecurityIpBlocked,
+        IncomingReportDmarcReport,
+        IncomingReportDmarcReportWithWarnings,
+        IncomingReportTlsReport,
+        IncomingReportTlsReportWithWarnings,
+        CacheHit,
+        CacheMiss,
+        CacheStale,
+        CacheEntryTooLarge,
+        CacheSwapHit,
+        CacheSwapMiss,
+        CacheSwapWrite,
+        CacheSwapError,
+        QueueBackPressure,
+        LimitMemoryBudget,
+        SearchIndexBatchIndexed,
+        SearchIndexDocumentTruncated,
+        SearchIndexPartitionRetry,
+        TaskManagerTaskFailed,
+        TaskManagerTaskRetry,
+        TaskManagerTaskStalled,
+        TaskManagerTaskExpired,
+        SmtpDkim2DsnRejected,
+        SmtpSpfFromPass,
+        SmtpSpfFromFail,
+        SmtpDkimPass,
+        SmtpDkimFail,
+        SmtpDkim2Pass,
+        SmtpDkim2Fail,
+        SmtpDmarcPass,
+        SmtpDmarcFail,
+    ]
+);
+
+persisted_metrics!(
+    PERSISTED_GAUGES, is_persisted_gauge => [
+        QueueCount,
+        ServerMemory,
+        ServerBufferedMemorySmtp,
+        ServerBufferedMemoryRead,
+        CacheMessagesSize,
+        CacheMessagesLargeSize,
+        CacheSize,
+        SearchIndexPendingEmail,
+        SearchIndexPendingCalendar,
+        SearchIndexPendingContacts,
+        SearchIndexPendingFile,
+        SearchIndexPendingTracing,
+        TaskManagerPending,
+        TaskManagerDue,
+    ]
+);
+
+persisted_metrics!(
+    PERSISTED_HISTOGRAMS, is_persisted_histogram => [
+        MessageIngestTime,
+        SearchIndexIndexTime,
+        DeliveryTotalTime,
+        DeliveryAttemptTime,
+        DnsLookupTime,
+        StoreDataReadTime,
+        StoreDataWriteTime,
+        StoreBlobReadTime,
+        StoreBlobWriteTime,
+    ]
+);
+
 pub trait MetricsStore: Sync + Send {
     fn write_metrics(
         &self,
+        node_id: u64,
         timestamp: Option<u64>,
         history: SharedMetricHistory,
     ) -> impl Future<Output = trc::Result<()>> + Send;
@@ -49,36 +150,14 @@ pub type SharedMetricHistory = Arc<Mutex<MetricsHistory>>;
 impl MetricsStore for Store {
     async fn write_metrics(
         &self,
+        node_id: u64,
         _timestamp: Option<u64>,
         history_: SharedMetricHistory,
     ) -> trc::Result<()> {
         let mut batch = BatchBuilder::new();
         {
             let mut history_guard = history_.lock();
-            for event in [
-                MetricType::SmtpConnectionStart,
-                MetricType::ImapConnectionStart,
-                MetricType::Pop3ConnectionStart,
-                MetricType::ManageSieveConnectionStart,
-                MetricType::HttpConnectionStart,
-                MetricType::DeliveryAttemptStart,
-                MetricType::QueueMessageQueued,
-                MetricType::QueueAuthenticatedMessageQueued,
-                MetricType::QueueDsnQueued,
-                MetricType::QueueReportQueued,
-                MetricType::MessageIngestHam,
-                MetricType::MessageIngestSpam,
-                MetricType::AuthFailed,
-                MetricType::SecurityAuthenticationBan,
-                MetricType::SecurityScanBan,
-                MetricType::SecurityAbuseBan,
-                MetricType::SecurityLoiterBan,
-                MetricType::SecurityIpBlocked,
-                MetricType::IncomingReportDmarcReport,
-                MetricType::IncomingReportDmarcReportWithWarnings,
-                MetricType::IncomingReportTlsReport,
-                MetricType::IncomingReportTlsReportWithWarnings,
-            ] {
+            for &event in PERSISTED_COUNTERS {
                 let reading = Collector::read_metric_counter(event.event_id());
                 if reading > 0 {
                     let history = history_guard.events.entry(event).or_insert(0);
@@ -86,10 +165,10 @@ impl MetricsStore for Store {
                     *history = reading;
 
                     if diff > 0 {
-                        #[cfg(not(any(feature = "dev_mode", feature = "test_mode")))]
+                        #[cfg(not(any(feature = "dev_mode", stalwart_tests)))]
                         let metric_id = history_guard.id_generator.generate();
 
-                        #[cfg(any(feature = "dev_mode", feature = "test_mode"))]
+                        #[cfg(any(feature = "dev_mode", stalwart_tests))]
                         let metric_id = _timestamp
                             .map(|timestamp| {
                                 SnowflakeIdGenerator::global_id_from_timestamp(timestamp).unwrap()
@@ -101,6 +180,7 @@ impl MetricsStore for Store {
                             Metric::Counter(MetricCount {
                                 count: diff as u64,
                                 metric: event,
+                                node_id,
                             })
                             .to_pickled_vec(),
                         );
@@ -110,45 +190,33 @@ impl MetricsStore for Store {
 
             for gauge in Collector::collect_gauges(true) {
                 let metric = gauge.id();
-                if matches!(metric, MetricType::QueueCount | MetricType::ServerMemory) {
+                if is_persisted_gauge(metric) {
                     let value = gauge.get();
-                    if value > 0 {
-                        #[cfg(not(any(feature = "dev_mode", feature = "test_mode")))]
-                        let metric_id = history_guard.id_generator.generate();
+                    #[cfg(not(any(feature = "dev_mode", stalwart_tests)))]
+                    let metric_id = history_guard.id_generator.generate();
 
-                        #[cfg(any(feature = "dev_mode", feature = "test_mode"))]
-                        let metric_id = _timestamp
-                            .map(|timestamp| {
-                                SnowflakeIdGenerator::global_id_from_timestamp(timestamp).unwrap()
-                            })
-                            .unwrap_or_else(|| history_guard.id_generator.generate());
+                    #[cfg(any(feature = "dev_mode", stalwart_tests))]
+                    let metric_id = _timestamp
+                        .map(|timestamp| {
+                            SnowflakeIdGenerator::global_id_from_timestamp(timestamp).unwrap()
+                        })
+                        .unwrap_or_else(|| history_guard.id_generator.generate());
 
-                        batch.set(
-                            ValueClass::Telemetry(TelemetryClass::Metric(metric_id)),
-                            Metric::Gauge(MetricCount {
-                                count: value,
-                                metric,
-                            })
-                            .to_pickled_vec(),
-                        );
-                    }
+                    batch.set(
+                        ValueClass::Telemetry(TelemetryClass::Metric(metric_id)),
+                        Metric::Gauge(MetricCount {
+                            count: value,
+                            metric,
+                            node_id,
+                        })
+                        .to_pickled_vec(),
+                    );
                 }
             }
 
             for histogram in Collector::collect_histograms(true) {
                 let metric = histogram.id();
-                if matches!(
-                    metric,
-                    MetricType::MessageIngestTime
-                        | MetricType::MessageIngestIndexTime
-                        | MetricType::DeliveryTotalTime
-                        | MetricType::DeliveryAttemptTime
-                        | MetricType::DnsLookupTime
-                        | MetricType::StoreDataReadTime
-                        | MetricType::StoreDataWriteTime
-                        | MetricType::StoreBlobReadTime
-                        | MetricType::StoreBlobWriteTime
-                ) {
+                if is_persisted_histogram(metric) {
                     let history = history_guard.histograms.entry(metric).or_default();
                     let sum = histogram.sum();
                     let count = histogram.count();
@@ -157,10 +225,10 @@ impl MetricsStore for Store {
                     history.sum = sum;
                     history.count = count;
                     if diff_sum > 0 || diff_count > 0 {
-                        #[cfg(not(any(feature = "dev_mode", feature = "test_mode")))]
+                        #[cfg(not(any(feature = "dev_mode", stalwart_tests)))]
                         let metric_id = history_guard.id_generator.generate();
 
-                        #[cfg(any(feature = "dev_mode", feature = "test_mode"))]
+                        #[cfg(any(feature = "dev_mode", stalwart_tests))]
                         let metric_id = _timestamp
                             .map(|timestamp| {
                                 SnowflakeIdGenerator::global_id_from_timestamp(timestamp).unwrap()
@@ -169,7 +237,13 @@ impl MetricsStore for Store {
 
                         batch.set(
                             ValueClass::Telemetry(TelemetryClass::Metric(metric_id)),
-                            Metric::Histogram(MetricSum { count, metric, sum }).to_pickled_vec(),
+                            Metric::Histogram(MetricSum {
+                                count: diff_count,
+                                metric,
+                                sum: diff_sum,
+                                node_id,
+                            })
+                            .to_pickled_vec(),
                         );
                     }
                 }
@@ -177,7 +251,7 @@ impl MetricsStore for Store {
         }
 
         if !batch.is_empty() {
-            self.write(batch.build_all())
+            self.write_batch(&mut batch)
                 .await
                 .caused_by(trc::location!())?;
         }

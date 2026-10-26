@@ -8,6 +8,7 @@
 pub mod journald;
 pub mod log;
 pub mod otel;
+pub mod spans;
 pub mod stdout;
 
 // SPDX-SnippetBegin
@@ -15,8 +16,8 @@ pub mod stdout;
 // SPDX-License-Identifier: LicenseRef-SEL
 #[cfg(feature = "enterprise")]
 pub mod store;
-// SPDX-SnippetEnd
 
+#[cfg(feature = "enterprise")]
 use registry::{
     schema::structs::{
         Trace, TraceEvent, TraceKeyValue, TraceValue, TraceValueBoolean, TraceValueDuration,
@@ -25,8 +26,10 @@ use registry::{
     },
     types::{datetime::UTCDateTime, ipaddr::IpAddr, list::List},
 };
+#[cfg(feature = "enterprise")]
 use trc::{Event, EventDetails, Value};
 
+#[cfg(feature = "enterprise")]
 pub trait TraceEvents {
     fn build_trace_events<'x>(
         span_events: impl IntoIterator<Item = &'x Event<EventDetails>>,
@@ -39,6 +42,7 @@ pub trait TraceEvents {
     ) -> Self;
 }
 
+#[cfg(feature = "enterprise")]
 impl TraceEvents for Trace {
     fn build_trace_events<'x>(
         span_events: impl IntoIterator<Item = &'x Event<EventDetails>>,
@@ -75,6 +79,7 @@ impl TraceEvents for Trace {
     }
 }
 
+#[cfg(feature = "enterprise")]
 fn map_value(value: &Value) -> TraceValue {
     match value {
         Value::String(value) => TraceValue::String(TraceValueString {
@@ -90,7 +95,7 @@ fn map_value(value: &Value) -> TraceValue {
         }),
         Value::Duration(value) => TraceValue::Duration(TraceValueDuration { value: *value }),
         Value::Bytes(items) => TraceValue::String(TraceValueString {
-            value: String::from_utf8_lossy(items).to_string(),
+            value: String::from_utf8_lossy(items).into_owned(),
         }),
         Value::Bool(value) => TraceValue::Boolean(TraceValueBoolean { value: *value }),
         Value::Ipv4(ipv4_addr) => TraceValue::IpAddr(TraceValueIpAddr {
@@ -116,3 +121,4 @@ fn map_value(value: &Value) -> TraceValue {
         Value::None => TraceValue::Null,
     }
 }
+// SPDX-SnippetEnd

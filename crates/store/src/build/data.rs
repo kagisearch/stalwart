@@ -4,11 +4,19 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::{Store, registry::bootstrap::Bootstrap};
+use crate::Store;
+use registry::schema::structs::DataStore;
+// SPDX-SnippetBegin
+// SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+// SPDX-License-Identifier: LicenseRef-SEL
+#[cfg(feature = "enterprise")]
+use crate::registry::bootstrap::Bootstrap;
+#[cfg(feature = "enterprise")]
 use registry::schema::{
     prelude::ObjectType,
-    structs::{DataStore, MetricsStore, TracingStore},
+    structs::{MetricsStore, TracingStore},
 };
+// SPDX-SnippetEnd
 
 #[allow(unreachable_patterns)]
 impl Store {
@@ -33,6 +41,10 @@ impl Store {
         }
     }
 
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     pub async fn build_tracing(bp: &mut Bootstrap) -> Option<Self> {
         let result = match bp.setting_infallible::<TracingStore>().await {
             TracingStore::Disabled => Ok(None),
@@ -63,6 +75,7 @@ impl Store {
         }
     }
 
+    #[cfg(feature = "enterprise")]
     pub async fn build_metrics(bp: &mut Bootstrap) -> Option<Self> {
         let result = match bp.setting_infallible::<MetricsStore>().await {
             MetricsStore::Disabled => Ok(None),
@@ -92,4 +105,5 @@ impl Store {
             }
         }
     }
+    // SPDX-SnippetEnd
 }

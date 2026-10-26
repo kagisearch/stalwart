@@ -68,7 +68,12 @@ impl ShardedBlob {
 
     #[inline(always)]
     fn get_store(&self, key: &[u8]) -> &BlobStore {
-        &self.stores[xxhash_rust::xxh3::xxh3_64(key) as usize % self.stores.len()]
+        &self.stores[self.shard_of(key)]
+    }
+
+    #[inline(always)]
+    fn shard_of(&self, key: &[u8]) -> usize {
+        xxhash_rust::xxh3::xxh3_64(key) as usize % self.stores.len()
     }
 
     pub async fn get_blob(
@@ -112,21 +117,21 @@ impl ShardedBlob {
         .await
     }
 
-    pub async fn put_blob(&self, key: &[u8], data: &[u8]) -> trc::Result<()> {
+    pub async fn put_blob(&self, key: &[u8], data: Vec<u8>) -> trc::Result<()> {
         async move {
             match self.get_store(key) {
                 BlobStore::Store(store) => match store {
                     #[cfg(feature = "sqlite")]
                     Store::SQLite(store) => store.put_blob(key, data).await,
                     #[cfg(feature = "foundation")]
-                    Store::FoundationDb(store) => store.put_blob(key, data).await,
+                    Store::FoundationDb(store) => store.put_blob(key, &data).await,
                     #[cfg(feature = "postgres")]
-                    Store::PostgreSQL(store) => store.put_blob(key, data).await,
+                    Store::PostgreSQL(store) => store.put_blob(key, &data).await,
                     #[cfg(feature = "mysql")]
-                    Store::MySQL(store) => store.put_blob(key, data).await,
+                    Store::MySQL(store) => store.put_blob(key, &data).await,
                     #[cfg(feature = "rocks")]
                     Store::RocksDb(store) => store.put_blob(key, data).await,
-                    Store::Ephemeral(store) => store.put_blob(key, data).await,
+                    Store::Ephemeral(store) => store.put_blob(key, &data).await,
                     // SPDX-SnippetBegin
                     // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
                     // SPDX-License-Identifier: LicenseRef-SEL
@@ -135,10 +140,10 @@ impl ShardedBlob {
                         any(feature = "postgres", feature = "mysql")
                     ))]
                     // SPDX-SnippetEnd
-                    Store::SQLReadReplica(store) => store.put_blob(key, data).await,
+                    Store::SQLReadReplica(store) => store.put_blob(key, &data).await,
                     Store::None => Err(trc::StoreEvent::NotConfigured.into()),
                 },
-                BlobStore::Fs(store) => store.put_blob(key, data).await,
+                BlobStore::Fs(store) => store.put_blob(key, &data).await,
                 #[cfg(feature = "s3")]
                 BlobStore::S3(store) => store.put_blob(key, data).await,
                 #[cfg(feature = "azure")]
@@ -184,6 +189,26 @@ impl ShardedBlob {
             }
         }
         .await
+    }
+
+    pub async fn delete_blobs(&self, keys: &[&[u8]]) -> trc::Result<()> {
+        let per_shard = keys.len().div_ceil(self.stores.len().max(1));
+        let mut shards = self
+            .stores
+            .iter()
+            .map(|_| Vec::with_capacity(per_shard))
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(shard) = shards.get_mut(self.shard_of(key)) {
+                shard.push(*key);
+            }
+        }
+        for (store, keys) in self.stores.iter().zip(&shards) {
+            if !keys.is_empty() {
+                Box::pin(store.delete_blobs(keys)).await?;
+            }
+        }
+        Ok(())
     }
 
     pub fn into_single(self) -> BlobStore {

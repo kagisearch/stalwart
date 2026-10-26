@@ -21,8 +21,14 @@ pub struct Storage {
     pub blob: BlobStore,
     pub search: SearchStore,
     pub memory: InMemoryStore,
+    // SPDX-SnippetBegin
+    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+    // SPDX-License-Identifier: LicenseRef-SEL
+    #[cfg(feature = "enterprise")]
     pub metrics: Store,
+    #[cfg(feature = "enterprise")]
     pub tracing: Store,
+    // SPDX-SnippetEnd
     pub coordinator: Coordinator,
     pub directory: Option<Arc<Directory>>,
     pub directories: IdMap<Directory>,
@@ -48,8 +54,14 @@ impl Storage {
             search,
             coordinator: Coordinator::build(bp, &memory).await.unwrap_or_default(),
             memory,
+            // SPDX-SnippetBegin
+            // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+            // SPDX-License-Identifier: LicenseRef-SEL
+            #[cfg(feature = "enterprise")]
             tracing: Store::build_tracing(bp).await.unwrap_or_default(),
+            #[cfg(feature = "enterprise")]
             metrics: Store::build_metrics(bp).await.unwrap_or_default(),
+            // SPDX-SnippetEnd
             directory: directory.default_directory,
             directories: directory.directories,
         }

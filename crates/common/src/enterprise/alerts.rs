@@ -10,7 +10,8 @@
 
 use super::{AlertContent, AlertContentToken, AlertMethod};
 use crate::Server;
-use crate::expr::functions::EmptyResolver;
+use crate::expr::{Bump, functions::EmptyResolver};
+use compact_str::CompactString;
 use mail_builder::{
     MessageBuilder,
     headers::{
@@ -18,7 +19,6 @@ use mail_builder::{
         address::{Address, EmailAddress},
     },
 };
-use registry::schema::prelude::Property;
 use std::fmt::Write;
 use trc::{Collector, TelemetryEvent};
 
@@ -36,16 +36,11 @@ impl Server {
             return None;
         }
         let mut messages = Vec::new();
+        let mut arena = Bump::new();
 
         for alert in alerts {
             if !self
-                .eval_expr(
-                    &alert.condition,
-                    &EmptyResolver,
-                    alert.id,
-                    Property::Condition,
-                    0,
-                )
+                .eval_if(&alert.condition, &EmptyResolver, &mut arena, 0)
                 .await
                 .unwrap_or(false)
             {
@@ -66,7 +61,7 @@ impl Server {
                             Id = alert.id.id().id(),
                             To = to
                                 .iter()
-                                .map(|t| trc::Value::from(t.to_string()))
+                                .map(|t| trc::Value::from(CompactString::from(t)))
                                 .collect::<Vec<_>>(),
                             Details = subject.clone()
                         );
