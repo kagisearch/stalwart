@@ -95,7 +95,7 @@ impl RequestHandler for Server {
         let add_created_ids = request.created_ids.is_some();
         let using = request.using;
         let mut response = Response::new(
-            access_token.state(),
+            access_token.session_state(),
             request.created_ids.unwrap_or_default(),
             request.method_calls.len(),
         );

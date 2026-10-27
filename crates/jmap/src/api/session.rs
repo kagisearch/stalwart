@@ -106,7 +106,7 @@ impl SessionHandler for Server {
         access_token: &AccessToken,
     ) -> trc::Result<Session> {
         let mut session = Session::new(base_url, &self.core.jmap.capabilities);
-        session.set_state(access_token.state());
+        session.set_state(access_token.session_state());
         if access_token.oauth_scopes().is_some() {
             for capability in Capability::all_capabilities() {
                 if !access_token.allows_oauth_scopes(capability_scopes(*capability)) {

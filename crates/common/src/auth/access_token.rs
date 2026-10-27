@@ -535,6 +535,19 @@ impl AccessToken {
         s.finish() as u32
     }
 
+    // The JMAP session state. Unlike state(), it covers the permissions and
+    // the OAuth scopes, since they decide which capabilities the session
+    // lists, and it uses a fixed seed, since a client compares it across
+    // responses that any node may send, before or after a restart.
+    pub fn session_state(&self) -> u32 {
+        let mut s = xxh3::Xxh3Default::new();
+        self.inner.member_of.hash(&mut s);
+        self.inner.access_to.hash(&mut s);
+        self.effective_permissions().hash(&mut s);
+        self.oauth_scopes().hash(&mut s);
+        s.finish() as u32
+    }
+
     #[inline(always)]
     pub fn account_id(&self) -> u32 {
         self.inner.account_id
@@ -1204,3 +1217,50 @@ fn hash_credential_permissions(hasher: &mut AHasher, permissions: &structs::Cred
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/common/src/auth/access_token/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod session_state_tests {
+    use super::AccessToken;
+    use crate::auth::{TokenScope, oauth::scope::OAuthScopes};
+    use registry::schema::enums::Permission;
+
+    #[test]
+    fn session_state_follows_permissions() {
+        let mail = AccessToken::from_permissions(1, [Permission::JmapEmailGet]);
+        let mail_and_send = AccessToken::from_permissions(
+            1,
+            [
+                Permission::JmapEmailGet,
+                Permission::JmapEmailSubmissionCreate,
+            ],
+        );
+
+        assert_eq!(mail.state(), mail_and_send.state());
+        assert_ne!(mail.session_state(), mail_and_send.session_state());
+    }
+
+    #[test]
+    fn session_state_follows_oauth_scopes() {
+        let unscoped = AccessToken::from_permissions(1, [Permission::JmapEmailGet]);
+        let mail_only = unscoped
+            .clone()
+            .with_token_scope(Some(TokenScope::External {
+                scopes: OAuthScopes::MAIL,
+            }));
+        let full = unscoped
+            .clone()
+            .with_token_scope(Some(TokenScope::External {
+                scopes: OAuthScopes::FULL,
+            }));
+
+        assert_ne!(unscoped.session_state(), mail_only.session_state());
+        assert_eq!(unscoped.session_state(), full.session_state());
+    }
+
+    #[test]
+    fn session_state_is_the_same_in_every_process() {
+        // A seed picked at startup would change this value on every run.
+        let mail = AccessToken::from_permissions(1, [Permission::JmapEmailGet]);
+        assert_eq!(mail.session_state(), 4107043386);
+    }
+}
