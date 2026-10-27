@@ -244,6 +244,13 @@ impl<'a> Addresses<'a> {
 }
 
 fn date_value<'a>(date: &mail_parser::DateTime) -> JmapValue<'a> {
+    // FORK: mail-parser only range-checks the month, so a header such as
+    // `Date: 45 Jan 2024 99:99:99 +0000` would otherwise be serialized as
+    // `2024-01-45T99:99:99Z`, which strict RFC 3339 parsers reject. JMAP
+    // types these dates as nullable, so an invalid one is reported as absent.
+    if !date.is_valid() {
+        return Value::Null;
+    }
     Value::Element(EmailValue::Date(UTCDate {
         year: date.year,
         month: date.month,
@@ -255,4 +262,42 @@ fn date_value<'a>(date: &mail_parser::DateTime) -> JmapValue<'a> {
         tz_hour: date.tz_hour,
         tz_minute: date.tz_minute,
     }))
+}
+
+// FORK: the invalid-date guard in `date_value` has no upstream test home.
+#[cfg(test)]
+mod date_value_tests {
+    use super::date_value;
+    use jmap_proto::object::email::EmailValue;
+    use jmap_tools::Value;
+
+    fn date(day: u8, hour: u8) -> mail_parser::DateTime {
+        mail_parser::DateTime {
+            year: 2024,
+            month: 1,
+            day,
+            hour,
+            minute: 30,
+            second: 8,
+            tz_before_gmt: false,
+            tz_hour: 0,
+            tz_minute: 0,
+        }
+    }
+
+    #[test]
+    fn invalid_date_is_null() {
+        assert!(date_value(&date(45, 99)) == Value::Null);
+        assert!(date_value(&date(0, 10)) == Value::Null);
+    }
+
+    #[test]
+    fn valid_date_is_rendered() {
+        match date_value(&date(6, 15)) {
+            Value::Element(EmailValue::Date(utc)) => {
+                assert_eq!(utc.to_string(), "2024-01-06T15:30:08Z");
+            }
+            _ => panic!("expected a date value"),
+        }
+    }
 }
