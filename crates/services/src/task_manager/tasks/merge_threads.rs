@@ -10,8 +10,17 @@ use email::message::{
     ingest::{ThreadMerge, has_message_id},
     messagedata::MessageData,
 };
+// FORK: Message-ID threading without a subject match.
+use email::{
+    cache::{MessageCacheFetch, email::MessageCacheAccess},
+    message::{
+        ingest::message_id_index, messagedata::EmailMessageData, metadata::MetadataRow,
+        thread::ThreadSubject,
+    },
+};
 use registry::schema::structs::TaskMergeThreads;
-use std::{ops::RangeInclusive, str::FromStr, time::Duration};
+use std::{borrow::Cow, ops::RangeInclusive, str::FromStr, time::Duration};
+use store::Deserialize;
 use store::{
     IterateParams, Key, U32_LEN, ValueKey,
     ahash::AHashMap,
@@ -135,6 +144,26 @@ async fn merge_threads(
             .await
             .caused_by(trc::location!())?;
 
+        // FORK: Message-ID threading without a subject match. Also match the
+        // messages whose own Message-ID is referenced, whatever their subject,
+        // as ingest did when it scheduled this task. Without this a merge
+        // whose losing thread lives in another subject bucket is a no-op.
+        {
+            let seen = thread_merge
+                .thread_groups()
+                .flat_map(|(_, document_ids)| document_ids.iter().copied())
+                .collect::<Vec<_>>();
+            for (other_thread_id, document_id) in
+                message_id_index::threads_by_message_id(server, account_id, &message_ids)
+                    .await
+                    .caused_by(trc::location!())?
+            {
+                if !seen.contains(&document_id) {
+                    thread_merge.add(other_thread_id, document_id);
+                }
+            }
+        }
+
         if thread_merge.num_thread_ids() < 2 {
             // Another process merged the threads already?
             return Ok(Outcome::done());
@@ -151,6 +180,71 @@ async fn merge_threads(
         }
 
         let thread_id = thread_merge.merge_thread_id();
+
+        // FORK: Message-ID threading without a subject match. A thread may
+        // span subject buckets, so a losing thread can hold messages outside
+        // the bucket scanned above. Every message of a losing thread is moved,
+        // each under the subject hash its threading entry is keyed by, so none
+        // is left on a thread id that is logged as deleted below.
+        let mut groups: Vec<(u32, Vec<(u32, Hash128)>)> = Vec::new();
+        {
+            let cache = server
+                .get_cached_messages(account_id)
+                .await
+                .caused_by(trc::location!())?;
+            let mut unresolved: Vec<(u32, u32)> = Vec::new();
+            for (&group_thread_id, document_ids) in thread_merge.thread_groups() {
+                if group_thread_id != thread_id {
+                    let mut group_documents = document_ids.clone();
+                    group_documents.extend(
+                        cache
+                            .in_thread(group_thread_id)
+                            .map(|message| message.document_id()),
+                    );
+                    group_documents.sort_unstable();
+                    group_documents.dedup();
+                    unresolved.extend(
+                        group_documents
+                            .into_iter()
+                            .map(|document_id| (group_thread_id, document_id)),
+                    );
+                }
+            }
+            let mut document_ids = unresolved
+                .iter()
+                .map(|(_, document_id)| *document_id)
+                .collect::<Vec<_>>();
+            document_ids.sort_unstable();
+            document_ids.dedup();
+            let mut hashes: AHashMap<u32, Hash128> = AHashMap::with_capacity(document_ids.len());
+            if !document_ids.is_empty() {
+                server
+                    .message_metadata(account_id, &document_ids, |document_id, bytes| {
+                        let row = MetadataRow::deserialize(bytes)?;
+                        let metadata = row.unarchive()?;
+                        let headers;
+                        let subject = match metadata.thread_subject() {
+                            ThreadSubject::Resolved(name) => Cow::Borrowed(name),
+                            ThreadSubject::InHeaders => {
+                                headers = row.raw_headers()?;
+                                metadata.thread_subject_in(&headers)
+                            }
+                        };
+                        hashes.insert(document_id, email::message::ingest::thread_hash(&subject));
+                        Ok(true)
+                    })
+                    .await
+                    .caused_by(trc::location!())?;
+            }
+            for (group_thread_id, document_id) in unresolved {
+                if let Some(&subject_hash) = hashes.get(&document_id) {
+                    match groups.iter_mut().find(|(id, _)| *id == group_thread_id) {
+                        Some((_, group)) => group.push((document_id, subject_hash)),
+                        None => groups.push((group_thread_id, vec![(document_id, subject_hash)])),
+                    }
+                }
+            }
+        }
 
         // Delete all but the most common threadId
         let mut batch = BatchBuilder::new();
@@ -169,9 +263,9 @@ async fn merge_threads(
         // Move messages to the new threadId
         batch.with_collection(Collection::Email);
 
-        for (&group_thread_id, document_ids) in thread_merge.thread_groups() {
+        for &(group_thread_id, ref document_ids) in &groups {
             if thread_id != group_thread_id {
-                for &document_id in document_ids {
+                for &(document_id, subject_hash) in document_ids {
                     if let Some(data) = server
                         .store()
                         .get_value::<MessageData>(ValueKey::archive(
@@ -210,7 +304,7 @@ async fn merge_threads(
                         batch.merge_fnc(
                             ValueClass::IndexProperty(IndexPropertyClass::Hash {
                                 property: EmailField::Threading.into(),
-                                hash: thread_hash,
+                                hash: subject_hash,
                             }),
                             move |_, bytes| {
                                 let mut thread_index = bytes

@@ -804,6 +804,8 @@ impl EmailIngest for Server {
                 params.preview_text.as_deref(),
             )
             .caused_by(trc::location!())?;
+        // FORK: Message-ID threading without a subject match.
+        message_id_index::index(batch, &message_id_index::own_message_ids(&message));
         batch
             .set(
                 ValueClass::IndexProperty(IndexPropertyClass::Hash {
@@ -1042,6 +1044,18 @@ impl EmailIngest for Server {
             .await
             .caused_by(trc::location!())?;
         result.bucket_full = rows >= THREAD_SCAN_WINDOW;
+
+        // FORK: also match the messages whose own Message-ID this message
+        // references, regardless of subject. Documents the subject scan
+        // already matched are not counted twice.
+        for (thread_id, document_id) in
+            message_id_index::threads_by_message_id(self, account_id, message_ids).await?
+        {
+            if !result.matched_ids.contains(&document_id) {
+                thread_merge.add(thread_id, document_id);
+                result.matched_ids.push(document_id);
+            }
+        }
 
         match thread_merge.num_thread_ids() {
             0 => Ok(result),
@@ -1340,6 +1354,8 @@ impl ThreadMerge {
 
 mod checks;
 pub mod group;
+// FORK: Message-ID threading without a subject match.
+pub mod message_id_index;
 pub mod recheck;
 #[cfg(all(test, stalwart_tests))]
 #[rustfmt::skip]

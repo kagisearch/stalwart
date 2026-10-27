@@ -854,6 +854,17 @@ fn delete_email_metadata(
                 }
             };
             metadata.unindex(batch, &thread_subject);
+            // FORK: Message-ID threading without a subject match.
+            {
+                let headers = row.raw_headers().caused_by(trc::location!())?;
+                email::message::ingest::message_id_index::unindex(
+                    batch,
+                    &email::message::ingest::message_id_index::own_message_ids_in(
+                        metadata.root().root_part().headers(),
+                        &headers,
+                    ),
+                );
+            }
 
             // SPDX-SnippetBegin
             // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>

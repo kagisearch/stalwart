@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::ingest::{EmailIngest, IngestedEmail};
+use super::ingest::{EmailIngest, IngestedEmail, message_id_index};
 use crate::message::{
     index::extractors::VisitText,
     ingest::ThreadInfo,
@@ -137,6 +137,8 @@ impl EmailCopy for Server {
                 });
             }
         }
+        // FORK: Message-ID threading without a subject match.
+        let own_message_ids = message_id_index::own_message_ids_in(root_headers, &headers);
         let envelope = metadata.root().envelope();
         let subject = metadata.thread_subject_with(root_headers, &headers);
         let sent_at = envelope.datetime().map(|date| date.to_timestamp());
@@ -255,7 +257,10 @@ impl EmailCopy for Server {
             .with_collection(Collection::Email)
             .create_document(document_slot)
             .custom(index_builder.with_changes(data))
-            .caused_by(trc::location!())?
+            .caused_by(trc::location!())?;
+        // FORK: Message-ID threading without a subject match.
+        message_id_index::index(&mut batch, &own_message_ids);
+        batch
             .set(
                 ValueClass::IndexProperty(IndexPropertyClass::Hash {
                     property: EmailField::Threading.into(),

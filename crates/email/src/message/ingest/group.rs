@@ -27,6 +27,9 @@ pub struct IngestGroup {
 
 #[derive(Default)]
 pub struct ThreadKey {
+    // FORK: Message-ID threading without a subject match. The subject hash
+    // no longer takes part in pending-thread matching.
+    #[allow(dead_code)]
     hash: Hash128,
     message_ids: Vec<u128>,
 }
@@ -73,11 +76,13 @@ impl IngestGroup {
             .threads
             .iter()
             .filter(|(pending, _)| {
-                pending.hash == key.hash
-                    && sorted_intersect(
-                        pending.message_ids.iter().copied(),
-                        key.message_ids.iter().copied(),
-                    )
+                // FORK: Message-ID threading without a subject match. The id
+                // lists include each message's own Message-ID, so a shared id
+                // is enough; the subjects need not match.
+                sorted_intersect(
+                    pending.message_ids.iter().copied(),
+                    key.message_ids.iter().copied(),
+                )
             })
             .map(|(_, thread_id)| *thread_id);
         let first = threads.next()?;
