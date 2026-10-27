@@ -405,20 +405,27 @@ impl PostgresStore {
                     query.push_str(field.column());
                     query.push(' ');
                     let key_pos = values.len() + 1;
-                    values.push(FilterParam::Text(key));
                     match op {
                         KeyValueMatch::Equals(value) => {
-                            let value_pos = values.len() + 1;
-                            let _ = write!(query, "->> ${key_pos} = ${value_pos}");
-                            values.push(FilterParam::Text(value));
+                            // FORK: containment is what the column's GIN index
+                            // serves, where `->> key = value` reads every row of
+                            // the account. Key/value fields are stored as flat
+                            // objects of strings, so both forms match the same
+                            // rows. The pair binds as a one-entry jsonb object.
+                            let _ = write!(query, "@> ${key_pos}");
+                            values.push(FilterParam::Json(
+                                serde_json::json!({ key.as_str(): value }),
+                            ));
                         }
                         KeyValueMatch::Contains(value) => {
+                            values.push(FilterParam::Text(key));
                             let value_pos = values.len() + 1;
                             let _ =
                                 write!(query, "->> ${key_pos} ILIKE '%' || ${value_pos} || '%'");
                             values.push(FilterParam::Text(value));
                         }
                         KeyValueMatch::Exists => {
+                            values.push(FilterParam::Text(key));
                             let _ = write!(query, " ? ${key_pos}");
                         }
                     }
@@ -791,6 +798,8 @@ enum FilterParam<'x> {
     Text(&'x str),
     Integer(u64, IntegerColumn),
     Ids(&'x [i32]),
+    // FORK: jsonb containment operand for key/value equality.
+    Json(serde_json::Value),
 }
 
 impl FilterParam<'_> {
@@ -800,6 +809,7 @@ impl FilterParam<'_> {
             FilterParam::Integer(_, IntegerColumn::Int4) => Type::INT4,
             FilterParam::Integer(_, IntegerColumn::Int8) => Type::INT8,
             FilterParam::Ids(_) => Type::INT4_ARRAY,
+            FilterParam::Json(_) => Type::JSONB,
         }
     }
 }
@@ -817,6 +827,7 @@ impl ToSql for FilterParam<'_> {
                 _ => i64::try_from(*value)?.to_sql(ty, out),
             },
             FilterParam::Ids(ids) => ids.to_sql(ty, out),
+            FilterParam::Json(value) => value.to_sql(ty, out),
         }
     }
 
@@ -836,6 +847,7 @@ impl ToSql for FilterParam<'_> {
                 _ => i64::try_from(*value)?.to_sql_checked(ty, out),
             },
             FilterParam::Ids(ids) => ids.to_sql_checked(ty, out),
+            FilterParam::Json(value) => value.to_sql_checked(ty, out),
         }
     }
 }
