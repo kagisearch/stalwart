@@ -346,6 +346,11 @@ impl EventType {
             b"mta-hook.action-reject" => EventType::MtaHook(MtaHookEvent::ActionReject),
             b"mta-hook.action-quarantine" => EventType::MtaHook(MtaHookEvent::ActionQuarantine),
             b"mta-hook.error" => EventType::MtaHook(MtaHookEvent::Error),
+            b"delivery-hook.action-accept" => EventType::DeliveryHook(DeliveryHookEvent::ActionAccept),
+            b"delivery-hook.action-discard" => EventType::DeliveryHook(DeliveryHookEvent::ActionDiscard),
+            b"delivery-hook.action-reject" => EventType::DeliveryHook(DeliveryHookEvent::ActionReject),
+            b"delivery-hook.action-quarantine" => EventType::DeliveryHook(DeliveryHookEvent::ActionQuarantine),
+            b"delivery-hook.error" => EventType::DeliveryHook(DeliveryHookEvent::Error),
             b"mta-sts.authorized" => EventType::MtaSts(MtaStsEvent::Authorized),
             b"mta-sts.not-authorized" => EventType::MtaSts(MtaStsEvent::NotAuthorized),
             b"mta-sts.policy-fetch" => EventType::MtaSts(MtaStsEvent::PolicyFetch),
@@ -1004,6 +1009,11 @@ impl EventType {
             b"mta-hook.action-reject" => EventType::MtaHook(MtaHookEvent::ActionReject),
             b"mta-hook.action-quarantine" => EventType::MtaHook(MtaHookEvent::ActionQuarantine),
             b"mta-hook.error" => EventType::MtaHook(MtaHookEvent::Error),
+            b"delivery-hook.action-accept" => EventType::DeliveryHook(DeliveryHookEvent::ActionAccept),
+            b"delivery-hook.action-discard" => EventType::DeliveryHook(DeliveryHookEvent::ActionDiscard),
+            b"delivery-hook.action-reject" => EventType::DeliveryHook(DeliveryHookEvent::ActionReject),
+            b"delivery-hook.action-quarantine" => EventType::DeliveryHook(DeliveryHookEvent::ActionQuarantine),
+            b"delivery-hook.error" => EventType::DeliveryHook(DeliveryHookEvent::Error),
             b"mta-sts.authorized" => EventType::MtaSts(MtaStsEvent::Authorized),
             b"mta-sts.not-authorized" => EventType::MtaSts(MtaStsEvent::NotAuthorized),
             b"mta-sts.policy-fetch" => EventType::MtaSts(MtaStsEvent::PolicyFetch),
@@ -1734,6 +1744,19 @@ impl EventType {
             EventType::MtaHook(MtaHookEvent::ActionReject) => "mta-hook.action-reject",
             EventType::MtaHook(MtaHookEvent::ActionQuarantine) => "mta-hook.action-quarantine",
             EventType::MtaHook(MtaHookEvent::Error) => "mta-hook.error",
+            EventType::DeliveryHook(DeliveryHookEvent::ActionAccept) => {
+                "delivery-hook.action-accept"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::ActionDiscard) => {
+                "delivery-hook.action-discard"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::ActionReject) => {
+                "delivery-hook.action-reject"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::ActionQuarantine) => {
+                "delivery-hook.action-quarantine"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::Error) => "delivery-hook.error",
             EventType::MtaSts(MtaStsEvent::Authorized) => "mta-sts.authorized",
             EventType::MtaSts(MtaStsEvent::NotAuthorized) => "mta-sts.not-authorized",
             EventType::MtaSts(MtaStsEvent::PolicyFetch) => "mta-sts.policy-fetch",
@@ -2519,6 +2542,11 @@ impl EventType {
             EventType::MtaHook(MtaHookEvent::ActionReject) => 291,
             EventType::MtaHook(MtaHookEvent::ActionQuarantine) => 290,
             EventType::MtaHook(MtaHookEvent::Error) => 292,
+            EventType::DeliveryHook(DeliveryHookEvent::ActionAccept) => 655,
+            EventType::DeliveryHook(DeliveryHookEvent::ActionDiscard) => 656,
+            EventType::DeliveryHook(DeliveryHookEvent::ActionReject) => 657,
+            EventType::DeliveryHook(DeliveryHookEvent::ActionQuarantine) => 658,
+            EventType::DeliveryHook(DeliveryHookEvent::Error) => 659,
             EventType::MtaSts(MtaStsEvent::Authorized) => 293,
             EventType::MtaSts(MtaStsEvent::NotAuthorized) => 295,
             EventType::MtaSts(MtaStsEvent::PolicyFetch) => 296,
@@ -3244,6 +3272,11 @@ impl EventType {
             291 => Some(EventType::MtaHook(MtaHookEvent::ActionReject)),
             290 => Some(EventType::MtaHook(MtaHookEvent::ActionQuarantine)),
             292 => Some(EventType::MtaHook(MtaHookEvent::Error)),
+            655 => Some(EventType::DeliveryHook(DeliveryHookEvent::ActionAccept)),
+            656 => Some(EventType::DeliveryHook(DeliveryHookEvent::ActionDiscard)),
+            657 => Some(EventType::DeliveryHook(DeliveryHookEvent::ActionReject)),
+            658 => Some(EventType::DeliveryHook(DeliveryHookEvent::ActionQuarantine)),
+            659 => Some(EventType::DeliveryHook(DeliveryHookEvent::Error)),
             293 => Some(EventType::MtaSts(MtaStsEvent::Authorized)),
             295 => Some(EventType::MtaSts(MtaStsEvent::NotAuthorized)),
             296 => Some(EventType::MtaSts(MtaStsEvent::PolicyFetch)),
@@ -3783,6 +3816,10 @@ impl EventType {
             EventType::MtaHook(MtaHookEvent::ActionDiscard) => Level::Info,
             EventType::MtaHook(MtaHookEvent::ActionReject) => Level::Info,
             EventType::MtaHook(MtaHookEvent::ActionQuarantine) => Level::Info,
+            EventType::DeliveryHook(DeliveryHookEvent::ActionAccept) => Level::Info,
+            EventType::DeliveryHook(DeliveryHookEvent::ActionDiscard) => Level::Info,
+            EventType::DeliveryHook(DeliveryHookEvent::ActionReject) => Level::Info,
+            EventType::DeliveryHook(DeliveryHookEvent::ActionQuarantine) => Level::Info,
             EventType::MtaSts(MtaStsEvent::NotAuthorized) => Level::Info,
             EventType::MtaSts(MtaStsEvent::PolicyFetchError) => Level::Info,
             EventType::MtaSts(MtaStsEvent::InvalidPolicy) => Level::Info,
@@ -3995,6 +4032,7 @@ impl EventType {
             EventType::Milter(MilterEvent::Disconnected) => Level::Warn,
             EventType::Milter(MilterEvent::ParseError) => Level::Warn,
             EventType::MtaHook(MtaHookEvent::Error) => Level::Warn,
+            EventType::DeliveryHook(DeliveryHookEvent::Error) => Level::Warn,
             EventType::Network(NetworkEvent::ProxyError) => Level::Warn,
             EventType::Queue(QueueEvent::BackPressure) => Level::Warn,
             EventType::Registry(RegistryEvent::BuildWarning) => Level::Warn,
@@ -4466,6 +4504,19 @@ impl EventType {
             EventType::MtaHook(MtaHookEvent::ActionReject) => "MTA hook action: Reject",
             EventType::MtaHook(MtaHookEvent::ActionQuarantine) => "MTA hook action: Quarantine",
             EventType::MtaHook(MtaHookEvent::Error) => "MTA hook error",
+            EventType::DeliveryHook(DeliveryHookEvent::ActionAccept) => {
+                "Delivery hook action: Accept"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::ActionDiscard) => {
+                "Delivery hook action: Discard"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::ActionReject) => {
+                "Delivery hook action: Reject"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::ActionQuarantine) => {
+                "Delivery hook action: Quarantine"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::Error) => "Delivery hook error",
             EventType::MtaSts(MtaStsEvent::Authorized) => "Host authorized by MTA-STS policy",
             EventType::MtaSts(MtaStsEvent::NotAuthorized) => {
                 "Host not authorized by MTA-STS policy"
@@ -5520,6 +5571,19 @@ impl EventType {
                 "stalwart.mta_hook.action_quarantine"
             }
             EventType::MtaHook(MtaHookEvent::Error) => "stalwart.mta_hook.error",
+            EventType::DeliveryHook(DeliveryHookEvent::ActionAccept) => {
+                "stalwart.delivery_hook.action_accept"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::ActionDiscard) => {
+                "stalwart.delivery_hook.action_discard"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::ActionReject) => {
+                "stalwart.delivery_hook.action_reject"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::ActionQuarantine) => {
+                "stalwart.delivery_hook.action_quarantine"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::Error) => "stalwart.delivery_hook.error",
             EventType::MtaSts(MtaStsEvent::Authorized) => "stalwart.mta_sts.authorized",
             EventType::MtaSts(MtaStsEvent::NotAuthorized) => "stalwart.mta_sts.not_authorized",
             EventType::MtaSts(MtaStsEvent::InvalidPolicy) => "stalwart.mta_sts.invalid_policy",
@@ -6166,6 +6230,21 @@ impl EventType {
                 "stalwart_mta_hook_action_quarantine_total"
             }
             EventType::MtaHook(MtaHookEvent::Error) => "stalwart_mta_hook_error_total",
+            EventType::DeliveryHook(DeliveryHookEvent::ActionAccept) => {
+                "stalwart_delivery_hook_action_accept_total"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::ActionDiscard) => {
+                "stalwart_delivery_hook_action_discard_total"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::ActionReject) => {
+                "stalwart_delivery_hook_action_reject_total"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::ActionQuarantine) => {
+                "stalwart_delivery_hook_action_quarantine_total"
+            }
+            EventType::DeliveryHook(DeliveryHookEvent::Error) => {
+                "stalwart_delivery_hook_error_total"
+            }
             EventType::MtaSts(MtaStsEvent::Authorized) => "stalwart_mta_sts_authorized_total",
             EventType::MtaSts(MtaStsEvent::NotAuthorized) => {
                 "stalwart_mta_sts_not_authorized_total"
@@ -6824,6 +6903,11 @@ impl EventType {
             EventType::MtaHook(MtaHookEvent::ActionReject),
             EventType::MtaHook(MtaHookEvent::ActionQuarantine),
             EventType::MtaHook(MtaHookEvent::Error),
+            EventType::DeliveryHook(DeliveryHookEvent::ActionAccept),
+            EventType::DeliveryHook(DeliveryHookEvent::ActionDiscard),
+            EventType::DeliveryHook(DeliveryHookEvent::ActionReject),
+            EventType::DeliveryHook(DeliveryHookEvent::ActionQuarantine),
+            EventType::DeliveryHook(DeliveryHookEvent::Error),
             EventType::MtaSts(MtaStsEvent::Authorized),
             EventType::MtaSts(MtaStsEvent::NotAuthorized),
             EventType::MtaSts(MtaStsEvent::PolicyFetch),

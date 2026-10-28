@@ -38,7 +38,7 @@ pub async fn send_delivery_hook_request(
                 // A response the hook could not express is treated as a plain
                 // accept rather than failing the delivery.
                 trc::event!(
-                    MtaHook(trc::MtaHookEvent::Error),
+                    DeliveryHook(trc::DeliveryHookEvent::Error),
                     Reason = format!("Failed to parse delivery hook response: {err}"),
                     Contents = String::from_utf8_lossy(trimmed).into_owned(),
                 );

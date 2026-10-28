@@ -6,7 +6,7 @@
 
 // This file is auto-generated. Do not edit directly.
 
-pub const TOTAL_EVENT_COUNT: usize = 655;
+pub const TOTAL_EVENT_COUNT: usize = 660;
 pub const TOTAL_METRIC_COUNT: usize = 385;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,6 +25,7 @@ pub enum EventType {
     Cluster(ClusterEvent),
     Dane(DaneEvent),
     Delivery(DeliveryEvent),
+    DeliveryHook(DeliveryHookEvent),
     Dkim(DkimEvent),
     Dkim2(Dkim2Event),
     Dmarc(DmarcEvent),
@@ -531,6 +532,18 @@ pub enum MtaHookEvent {
     ActionReject = 291,
     ActionQuarantine = 290,
     Error = 292,
+}
+
+// FORK: delivery hook outcomes, kept apart from MtaHookEvent so logs and
+// metrics can tell the two hook families apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum DeliveryHookEvent {
+    ActionAccept = 655,
+    ActionDiscard = 656,
+    ActionReject = 657,
+    ActionQuarantine = 658,
+    Error = 659,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

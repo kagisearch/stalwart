@@ -539,7 +539,7 @@ async fn try_delivery_hook(
 
                 if response.replace_mailboxes && !resolved_file_into {
                     trc::event!(
-                        MtaHook(trc::MtaHookEvent::Error),
+                        DeliveryHook(trc::DeliveryHookEvent::Error),
                         AccountId = account_id,
                         Details = format!(
                             "Delivery hook '{}' requested replace_mailboxes but no fileInto target resolved, ignoring replacement",
@@ -552,7 +552,7 @@ async fn try_delivery_hook(
                 match response.action {
                     HookAction::Accept => {
                         trc::event!(
-                            MtaHook(trc::MtaHookEvent::ActionAccept),
+                            DeliveryHook(trc::DeliveryHookEvent::ActionAccept),
                             AccountId = account_id,
                             Details = format!("Delivery hook '{}' accepted", hook.id),
                             Elapsed = elapsed,
@@ -560,7 +560,7 @@ async fn try_delivery_hook(
                     }
                     HookAction::Discard => {
                         trc::event!(
-                            MtaHook(trc::MtaHookEvent::ActionDiscard),
+                            DeliveryHook(trc::DeliveryHookEvent::ActionDiscard),
                             AccountId = account_id,
                             Details = format!("Delivery hook '{}' discarded", hook.id),
                             Elapsed = elapsed,
@@ -573,7 +573,7 @@ async fn try_delivery_hook(
                     }
                     HookAction::Quarantine => {
                         trc::event!(
-                            MtaHook(trc::MtaHookEvent::ActionQuarantine),
+                            DeliveryHook(trc::DeliveryHookEvent::ActionQuarantine),
                             AccountId = account_id,
                             Details = format!("Delivery hook '{}' quarantined", hook.id),
                             Elapsed = elapsed,
@@ -585,7 +585,7 @@ async fn try_delivery_hook(
                     }
                     HookAction::Reject => {
                         trc::event!(
-                            MtaHook(trc::MtaHookEvent::ActionReject),
+                            DeliveryHook(trc::DeliveryHookEvent::ActionReject),
                             AccountId = account_id,
                             Details = format!("Delivery hook '{}' rejected", hook.id),
                             Elapsed = elapsed,
@@ -603,7 +603,7 @@ async fn try_delivery_hook(
             Err(err) => {
                 // Hook error - log and potentially fail
                 trc::event!(
-                    MtaHook(trc::MtaHookEvent::Error),
+                    DeliveryHook(trc::DeliveryHookEvent::Error),
                     AccountId = account_id,
                     Details = format!("Delivery hook '{}': {}", hook.id, err),
                     Elapsed = elapsed,
@@ -621,7 +621,7 @@ async fn try_delivery_hook(
     // behavior. A temporary failure is any error the delivery code does not
     // map to a permanent one, which `MessageIngest(Error)` is.
     if should_tempfail {
-        return Err(trc::EventType::MtaHook(trc::MtaHookEvent::Error)
+        return Err(trc::EventType::DeliveryHook(trc::DeliveryHookEvent::Error)
             .ctx(
                 trc::Key::Reason,
                 "Message temporarily rejected by delivery hook",
