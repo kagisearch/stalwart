@@ -625,6 +625,7 @@ impl EmailIngest for Server {
 
         // Encrypt message
         let do_encrypt = match params.source {
+            IngestSource::Jmap { .. } if params.keywords.contains(&Keyword::Draft) => false,
             IngestSource::Jmap { .. } | IngestSource::Imap { .. } => {
                 self.core.email.encrypt
                     && self.core.email.encrypt_append
