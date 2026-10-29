@@ -10,7 +10,7 @@ pull in all features from the main Stalwart project.
 * Do not make sweeping changes (e.g. changing formatting standards).
 * Keep changes isolated, in new files, where possible.
 * Add tests for new behavior to verify external changes don't cause regressions.
-    * Upstream keeps its tests in a sibling `stalwart-tests` checkout, referenced from the code by `#[path]` attributes. Fork tests go in our fork of that repository.
+    * Since v1.0 upstream keeps its tests in a private sibling checkout named `stalwart-tests`, referenced from the code by `#[path]` attributes. We maintain our own `stalwart-tests` repository in the same layout and tests go there, both the integration suite and unit tests for fork changes. Nothing in this repository's manifests refers to it.
 * Keep changes minimal, providing extensible functionality through hooks to eternal systems.
 * Avoid deduplication between fork code and new functionality.
     * This helps with merge conflicts at the cost of duplication.
@@ -47,5 +47,5 @@ In certain cases, it's worth aborting a merge and refactoring to make conflicts 
 Our custom build looks like:
 
 ```bash
-cargo build --release -p stalwart --no-default-features --features postgres
+cargo build --release -p stalwart --no-default-features --features "postgres s3 redis nats enterprise"
 ```

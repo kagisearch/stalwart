@@ -30,11 +30,11 @@
             ];
           };
 
-          # Feature set the kagi-email local dev build uses (kagi-email/flake.nix,
-          # overlays.default -> stalwart.cargoBuildFeatures). The image Cloud
-          # Build deploys to dev and prod is built from Dockerfile, which adds
-          # nats and redis on top of this.
-          kagiFeatures = "postgres s3";
+          # Feature set of the image Cloud Build deploys to dev and prod
+          # (Dockerfile). The kagi-email local dev build (kagi-email/flake.nix,
+          # overlays.default -> stalwart.cargoBuildFeatures) uses the same set;
+          # keep all three in sync.
+          kagiFeatures = "postgres s3 redis nats enterprise";
 
           # Feature set upstream CI builds for the release binaries (ci.yml).
           ciFeatures = "sqlite postgres mysql rocks s3 redis azure nats enterprise";
@@ -95,7 +95,8 @@
               CARGO_NET_RETRY = "10";
               CARGO_NET_GIT_FETCH_WITH_CLI = "true";
 
-              # Mirrors env from .github/workflows/test.yml.
+              # Mirrors env from the test workflow upstream shipped before v1.0.
+              # The suite now lives in ../stalwart-tests (see FORK.md).
               STORE = "RocksDb";
               RUST_MIN_STACK = "16777216";
 
@@ -108,7 +109,7 @@
               echo "Stalwart dev shell — $(rustc --version)"
               echo "Kagi Mail build:  cargo build --release -p stalwart --no-default-features --features \"${kagiFeatures}\""
               echo "CI build:         cargo build --release -p stalwart --no-default-features --features \"${ciFeatures}\""
-              echo "Tests need a running Docker daemon (testcontainers)."
+              echo "Tests:            cd ../stalwart-tests/integration && cargo test -p tests <group> (needs Docker)"
             '';
           };
         };
