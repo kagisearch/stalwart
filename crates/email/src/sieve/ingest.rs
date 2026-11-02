@@ -826,7 +826,7 @@ impl SieveScriptIngest for Server {
                         IngestEmail {
                             raw_message: &sieve_message.raw_message,
                             blob_hash,
-                            message: message.into(),
+                            message: Some(&message),
                             access_token,
                             mailbox_ids: sieve_message.file_into,
                             keywords: sieve_message.flags,

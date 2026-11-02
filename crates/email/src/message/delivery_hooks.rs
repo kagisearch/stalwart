@@ -199,7 +199,7 @@ impl DeliveryHookIngest for Server {
                     // stores the modified one itself.
                     self.email_ingest(IngestEmail {
                         raw_message: &raw_message,
-                        message: Some(message),
+                        message: Some(&message),
                         blob_hash: None,
                         access_token: params.access_token,
                         mailbox_ids: params.mailbox_ids,

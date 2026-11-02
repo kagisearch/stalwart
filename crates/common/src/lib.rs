@@ -54,6 +54,7 @@ use config::{
     storage::Storage,
     telemetry::Metrics,
 };
+use gateway::resolver::{KeyCacheKey, KeyEntry};
 use ipc::{BroadcastEvent, PushEvent, QueueEvent, ReportingEvent, subscribers::PushSubscribers};
 use mail_auth::{Mx, Negative, RecordSet, TxtRecord};
 use parking_lot::{Mutex, RwLock};
@@ -87,6 +88,7 @@ pub mod auth;
 pub mod cache;
 pub mod config;
 pub mod expr;
+pub mod gateway;
 pub mod i18n;
 pub mod ipc;
 pub mod manager;
@@ -161,6 +163,7 @@ pub const KV_LOCK_DAV: u8 = 16;
 pub const KV_LOCK_SEARCH_INDEX: u8 = 17;
 pub const KV_OAUTH_CIMD: u8 = 18;
 pub const KV_RATE_LIMIT_CIMD: u8 = 19;
+pub const KV_KEY_LOOKUP: u8 = 20;
 
 #[derive(Clone)]
 pub struct Server {
@@ -199,6 +202,8 @@ pub struct Data {
 
     pub smtp_connectors: TlsConnectors,
     pub memory_budget: MemoryBudget,
+
+    pub harvest_tasks: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -248,6 +253,7 @@ pub struct Caches {
     pub lists: Cache<u32, Arc<MailingListCache>>,
 
     pub dkim_signers: Cache<u32, Arc<DkimSigners>>,
+    pub external_public_keys: CacheWithTtl<KeyCacheKey, Option<Arc<KeyEntry>>>,
 
     pub dns_txt: CacheWithTtl<Box<str>, TxtRecord>,
     pub dns_mx: CacheWithTtl<Box<str>, Result<RecordSet<Mx>, Negative>>,
