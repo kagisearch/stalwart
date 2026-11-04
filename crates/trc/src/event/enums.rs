@@ -6,8 +6,8 @@
 
 // This file is auto-generated. Do not edit directly.
 
-pub const TOTAL_EVENT_COUNT: usize = 673;
-pub const TOTAL_METRIC_COUNT: usize = 398;
+pub const TOTAL_EVENT_COUNT: usize = 675;
+pub const TOTAL_METRIC_COUNT: usize = 399;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventType {
@@ -558,11 +558,11 @@ pub enum MtaHookEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum DeliveryHookEvent {
-    ActionAccept = 655,
-    ActionDiscard = 656,
-    ActionReject = 657,
-    ActionQuarantine = 658,
-    Error = 659,
+    ActionAccept = 670,
+    ActionDiscard = 671,
+    ActionReject = 672,
+    ActionQuarantine = 673,
+    Error = 674,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -912,6 +912,7 @@ pub enum StoreEvent {
     PoolError = 509,
     DataCorruption = 494,
     DecompressError = 497,
+    DecryptError = 668,
     DeserializeError = 498,
     NotFound = 507,
     NotConfigured = 506,
@@ -931,6 +932,7 @@ pub enum StoreEvent {
     HttpStoreFetch = 475,
     AutoExpunge = 348,
     BlobStorePurged = 353,
+    BlobStoreRecoded = 669,
     DataStorePurged = 352,
 }
 
@@ -1414,6 +1416,7 @@ pub enum MetricType {
     StorePoolError = 296,
     StoreDataCorruption = 297,
     StoreDecompressError = 298,
+    StoreDecryptError = 398,
     StoreDeserializeError = 299,
     StoreNotFound = 300,
     StoreNotConfigured = 301,
