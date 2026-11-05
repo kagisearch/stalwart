@@ -4,9 +4,12 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{download::BlobDownload, embedded::EmbeddedBlobs};
+use super::{
+    download::{BlobAccess, BlobDownload, EmailMetadata, email_metadata_key, reads_blob_link},
+    embedded::EmbeddedBlobs,
+};
 use common::{Server, auth::AccessToken};
-use email::message::messagedata::MessageData;
+use email::message::{messagedata::MessageData, metadata::MetadataRow};
 use encodify::base64::STANDARD;
 use futures_util::{StreamExt, stream};
 use jmap_proto::{
@@ -69,12 +72,56 @@ impl BlobOperations for Server {
             .map(|length| range_from.saturating_add(length))
             .unwrap_or(usize::MAX);
 
+        // Check every blob's link, and read the metadata of the messages among
+        // them, with one store call each rather than two round trips per blob.
+        let link_sizes = self
+            .store()
+            .blob_link_sizes(
+                ids.iter()
+                    .filter(|blob_id| reads_blob_link(blob_id, access_token))
+                    .map(|blob_id| (&blob_id.hash, &blob_id.class)),
+            )
+            .await
+            .caused_by(trc::location!())?;
+        let mut link_sizes = link_sizes.into_iter();
+        let mut access = Vec::with_capacity(ids.len());
+        for blob_id in &ids {
+            access.push(if reads_blob_link(blob_id, access_token) {
+                self.has_access_linked_blob(blob_id, link_sizes.next().flatten(), access_token)
+                    .await?
+            } else {
+                self.has_access_blob(blob_id, access_token).await?
+            });
+        }
+        let metadatas = self
+            .store()
+            .get_values::<MetadataRow>(
+                ids.iter()
+                    .zip(&access)
+                    .map(|(blob_id, access)| {
+                        email_metadata_key(blob_id).filter(|_| access.is_allowed())
+                    })
+                    .collect(),
+            )
+            .await
+            .caused_by(trc::location!())?;
+
         // Read several blobs at once, in request order. With a remote blob
         // store every read is a round trip, which one-after-another reads
         // would add up across the whole request.
-        let mut downloads = stream::iter(ids)
-            .map(|blob_id| async move {
-                let bytes = self.blob_download(&blob_id, access_token).await;
+        let mut downloads = stream::iter(ids.into_iter().zip(access).zip(metadatas))
+            .map(|((blob_id, access), metadata)| async move {
+                let bytes = match access {
+                    BlobAccess::Allowed { size } => self
+                        .blob_contents_allowed(&blob_id, size, EmailMetadata::Read(metadata))
+                        .await
+                        .and_then(|contents| {
+                            contents
+                                .map(|contents| contents.into_downloaded().map(|blob| blob.bytes))
+                                .transpose()
+                        }),
+                    BlobAccess::Denied => Ok(None),
+                };
                 (blob_id, bytes)
             })
             .buffered(BLOB_GET_CONCURRENCY);

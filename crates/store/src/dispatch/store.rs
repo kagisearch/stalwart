@@ -11,6 +11,7 @@ use crate::{
         key::{CounterKind, KeySerializer},
     },
 };
+use ahash::AHashMap;
 use compact_str::ToCompactString;
 use std::time::Instant;
 use trc::{AddContext, StoreEvent};
@@ -77,6 +78,74 @@ impl Store {
         crate::dispatch::StoreOps::count_get_value_hit(&result);
 
         result
+    }
+
+    /// Reads several values, in the order of `keys` (`None` reads nothing),
+    /// with one `iterate_many` call: one query on PostgreSQL and MySQL. Keys
+    /// from more than one subspace are read one at a time.
+    pub async fn get_values<U>(
+        &self,
+        keys: Vec<Option<ValueKey<ValueClass>>>,
+    ) -> trc::Result<Vec<Option<U>>>
+    where
+        U: Deserialize + 'static,
+    {
+        let mut subspaces = keys.iter().flatten().map(|key| key.subspace());
+        let Some(subspace) = subspaces.next() else {
+            return Ok(keys.iter().map(|_| None).collect());
+        };
+        if subspaces.any(|other| other != subspace) {
+            let mut values = Vec::with_capacity(keys.len());
+            for key in keys {
+                values.push(match key {
+                    Some(key) => self.get_value(key).await?,
+                    None => None,
+                });
+            }
+            return Ok(values);
+        }
+
+        let serialized = keys
+            .iter()
+            .map(|key| key.as_ref().map(|key| key.serialize(0)))
+            .collect::<Vec<_>>();
+        // iterate_many takes its points sorted and distinct
+        let mut points = serialized.iter().flatten().collect::<Vec<_>>();
+        points.sort_unstable();
+        points.dedup();
+        let ranges = points
+            .into_iter()
+            .map(|key| {
+                let point = || AnyKey {
+                    subspace,
+                    key: key.clone(),
+                };
+                IterateParams::new(point(), point())
+            })
+            .collect::<Vec<_>>();
+        let mut values = AHashMap::with_capacity(ranges.len());
+        self.iterate_many(ranges, |key, value| {
+            values.insert(key.to_vec(), Some(U::deserialize(value)?));
+            Ok(true)
+        })
+        .await
+        .caused_by(trc::location!())?;
+
+        // A key given more than once takes the value read for it the first
+        // time and is read again for the others, as values are not Clone.
+        let mut result = Vec::with_capacity(keys.len());
+        for (key, serialized) in keys.into_iter().zip(serialized) {
+            result.push(
+                match (key, serialized.and_then(|key| values.get_mut(&key))) {
+                    (Some(key), Some(value)) => match value.take() {
+                        Some(value) => Some(value),
+                        None => self.get_value(key).await?,
+                    },
+                    _ => None,
+                },
+            );
+        }
+        Ok(result)
     }
 
     pub async fn key_exists(&self, key: impl Key) -> trc::Result<bool> {

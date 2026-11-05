@@ -96,6 +96,37 @@ impl From<BlobLinkValue> for SizedSetValue {
     }
 }
 
+fn blob_link_key(hash: &BlobHash, class: &BlobClass) -> Option<ValueKey<ValueClass>> {
+    Some(match class {
+        BlobClass::Reserved {
+            account_id,
+            expires,
+        } if *expires > now() => ValueKey {
+            account_id: *account_id,
+            collection: 0,
+            document_id: 0,
+            class: ValueClass::Blob(BlobOp::Link {
+                hash: hash.clone(),
+                to: BlobLink::Temporary { until: *expires },
+            }),
+        },
+        BlobClass::Linked {
+            account_id,
+            collection,
+            document_id,
+        } => ValueKey {
+            account_id: *account_id,
+            collection: *collection,
+            document_id: *document_id,
+            class: ValueClass::Blob(BlobOp::Link {
+                hash: hash.clone(),
+                to: BlobLink::Document,
+            }),
+        },
+        _ => return None,
+    })
+}
+
 impl Store {
     pub async fn blob_exists(&self, hash: impl AsRef<BlobHash> + Sync + Send) -> trc::Result<bool> {
         self.key_exists(ValueKey {
@@ -115,38 +146,30 @@ impl Store {
         hash: impl AsRef<BlobHash> + Sync + Send,
         class: impl AsRef<BlobClass> + Sync + Send,
     ) -> trc::Result<Option<u64>> {
-        let key = match class.as_ref() {
-            BlobClass::Reserved {
-                account_id,
-                expires,
-            } if *expires > now() => ValueKey {
-                account_id: *account_id,
-                collection: 0,
-                document_id: 0,
-                class: ValueClass::Blob(BlobOp::Link {
-                    hash: hash.as_ref().clone(),
-                    to: BlobLink::Temporary { until: *expires },
-                }),
-            },
-            BlobClass::Linked {
-                account_id,
-                collection,
-                document_id,
-            } => ValueKey {
-                account_id: *account_id,
-                collection: *collection,
-                document_id: *document_id,
-                class: ValueClass::Blob(BlobOp::Link {
-                    hash: hash.as_ref().clone(),
-                    to: BlobLink::Document,
-                }),
-            },
-            _ => return Ok(None),
+        let Some(key) = blob_link_key(hash.as_ref(), class.as_ref()) else {
+            return Ok(None);
         };
-
         self.get_value::<BlobLinkValue>(key)
             .await
             .map(|value| value.map(|value| value.size))
+    }
+
+    /// What `blob_link_size` returns for each blob, in the order given, read
+    /// with one store call rather than one per blob.
+    pub async fn blob_link_sizes<'x>(
+        &self,
+        blobs: impl IntoIterator<Item = (&'x BlobHash, &'x BlobClass)>,
+    ) -> trc::Result<Vec<Option<u64>>> {
+        let keys = blobs
+            .into_iter()
+            .map(|(hash, class)| blob_link_key(hash, class))
+            .collect();
+        Ok(self
+            .get_values::<BlobLinkValue>(keys)
+            .await?
+            .into_iter()
+            .map(|value| value.map(|value| value.size))
+            .collect())
     }
 
     pub async fn purge_blobs_all_shards(&self, blob_store: BlobStore) -> trc::Result<()> {
