@@ -309,7 +309,7 @@ fn build_filter(query: &mut String, filters: &[SearchFilter]) -> Vec<Value> {
                     is_first = false;
                 }
 
-                operator_stack.push((operator, is_first));
+                operator_stack.push((operator, is_first, ")"));
                 operator = filter;
                 is_first = true;
                 query.push('(');
@@ -325,16 +325,22 @@ fn build_filter(query: &mut String, filters: &[SearchFilter]) -> Vec<Value> {
                     is_first = false;
                 }
 
-                operator_stack.push((operator, is_first));
+                // FORK: a column a document has no value for is NULL, which makes the
+                // condition NULL, and NOT keeps it NULL, so the document would match
+                // neither the condition nor its negation. A missing value does not
+                // match, so the negation treats it as false.
+                operator_stack.push((operator, is_first, "), FALSE)"));
                 operator = &SearchFilter::Or;
                 is_first = true;
-                query.push_str("NOT (");
+                query.push_str("NOT COALESCE((");
             }
             SearchFilter::End => {
-                let p = operator_stack.pop().unwrap_or((&SearchFilter::And, true));
+                let p = operator_stack
+                    .pop()
+                    .unwrap_or((&SearchFilter::And, true, ")"));
                 operator = p.0;
                 is_first = p.1;
-                query.push(')');
+                query.push_str(p.2);
             }
             SearchFilter::DocumentSet(_) => {
                 debug_assert!(
