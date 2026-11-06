@@ -17,7 +17,7 @@ use groupware::cache::GroupwareCache;
 use hyper::body::Bytes;
 use registry::schema::enums::Permission;
 use std::future::Future;
-use store::ValueKey;
+use store::{ValueKey, write::ValueClass};
 use trc::AddContext;
 use types::acl::Acl;
 use types::blob::{BlobClass, BlobId};
@@ -47,6 +47,40 @@ pub enum BlobAccess {
 impl BlobAccess {
     pub fn is_allowed(&self) -> bool {
         matches!(self, BlobAccess::Allowed { .. })
+    }
+}
+
+/// A message's metadata row, read by `blob_contents_allowed` itself or ahead
+/// of it by the caller.
+pub enum EmailMetadata {
+    Fetch,
+    Read(Option<MetadataRow>),
+}
+
+/// Whether `has_access_blob` reads the blob's link, which a caller checking
+/// many blobs reads for all of them with `Store::blob_link_sizes`.
+pub fn reads_blob_link(blob_id: &BlobId, access_token: &AccessToken) -> bool {
+    !matches!(blob_id.class, BlobClass::Embedded { .. })
+        && !(blob_id.class.is_superuser() && access_token.has_permission(Permission::FetchAnyBlob))
+}
+
+/// The metadata row `blob_contents_allowed` reads for a blob, if any: a
+/// message's whole raw blob, whose stored headers it may restore.
+pub fn email_metadata_key(blob_id: &BlobId) -> Option<ValueKey<ValueClass>> {
+    match &blob_id.class {
+        BlobClass::Linked {
+            account_id,
+            collection,
+            document_id,
+        } if *collection == Collection::Email as u8 && blob_id.section.is_none() => {
+            Some(ValueKey::immutable(
+                *account_id,
+                Collection::Email,
+                *document_id,
+                EmailField::Metadata,
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -121,6 +155,22 @@ pub trait BlobDownload: Sync + Send {
         blob_id: &BlobId,
         access_token: &AccessToken,
     ) -> impl Future<Output = trc::Result<BlobAccess>> + Send;
+
+    /// `has_access_blob` for a blob whose link size the caller has read.
+    fn has_access_linked_blob(
+        &self,
+        blob_id: &BlobId,
+        link_size: Option<u64>,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<BlobAccess>> + Send;
+
+    /// `blob_contents` for a blob it is allowed to read.
+    fn blob_contents_allowed(
+        &self,
+        blob_id: &BlobId,
+        size: Option<u64>,
+        metadata: EmailMetadata,
+    ) -> impl Future<Output = trc::Result<Option<BlobContents>>> + Send;
 }
 
 impl BlobDownload for Server {
@@ -154,7 +204,16 @@ impl BlobDownload for Server {
         else {
             return Ok(None);
         };
+        self.blob_contents_allowed(blob_id, size, EmailMetadata::Fetch)
+            .await
+    }
 
+    async fn blob_contents_allowed(
+        &self,
+        blob_id: &BlobId,
+        size: Option<u64>,
+        metadata: EmailMetadata,
+    ) -> trc::Result<Option<BlobContents>> {
         if matches!(blob_id.class, BlobClass::Embedded { .. }) {
             return match self
                 .embedded_blob(blob_id)
@@ -181,23 +240,16 @@ impl BlobDownload for Server {
         else {
             return Ok(None);
         };
-        if let BlobClass::Linked {
-            account_id,
-            collection,
-            document_id,
-        } = &blob_id.class
-            && *collection == Collection::Email as u8
-            && let Some(row) = self
+        let row = match (metadata, email_metadata_key(blob_id)) {
+            (EmailMetadata::Read(row), _) => row,
+            (EmailMetadata::Fetch, Some(key)) => self
                 .store()
-                .get_value::<MetadataRow>(ValueKey::immutable(
-                    *account_id,
-                    Collection::Email,
-                    *document_id,
-                    EmailField::Metadata,
-                ))
+                .get_value::<MetadataRow>(key)
                 .await
-                .caused_by(trc::location!())?
-        {
+                .caused_by(trc::location!())?,
+            (EmailMetadata::Fetch, None) => None,
+        };
+        if let Some(row) = row {
             let metadata = row.unarchive().caused_by(trc::location!())?;
             let body_offset = metadata.blob_body_offset();
             if metadata.headers_len() != body_offset {
@@ -236,16 +288,26 @@ impl BlobDownload for Server {
                 });
         }
 
-        if blob_id.class.is_superuser() && access_token.has_permission(Permission::FetchAnyBlob) {
+        if !reads_blob_link(blob_id, access_token) {
             return Ok(BlobAccess::Allowed { size: None });
         }
 
-        let Some(size) = self
+        let link_size = self
             .store()
             .blob_link_size(&blob_id.hash, &blob_id.class)
             .await
-            .caused_by(trc::location!())?
-        else {
+            .caused_by(trc::location!())?;
+        self.has_access_linked_blob(blob_id, link_size, access_token)
+            .await
+    }
+
+    async fn has_access_linked_blob(
+        &self,
+        blob_id: &BlobId,
+        link_size: Option<u64>,
+        access_token: &AccessToken,
+    ) -> trc::Result<BlobAccess> {
+        let Some(size) = link_size else {
             return Ok(BlobAccess::Denied);
         };
 

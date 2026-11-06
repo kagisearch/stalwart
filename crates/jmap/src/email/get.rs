@@ -32,6 +32,7 @@ use email::{
         messagedata::{EmailMessageData, MetadataForm},
     },
 };
+use futures_util::{StreamExt, stream};
 use jmap_proto::{
     method::get::{GetRequest, GetResponse, all_ids, unique_properties},
     object::email::{Email, EmailProperty, EmailValue},
@@ -48,6 +49,10 @@ use types::{
     id::Id,
     keyword::HASATTACHMENT,
 };
+
+/// Raw messages read ahead of the one being rendered. Each is held whole, so
+/// fewer than Blob/get reads at once.
+const EMAIL_GET_BLOB_READ_AHEAD: usize = 8;
 
 pub trait EmailGet: Sync + Send {
     fn email_get(
@@ -243,6 +248,35 @@ impl EmailGet for Server {
                     .await
                     .caused_by(trc::location!())?;
 
+                // The raw messages this round renders, in the order the loop
+                // below reaches them and a few ahead of it, rather than one
+                // blob store round trip at a time.
+                let blob_reads = if needs.blob {
+                    chunk
+                        .iter()
+                        .filter(|&&id| {
+                            cache
+                                .email_by_jmap_id(id)
+                                .is_some_and(|data| access.allows(data))
+                        })
+                        .filter_map(|id| match batch.lookup(id.document_id()) {
+                            Lookup::Found(metadata) => Some(metadata),
+                            Lookup::Missing | Lookup::Skip => None,
+                        })
+                        .map(|metadata| {
+                            let metadata = metadata.unarchive().caused_by(trc::location!())?;
+                            Ok((metadata.blob_hash(), metadata.size() as u64))
+                        })
+                        .collect::<trc::Result<Vec<_>>>()?
+                } else {
+                    Vec::new()
+                };
+                let mut blobs = stream::iter(blob_reads)
+                    .map(|(blob_hash, size)| async move {
+                        self.fetch_blob(&blob_hash, 0..usize::MAX, Some(size)).await
+                    })
+                    .buffered(EMAIL_GET_BLOB_READ_AHEAD);
+
                 for &id in chunk {
                     let Some(data) = cache
                         .email_by_jmap_id(id)
@@ -279,10 +313,7 @@ impl EmailGet for Server {
                         budget.add_light(cost.light)?;
                         let blob_hash = metadata.blob_hash();
                         if needs.blob {
-                            let Some(value) = self
-                                .fetch_blob(&blob_hash, 0..usize::MAX, Some(metadata.size() as u64))
-                                .await?
-                            else {
+                            let Some(value) = blobs.next().await.transpose()?.flatten() else {
                                 trc::event!(
                                     Store(StoreEvent::NotFound),
                                     AccountId = account_id,
