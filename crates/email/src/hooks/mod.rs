@@ -163,13 +163,25 @@ pub enum Modification {
         name: String,
         value: String,
     },
+    /// Replace the message body, everything after the first empty line, with
+    /// `value`. The header block is kept as received, so the other
+    /// modifications still apply. When several hooks replace the body, the
+    /// last one wins.
+    #[serde(rename = "replaceContents")]
+    ReplaceContents { value: String },
 }
 
 pub enum ModificationOut {
-    AddHeader { name: String, value: String },
+    AddHeader {
+        name: String,
+        value: String,
+    },
     ReplaceHeader {
         index: u32,
         name: String,
+        value: String,
+    },
+    ReplaceContents {
         value: String,
     },
 }

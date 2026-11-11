@@ -12,7 +12,8 @@
 //! hook sees the message, the envelope, the current filing and the thread the
 //! message is expected to join, and answers with an action (accept, discard,
 //! reject, quarantine) plus filing changes: extra or replacement mailboxes,
-//! flags, header additions and replacements, and preview text.
+//! flags, header additions and replacements, a replacement body, and preview
+//! text.
 //!
 //! `email_ingest_with_hooks` is the one entry point: the delivery paths call
 //! it in place of `email_ingest`, and everything about hooks and the fork's
@@ -164,22 +165,36 @@ impl DeliveryHookIngest for Server {
             .map(normalize_preview)
             .filter(|preview| !preview.is_empty());
 
-        // Header modifications, additions first
+        // The body is replaced first, then the headers: additions, then
+        // replacements
         let mut add_headers = Vec::new();
         let mut replace_headers = Vec::new();
+        let mut contents = None;
         for modification in hooks.modifications {
             match modification {
                 ModificationOut::AddHeader { name, value } => add_headers.push((name, value)),
                 ModificationOut::ReplaceHeader { index, name, value } => {
                     replace_headers.push((index, name, value))
                 }
+                ModificationOut::ReplaceContents { value } => contents = Some(value),
             }
         }
         let mut modified = None;
+        if let Some(contents) = contents {
+            modified = replace_contents(params.raw_message, &contents);
+            if modified.is_none() {
+                trc::event!(
+                    MessageIngest(trc::MessageIngestEvent::Error),
+                    Details =
+                        "Delivery hook replaced the body of a message that has none, keeping it.",
+                    SpanId = session_id
+                );
+            }
+        }
         if !add_headers.is_empty() {
             modified = Some(apply_add_header_modifications(
                 &add_headers,
-                params.raw_message,
+                modified.as_deref().unwrap_or(params.raw_message),
             ));
         }
         if !replace_headers.is_empty()
@@ -215,7 +230,7 @@ impl DeliveryHookIngest for Server {
                 None => {
                     trc::event!(
                         MessageIngest(trc::MessageIngestEvent::Error),
-                        Details = "Failed to parse message after header modifications, delivering it unmodified.",
+                        Details = "Failed to parse message after hook modifications, delivering it unmodified.",
                         SpanId = session_id
                     );
                     params.message = Some(message);
@@ -534,6 +549,9 @@ async fn try_delivery_hook(
                                 value,
                             });
                         }
+                        Modification::ReplaceContents { value } => {
+                            modifications_out.push(ModificationOut::ReplaceContents { value });
+                        }
                     }
                 }
 
@@ -680,6 +698,32 @@ async fn find_message_thread(
             .map(|id| Id::from(id).as_string())
             .collect(),
     })
+}
+
+/// Where the body of a raw message starts: after the first line that is empty
+/// or holds only a carriage return. Hooks receive the whole message and split
+/// it the same way, so a body they send back lands exactly where they took it
+/// from. `None` when the message has no empty line, and so no body.
+fn body_offset(raw: &[u8]) -> Option<usize> {
+    let mut start = 0;
+    while let Some(end) = raw[start..].iter().position(|&b| b == b'\n') {
+        let line = &raw[start..start + end];
+        if line.is_empty() || line == b"\r" {
+            return Some(start + end + 1);
+        }
+        start += end + 1;
+    }
+    None
+}
+
+/// The message with its body replaced by `contents` and its header block
+/// untouched, or `None` when it has no body to replace.
+fn replace_contents(raw: &[u8], contents: &str) -> Option<Vec<u8>> {
+    let offset = body_offset(raw)?;
+    let mut message = Vec::with_capacity(offset + contents.len());
+    message.extend_from_slice(&raw[..offset]);
+    message.extend_from_slice(contents.as_bytes());
+    Some(message)
 }
 
 // Prepend AddHeader modifications to a raw RFC 5322 message
@@ -859,7 +903,7 @@ fn apply_replace_header_modifications(
 mod tests {
     use super::{
         apply_add_header_modifications, apply_flag_filing, apply_replace_header_modifications,
-        normalize_preview,
+        normalize_preview, replace_contents,
     };
     use crate::mailbox::{ARCHIVE_ID, DRAFTS_ID, INBOX_ID, JUNK_ID, SENT_ID, TRASH_ID};
     use mail_parser::MessageParser;
@@ -891,6 +935,34 @@ mod tests {
 
     fn has_header_named(headers: &[(String, String)], name: &str) -> bool {
         headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name))
+    }
+
+    #[test]
+    fn replace_contents_keeps_the_header_block() {
+        assert_eq!(
+            replace_contents(b"Subject: Hi\r\nX-A: 1\r\n\r\nold\r\n\r\nbody", "new").unwrap(),
+            b"Subject: Hi\r\nX-A: 1\r\n\r\nnew"
+        );
+        // Split at the first empty line whatever the line endings
+        assert_eq!(
+            replace_contents(b"Subject: Hi\n\nold\r\n\r\nbody", "new").unwrap(),
+            b"Subject: Hi\n\nnew"
+        );
+        assert_eq!(replace_contents(b"\r\nold", "new").unwrap(), b"\r\nnew");
+    }
+
+    #[test]
+    fn replace_contents_needs_a_body() {
+        assert_eq!(replace_contents(b"Subject: Hi\r\nX-A: 1", "new"), None);
+        assert_eq!(replace_contents(b"", "new"), None);
+    }
+
+    #[test]
+    fn replace_contents_then_add_header() {
+        let replaced = replace_contents(b"Subject: Hi\r\n\r\nold", "new").unwrap();
+        let out =
+            apply_add_header_modifications(&[("X-Test".to_string(), "foo".to_string())], &replaced);
+        assert_eq!(out, b"X-Test: foo\r\nSubject: Hi\r\n\r\nnew");
     }
 
     #[test]
