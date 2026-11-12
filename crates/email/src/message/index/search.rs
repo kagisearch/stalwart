@@ -193,6 +193,10 @@ impl DocumentBuilder<'_> {
                 addresses.visit_text(|text| {
                     self.document
                         .index_text(search_field.clone(), text, Language::None);
+                    address_parts(text, |part| {
+                        self.document
+                            .index_text(search_field.clone(), part, Language::None);
+                    });
                 });
             }
         }
@@ -341,6 +345,27 @@ impl<'a> Addresses<'a> {
     }
 }
 
+/// Visits the parts of an address a search should also find it by: its local
+/// part, its domain and each parent domain, and the domain's labels except the
+/// top-level one. `news@mail.example.com` yields `news`, `mail.example.com`,
+/// `mail`, `example.com` and `example`. Text that is not an address, such as a
+/// display name, yields nothing.
+fn address_parts<'x>(text: &'x str, mut visitor: impl FnMut(&'x str)) {
+    let Some((local, domain)) = text.rsplit_once('@') else {
+        return;
+    };
+    if local.is_empty() || domain.is_empty() || text.contains(char::is_whitespace) {
+        return;
+    }
+    visitor(local);
+    let mut domain = domain;
+    while let Some((label, parent)) = domain.split_once('.') {
+        visitor(domain);
+        visitor(label);
+        domain = parent;
+    }
+}
+
 impl<'a> EnvelopeView<'a> {
     fn addresses_of_interest(&self) -> [(EmailSearchField, Addresses<'a>); 4] {
         [
@@ -368,3 +393,54 @@ impl<'a> EnvelopeView<'a> {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/email/src/message/index/search/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod address_parts_tests {
+    use super::address_parts;
+
+    fn parts(text: &str) -> Vec<&str> {
+        let mut parts = Vec::new();
+        address_parts(text, |part| parts.push(part));
+        parts
+    }
+
+    #[test]
+    fn address_parts_split_local_part_and_domains() {
+        assert_eq!(parts("fred@juno.com"), ["fred", "juno.com", "juno"]);
+        assert_eq!(
+            parts("news@mail.example.co.uk"),
+            [
+                "news",
+                "mail.example.co.uk",
+                "mail",
+                "example.co.uk",
+                "example",
+                "co.uk",
+                "co",
+            ]
+        );
+    }
+
+    #[test]
+    fn address_parts_keep_the_local_part_whole() {
+        assert_eq!(
+            parts("first.last+tag@example.com"),
+            ["first.last+tag", "example.com", "example"]
+        );
+        // A quoted local part may hold an '@': the domain follows the last one.
+        assert_eq!(
+            parts("\"a@b\"@example.com"),
+            ["\"a@b\"", "example.com", "example"]
+        );
+    }
+
+    #[test]
+    fn address_parts_skip_text_that_is_not_an_address() {
+        assert!(parts("Fred Smith").is_empty());
+        assert!(parts("Fred @ Juno").is_empty());
+        assert!(parts("fred@").is_empty());
+        assert!(parts("@juno.com").is_empty());
+        assert!(parts("").is_empty());
+        assert_eq!(parts("root@localhost"), ["root"]);
+    }
+}
