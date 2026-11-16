@@ -349,15 +349,20 @@ impl<'a> Addresses<'a> {
 /// part, its domain and each parent domain, and the domain's labels except the
 /// top-level one. `news@mail.example.com` yields `news`, `mail.example.com`,
 /// `mail`, `example.com` and `example`. Text that is not an address, such as a
-/// display name, yields nothing.
+/// display name, yields nothing. A domain literal (`[192.0.2.1]`) yields only
+/// the local part.
 fn address_parts<'x>(text: &'x str, mut visitor: impl FnMut(&'x str)) {
     let Some((local, domain)) = text.rsplit_once('@') else {
         return;
     };
-    if local.is_empty() || domain.is_empty() || text.contains(char::is_whitespace) {
+    let domain = domain.strip_suffix('.').unwrap_or(domain);
+    if local.is_empty() || domain.is_empty() || domain.contains(char::is_whitespace) {
         return;
     }
     visitor(local);
+    if domain.starts_with('[') {
+        return;
+    }
     let mut domain = domain;
     while let Some((label, parent)) = domain.split_once('.') {
         visitor(domain);
@@ -441,6 +446,31 @@ mod address_parts_tests {
         assert!(parts("fred@").is_empty());
         assert!(parts("@juno.com").is_empty());
         assert!(parts("").is_empty());
+        assert!(parts("fred@.").is_empty());
         assert_eq!(parts("root@localhost"), ["root"]);
+    }
+
+    #[test]
+    fn address_parts_index_every_label_but_the_tld() {
+        assert_eq!(parts("a@x.fv.com"), ["a", "x.fv.com", "x", "fv.com", "fv"]);
+    }
+
+    #[test]
+    fn address_parts_keep_the_domain_of_a_quoted_local_part_with_spaces() {
+        assert_eq!(
+            parts("\"john smith\"@example.com"),
+            ["\"john smith\"", "example.com", "example"]
+        );
+    }
+
+    #[test]
+    fn address_parts_ignore_a_trailing_dot() {
+        assert_eq!(parts("fred@Juno.COM."), ["fred", "Juno.COM", "Juno"]);
+    }
+
+    #[test]
+    fn address_parts_skip_a_domain_literal() {
+        assert_eq!(parts("fred@[192.0.2.1]"), ["fred"]);
+        assert_eq!(parts("fred@[IPv6:2001:db8::1]"), ["fred"]);
     }
 }
