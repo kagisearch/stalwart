@@ -13,6 +13,7 @@ pub mod dns;
 pub mod external_public_keys;
 pub mod grantee_cleanup;
 pub mod imip;
+pub mod imip_from;
 pub mod maintenance;
 pub mod merge_threads;
 pub mod rebuild_shares;
