@@ -6,7 +6,7 @@
 
 use crate::task_manager::{
     outcome::{Failure, Outcome, RetryClass},
-    tasks::{SmtpRejection, append_error},
+    tasks::{SmtpRejection, append_error, imip_from::imip_from_name},
 };
 use calcard::icalendar::{ICalendarParticipationStatus, ICalendarProperty};
 use common::{
@@ -25,7 +25,7 @@ use groupware::{
 };
 use mail_builder::{
     MessageBuilder,
-    headers::{HeaderType, content_type::ContentType},
+    headers::{HeaderType, address::Address, content_type::ContentType},
     mime::{BodyPart, MimePart},
 };
 use mail_parser::decoders::html::html_to_text;
@@ -160,6 +160,12 @@ async fn send_imip(
             }
         };
         let sender_info = organizer_info.as_ref().unwrap_or(&account_info);
+        // FORK: the sender is named by the iTIP message, never by the account.
+        let from_name = imip_from_name(
+            &itip_message.i_calendar_data,
+            itip_message.from.as_str(),
+            itip_message.is_from_organizer,
+        );
         let mut template = ItipTemplate::new(
             server,
             &formatter,
@@ -190,8 +196,8 @@ async fn send_imip(
 
             // Build message
             let message = MessageBuilder::new()
-                .from((
-                    sender_info.description().unwrap_or(sender_info.name()),
+                .from(Address::new_address(
+                    from_name.as_deref(),
                     itip_message.from.as_str(),
                 ))
                 .to(recipient.as_str())
