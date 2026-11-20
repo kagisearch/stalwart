@@ -788,10 +788,19 @@ impl MessageWrapper {
         {
             Ok(RcptResolution::Rewrite(rewritten)) => {
                 self.add_expanded_recipient(&rewritten, server).await;
+                // FORK: record the address as given, as the RCPT handler does
+                self.mark_last_recipient_rewritten(rcpt, super::RCPT_REWRITTEN);
             }
             Ok(RcptResolution::Expand(addrs)) => {
                 for addr in addrs.as_ref() {
                     self.add_expanded_recipient(addr, server).await;
+                    // FORK: a list member's copy is never reported back
+                    self.mark_last_recipient_rewritten(
+                        rcpt,
+                        super::RCPT_REWRITTEN
+                            | super::RCPT_EXPANDED
+                            | smtp_proto::RCPT_NOTIFY_NEVER,
+                    );
                 }
             }
             Ok(_) => {
@@ -806,6 +815,14 @@ impl MessageWrapper {
                 );
                 self.add_expanded_recipient(rcpt, server).await;
             }
+        }
+    }
+
+    /// FORK: marks the recipient just added as rewritten from `original`.
+    fn mark_last_recipient_rewritten(&mut self, original: &str, flags: u64) {
+        if let Some(recipient) = self.message.recipients.last_mut() {
+            recipient.orcpt = Some(original.to_lowercase().into_boxed_str());
+            recipient.flags |= flags;
         }
     }
 
