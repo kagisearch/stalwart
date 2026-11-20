@@ -1843,6 +1843,7 @@ dependencies = [
  "mail-builder",
  "mail-parser",
  "nlp",
+ "psl",
  "rand 0.8.8",
  "registry",
  "reqwest",

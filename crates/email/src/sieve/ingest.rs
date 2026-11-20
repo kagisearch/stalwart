@@ -794,6 +794,25 @@ impl SieveScriptIngest for Server {
         drop(ctx);
         let mut message = Some(message);
 
+        // FORK: resolved before delivering, so that a failed lookup is retried
+        let unverified_from = super::sender::unverified_local_from(
+            self,
+            mail_from,
+            raw_message,
+            sender_authentication,
+            &generated,
+        )
+        .await?;
+        // FORK: a message the script neither files nor discards is kept when
+        // its redirect is not sent
+        if unverified_from.is_some()
+            && !do_deliver
+            && !do_discard
+            && let Some(message) = messages.first_mut()
+        {
+            message.file_into.push(INBOX_ID);
+        }
+
         // Fail-safe, no discard and no keep seen, assume that something went wrong and file anyway.
         if !do_deliver
             && !do_discard
@@ -887,11 +906,13 @@ impl SieveScriptIngest for Server {
                     message.exploded = true;
                 }
             }
-            // FORK: replies and notifications are only sent as the account
+            // FORK: replies and notifications are only sent as the account,
+            // and a message forging a local From is not redirected
             super::sender::retain_own_senders(
                 self,
                 account_id,
                 [mail_from, reply_from],
+                unverified_from.as_deref(),
                 &mut generated,
                 session_id,
             )
