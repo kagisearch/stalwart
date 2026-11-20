@@ -9,7 +9,7 @@ use crate::{
     outbound::DeliveryResult,
     queue::{
         Error, ErrorDetails, FROM_AUTHENTICATED, FROM_UNAUTHENTICATED_DMARC, HostResponse, Message,
-        MessageSource, MessageWrapper, Status, UnexpectedResponse,
+        MessageSource, MessageWrapper, RCPT_EXPANDED, RCPT_REWRITTEN, Status, UnexpectedResponse,
         quota::HasQueueQuota,
         rcpt_spam_percentage,
         spool::{QueueOutcome, QueueParams, SmtpSpool},
@@ -44,9 +44,12 @@ impl MessageWrapper {
             recipients.push(IngestRecipient {
                 address: rcpt_addr.to_lowercase(),
                 orcpt: rcpt.orcpt.as_ref().map(|orcpt| orcpt.to_string()),
+                rewritten: rcpt.flags & RCPT_REWRITTEN != 0,
+                list_expanded: rcpt.flags & RCPT_EXPANDED != 0,
                 spam_percentage: rcpt_spam_percentage(rcpt.flags),
             });
-            pending_recipients.push((rcpt_idx, rcpt_addr));
+            // FORK: failures are reported under the address the sender used
+            pending_recipients.push((rcpt_idx, rcpt.dsn_address()));
         }
 
         // Deliver message

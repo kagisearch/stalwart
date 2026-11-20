@@ -51,10 +51,28 @@ impl SenderAuthentication {
 pub struct IngestRecipient {
     pub address: String,
     pub orcpt: Option<String>,
+    /// FORK: the server rewrote the recipient and `orcpt` is the address the
+    /// message was originally sent to, not a client-supplied ORCPT.
+    pub rewritten: bool,
+    /// FORK: the recipient is a member of the mailing list in `orcpt`.
+    pub list_expanded: bool,
     pub spam_percentage: Option<u8>,
 }
 
 impl IngestRecipient {
+    /// FORK: the pre-rewrite recipient address, stamped as `X-Original-To`.
+    pub fn original_to(&self) -> Option<&str> {
+        self.orcpt.as_deref().filter(|_| self.rewritten)
+    }
+
+    /// FORK: the address automatic replies are sent from: the one the sender
+    /// used, unless that is a mailing list the recipient is a member of.
+    pub fn reply_address(&self) -> &str {
+        self.original_to()
+            .filter(|_| !self.list_expanded)
+            .unwrap_or(self.address.as_str())
+    }
+
     pub fn orcpt_parameter(&self) -> Option<String> {
         self.orcpt
             .as_deref()
@@ -225,6 +243,7 @@ impl MailDelivery for Server {
                                     received_at: None,
                                     source: IngestSource::Smtp {
                                         deliver_to: &rcpt.address,
+                                        original_to: rcpt.original_to(),
                                         envelope_from: &message.sender_address,
                                         sender_authentication: message.sender_authentication,
                                         is_spam: rcpt.is_spam(),

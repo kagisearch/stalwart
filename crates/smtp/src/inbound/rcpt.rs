@@ -6,6 +6,7 @@
 
 use crate::{
     core::{Session, SessionAddress},
+    queue::{RCPT_EXPANDED, RCPT_REWRITTEN},
     scripts::ScriptResult,
 };
 use common::{
@@ -72,6 +73,8 @@ impl<T: SessionStream> Session<T> {
 
         // Build RCPT
         let address_lcase = to.address.to_lowercase_address(true);
+        // FORK: the address as received, before any rewriting
+        let original_to = address_lcase.clone();
         let rcpt = SessionAddress {
             domain: address_lcase.domain_part().into(),
             address_lcase,
@@ -188,14 +191,23 @@ impl<T: SessionStream> Session<T> {
             .rcpt_resolve(&rcpt.address_lcase, true, self.data.session_id)
             .await
         {
-            Ok(RcptResolution::Accept) => {}
+            Ok(RcptResolution::Accept) => {
+                // FORK: a script, milter, hook or the rewrite expression
+                // changed the recipient, record the address as received
+                if let Some(rcpt) = self.data.rcpt_to.last_mut()
+                    && rcpt.address_lcase != original_to
+                {
+                    rcpt.flags |= RCPT_REWRITTEN;
+                    rcpt.dsn_info = Some(original_to.clone());
+                }
+            }
             Ok(RcptResolution::Rewrite(address)) => {
                 let orig_addr = self.data.rcpt_to.pop().unwrap();
                 let mut new_addr = SessionAddress::new(address);
 
                 if !self.data.rcpt_to.contains(&new_addr) {
-                    new_addr.flags = orig_addr.flags;
-                    new_addr.dsn_info = orig_addr.address_lcase.into();
+                    new_addr.flags = orig_addr.flags | RCPT_REWRITTEN; // FORK
+                    new_addr.dsn_info = Some(original_to.clone()); // FORK
                     self.data.rcpt_to.push(new_addr);
                 } else {
                     trc::event!(
@@ -393,8 +405,14 @@ impl<T: SessionStream> Session<T> {
                 if !self.data.rcpt_to.contains(&member_addr)
                     && member_addr.address_lcase != list_addr.address_lcase
                 {
-                    member_addr.dsn_info = list_addr.address_lcase.clone().into();
-                    member_addr.flags = list_addr.flags;
+                    member_addr.dsn_info = Some(original_to.clone()); // FORK
+                    // FORK: the message reached the list, what happens to a
+                    // member's copy is not reported back to the sender
+                    member_addr.flags = (list_addr.flags
+                        & !(RCPT_NOTIFY_SUCCESS | RCPT_NOTIFY_FAILURE | RCPT_NOTIFY_DELAY))
+                        | RCPT_NOTIFY_NEVER
+                        | RCPT_REWRITTEN
+                        | RCPT_EXPANDED;
                     self.data.rcpt_to.push(member_addr);
                 }
             }

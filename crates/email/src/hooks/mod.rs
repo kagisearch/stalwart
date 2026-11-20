@@ -18,6 +18,12 @@ pub struct Address {
 pub struct Envelope {
     pub from: Address,
     pub to: Address,
+    /// The address the message was sent to, as received in RCPT TO, when the
+    /// server rewrote the recipient into `to` (catch-all, sub-addressing,
+    /// masked email, list expansion, rewrite rules). Absent when `to` is the
+    /// address the sender used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_to: Option<Address>,
     /// True when the sender authenticated over SMTP or the message passed DMARC
     #[serde(default)]
     pub sender_authenticated: bool,
