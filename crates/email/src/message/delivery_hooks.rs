@@ -77,6 +77,7 @@ impl DeliveryHookIngest for Server {
     ) -> trc::Result<IngestedEmail> {
         let IngestSource::Smtp {
             deliver_to,
+            original_to,
             envelope_from,
             sender_authentication,
             ..
@@ -98,6 +99,7 @@ impl DeliveryHookIngest for Server {
             envelope_from,
             sender_authentication.is_authenticated(),
             deliver_to,
+            original_to,
             &message,
             &params.mailbox_ids,
             &params.keywords,
@@ -156,6 +158,7 @@ impl DeliveryHookIngest for Server {
 
         params.source = IngestSource::Smtp {
             deliver_to,
+            original_to,
             envelope_from,
             sender_authentication,
             is_spam,
@@ -332,6 +335,7 @@ async fn try_delivery_hook(
     sender: &str,
     is_sender_authenticated: bool,
     recipient: &str,
+    original_recipient: Option<&str>,
     message: &Message<'_>,
     current_mailbox_ids: &[u32],
     current_keywords: &[Keyword],
@@ -378,6 +382,9 @@ async fn try_delivery_hook(
         to: hooks::Address {
             address: recipient.to_string(),
         },
+        original_to: original_recipient.map(|address| hooks::Address {
+            address: address.to_string(),
+        }),
         sender_authenticated: is_sender_authenticated,
     };
 

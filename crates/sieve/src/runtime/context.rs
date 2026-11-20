@@ -110,6 +110,7 @@ impl<'x> Context<'x> {
             oom: Cell::new(false),
             dynamic_regexes: RefCell::new(AHashMap::new()),
             user_address: "".into(),
+            account_address: "".into(),
             user_full_name: "".into(),
             current_time: super::platform::unix_time(),
             num_redirects: 0,
@@ -1084,6 +1085,12 @@ impl<'x> Context<'x> {
 
     pub fn set_user_address(&mut self, from: impl Into<Cow<'x, str>>) {
         self.user_address = from.into();
+    }
+
+    /// FORK: the account's own address. Redirects to it are suppressed like
+    /// redirects to the user address.
+    pub fn set_account_address(&mut self, address: impl Into<Cow<'x, str>>) {
+        self.account_address = address.into();
     }
 
     pub fn with_user_address(mut self, from: impl Into<Cow<'x, str>>) -> Self {

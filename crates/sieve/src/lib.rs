@@ -91,6 +91,8 @@ pub struct Runtime {
 pub struct Context<'x> {
     pub(crate) runtime: &'x Runtime,
     pub(crate) user_address: Cow<'x, str>,
+    // FORK: the account's own address, when replies are sent as another one
+    pub(crate) account_address: Cow<'x, str>,
     pub(crate) user_full_name: Cow<'x, str>,
     pub(crate) current_time: i64,
 

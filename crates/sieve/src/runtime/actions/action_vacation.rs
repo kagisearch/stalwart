@@ -67,6 +67,10 @@ impl<'x> Context<'x> {
         if !self.user_address.is_empty() {
             user_addresses.push(Cow::Borrowed(self.user_address.as_ref()));
         }
+        // FORK: the account's own address is still one of the user's
+        if !self.account_address.is_empty() {
+            user_addresses.push(Cow::Borrowed(self.account_address.as_ref()));
+        }
 
         if from.is_empty()
             || user_addresses.is_empty()

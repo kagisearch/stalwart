@@ -44,7 +44,12 @@ impl<'x> Context<'x> {
             return Ok(());
         }
 
-        if !redirect.list && address.eq_ignore_ascii_case(self.user_address.as_ref()) {
+        // FORK: also suppress redirects to the account's own address
+        if !redirect.list
+            && (address.eq_ignore_ascii_case(self.user_address.as_ref())
+                || (!self.account_address.is_empty()
+                    && address.eq_ignore_ascii_case(self.account_address.as_ref())))
+        {
             return Ok(());
         }
 

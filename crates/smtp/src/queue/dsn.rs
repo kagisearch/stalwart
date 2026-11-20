@@ -546,7 +546,7 @@ impl MessageWrapper {
                     }
                     rcpt.write_dsn(&mut dsn);
                     rcpt.status.write_dsn(&mut dsn);
-                    response.write_dsn_text(&rcpt.address, &mut txt_success);
+                    response.write_dsn_text(rcpt.dsn_address(), &mut txt_success); // FORK
                 }
                 Status::TemporaryFailure(response)
                     if rcpt.notify.due <= now && rcpt.has_flag(RCPT_NOTIFY_DELAY) =>
@@ -554,7 +554,7 @@ impl MessageWrapper {
                     rcpt.write_dsn(&mut dsn);
                     rcpt.status.write_dsn(&mut dsn);
                     rcpt.write_dsn_will_retry_until(self.message.created, &mut dsn);
-                    response.write_dsn_text(&rcpt.address, &mut txt_delay);
+                    response.write_dsn_text(rcpt.dsn_address(), &mut txt_delay); // FORK
                 }
                 Status::PermanentFailure(response) => {
                     if !rcpt.has_flag(RCPT_NOTIFY_FAILURE) {
@@ -562,7 +562,7 @@ impl MessageWrapper {
                     }
                     rcpt.write_dsn(&mut dsn);
                     rcpt.status.write_dsn(&mut dsn);
-                    response.write_dsn_text(&rcpt.address, &mut txt_failed);
+                    response.write_dsn_text(rcpt.dsn_address(), &mut txt_failed); // FORK
                 }
                 Status::Scheduled if rcpt.notify.due <= now && rcpt.has_flag(RCPT_NOTIFY_DELAY) => {
                     // This case should not happen under normal circumstances
@@ -573,7 +573,7 @@ impl MessageWrapper {
                         entity: "localhost".into(),
                         details: Error::ConcurrencyLimited,
                     }
-                    .write_dsn_text(&rcpt.address, &mut txt_delay);
+                    .write_dsn_text(rcpt.dsn_address(), &mut txt_delay); // FORK
                 }
                 _ => continue,
             }
@@ -977,7 +977,8 @@ impl Recipient {
         if let Some(orcpt) = &self.orcpt {
             let _ = write!(dsn, "Original-Recipient: {ORCPT_ADDR_TYPE}{orcpt}\r\n");
         }
-        let _ = write!(dsn, "Final-Recipient: rfc822;{}\r\n", self.address);
+        // FORK: do not disclose the address a recipient was rewritten to
+        let _ = write!(dsn, "Final-Recipient: rfc822;{}\r\n", self.dsn_address());
     }
 
     fn write_dsn_will_retry_until(&self, created: u64, dsn: &mut String) {

@@ -114,6 +114,9 @@ pub struct IngestEmail<'x> {
 pub enum IngestSource<'x> {
     Smtp {
         deliver_to: &'x str,
+        /// FORK: the address the message was sent to, when the server rewrote
+        /// the recipient into `deliver_to`. `None` when they are the same.
+        original_to: Option<&'x str>,
         envelope_from: &'x str,
         sender_authentication: SenderAuthentication,
         is_spam: bool,
@@ -394,12 +397,18 @@ impl EmailIngest for Server {
         let is_spam = match params.source {
             IngestSource::Smtp {
                 deliver_to,
+                original_to,
                 envelope_from,
                 sender_authentication,
                 mut is_spam,
             } => {
                 // Add delivered to header
                 if self.core.smtp.session.data.add_delivered_to {
+                    // FORK: record the address the sender used as well
+                    extra_headers.push(
+                        HeaderId::X_ORIGINAL_TO,
+                        original_to.unwrap_or(deliver_to),
+                    );
                     extra_headers.push(HeaderId::DELIVERED_TO, deliver_to);
                 }
 
