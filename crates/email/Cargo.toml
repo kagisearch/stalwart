@@ -27,6 +27,8 @@ serde_json = "1.0"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream"] }
 rand = "0.8"
 hashify = "0.3"
+# FORK: organizational domain of a redirected message's From
+psl = "2"
 rkyv.workspace = true
 compact_str = "0.10.0"
 tinyvec = { version = "1.13.3", features = ["alloc"] }
